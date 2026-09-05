@@ -101,6 +101,9 @@ operations! {
     FleetOverview(Empty), "fleet.overview", "fleet:read", "Observed agent and exporter state for permitted hosts";
     UnitsFailed(FailedParams), "units.failed", "units:read", "Failed readable services; unreachable hosts remain explicit";
     HostFacts(HostParams), "host.facts", "host:read", "Kernel, uptime and the running system closure";
+    HostMetrics(HostParams), "host.metrics", "metrics:read", "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
+    DeployStatus(FailedParams), "deploy.status", "host:read", "Running closure versus persistent system profile; unavailable hosts remain explicit";
+    UnitsList(HostParams), "units.list", "units:read", "All explicitly readable services, including unloaded services";
     UnitsStatus(UnitParams), "units.status", "units:read", "State of one explicitly readable service";
     UnitsLogs(LogParams), "units.logs", "logs:read", "Bounded recent journal entries for one readable service";
     AlertsActive(Empty), "alerts.active", "alerts:read", "Active alerts with an instance label matching permitted hosts";
@@ -128,6 +131,12 @@ pub struct Facts {
     pub kernel: String,
     pub uptime_seconds: f64,
     pub system_closure: Option<String>,
+    #[serde(default)]
+    pub system_profile: Option<String>,
+    #[serde(default)]
+    pub profile_generation: Option<u64>,
+    #[serde(default)]
+    pub profile_matches_running: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
@@ -137,6 +146,24 @@ pub struct UnitStatus {
     pub load_state: String,
     pub active_state: String,
     pub sub_state: String,
+    #[serde(default)]
+    pub details: Option<UnitDetails>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct UnitDetails {
+    pub main_pid: Option<u32>,
+    pub memory_current_bytes: Option<u64>,
+    pub restarts: Option<u32>,
+    pub exec_main_code: Option<i32>,
+    pub exec_main_status: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct UnitObservation {
+    pub host: String,
+    pub observed_at: jiff::Timestamp,
+    pub unit: UnitStatus,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]

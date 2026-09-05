@@ -62,6 +62,9 @@ pkgs.testers.runNixOSTest {
     ctl = "maxopsctl --token-file /run/client-token "
     machine.succeed(ctl + "host.facts --host fixture | jq -e '.facts.system_closure | startswith(\"/nix/store/\")'")
     machine.succeed(ctl + "units.failed | jq -e '.hosts[0].units[0].unit == \"maxops-fixture.service\"'")
+    machine.succeed(ctl + "units.list --host fixture | jq -e '.units | length == 1'")
+    machine.succeed(ctl + "units.status --host fixture --unit maxops-fixture.service | jq -e '.unit.details.exec_main_status == 1'")
+    machine.succeed(ctl + "deploy.status | jq -e '.hosts[0].activated_at == null'")
     machine.succeed(ctl + "units.logs --host fixture --unit maxops-fixture.service | jq -e '[.entries[].message] | any(contains(\"maxops-journal-fixture\"))'")
     machine.fail(ctl + "units.logs --host fixture --unit sshd.service")
     machine.fail("runuser -u maxops-agent -- systemctl --no-ask-password restart maxops-fixture.service")

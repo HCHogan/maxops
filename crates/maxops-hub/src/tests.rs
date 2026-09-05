@@ -91,6 +91,130 @@ fn snapshot(host: &str) -> Value {
 }
 
 #[tokio::test]
+async fn expanded_operations_preserve_scope_and_unknown_deployment_time() {
+    let (url, task) = stub(Router::new()
+        .route("/v1/snapshot", get(|| async { Json(snapshot("alpha")) }))
+        .route("/v1/unit", post(|headers: HeaderMap, Json(params): Json<maxops_proto::UnitParams>| async move {
+            assert!(Token::parse(AGENT_TOKEN.into()).unwrap().matches(&headers));
+            assert_eq!(params.host, "alpha");
+            assert_eq!(params.unit, "demo.service");
+            let mut unit = snapshot("alpha")["units"][0].clone();
+            unit["details"] = json!({"main_pid": 12, "memory_current_bytes": null, "restarts": 3, "exec_main_code": 1, "exec_main_status": 2});
+            Json(json!({"host": "alpha", "observed_at": now(), "unit": unit}))
+        }))).await;
+    let router = router(Arc::new(app(
+        &url,
+        &["units:read", "host:read", "metrics:read"],
+    )));
+    for operation in ["units.list", "host.metrics", "deploy.status"] {
+        assert_eq!(
+            call(
+                router.clone(),
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op": operation, "params": {"host": "private"}})
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let (status, units) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"units.list", "params":{"host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(units["units"].as_array().unwrap().len(), 1);
+    let (status, detail) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"units.status", "params":{"host":"alpha", "unit":"demo.service"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["unit"]["details"]["restarts"], 3);
+    let (status, deployment) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"deploy.status", "params":{}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deployment["hosts"][0]["running_closure"],
+        "/nix/store/test-system"
+    );
+    assert!(deployment["hosts"][0]["activated_at"].is_null());
+    assert!(deployment["hosts"][0]["profile_generation"].is_null());
+    let (status, metrics) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"host.metrics", "params":{"host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(metrics["observation"]["state"], "not_configured");
+    task.abort();
+}
+
+#[tokio::test]
+async fn service_details_reject_wrong_identity_and_stale_observations() {
+    for (host, time) in [
+        ("private", now()),
+        ("alpha", now() - std::time::Duration::from_secs(100)),
+    ] {
+        let (url, task) = stub(Router::new().route("/v1/unit", post(move || async move {
+            Json(json!({"host": host, "observed_at": time, "unit": snapshot("alpha")["units"][0]}))
+        }))).await;
+        let router = router(Arc::new(app(&url, &["units:read"])));
+        assert_eq!(
+            call(
+                router,
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op":"units.status", "params":{"host":"alpha", "unit":"demo.service"}})
+            )
+            .await
+            .0,
+            StatusCode::BAD_GATEWAY
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn metrics_queries_are_fixed_and_host_scoped_over_http() {
+    let (url, task) = stub(Router::new().route("/api/v1/query", get(|axum::extract::Query(params): axum::extract::Query<BTreeMap<String, String>>| async move {
+        assert_eq!(params["timeout"], "5s");
+        assert!(params["query"].contains("instance=\"alpha\""));
+        let value = if params["query"].contains("timestamp(") { now().as_second().to_string() } else { "2.5".into() };
+        Json(json!({"status":"success", "data":{"resultType":"vector", "result":[{"metric":{"instance":"alpha", "job":"node", "maxops_metric":"load1"}, "value":[0, value]}]}}))
+    }))).await;
+    let mut state = app("http://127.0.0.1:1", &["metrics:read"]);
+    state.prometheus_url = Some(url);
+    let router = router(Arc::new(state));
+    let (status, result) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"host.metrics", "params":{"host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["observation"]["metrics"]["load1"]["samples"][0]["value"],
+        2.5
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn authorization_blocks_identity_spoofing_and_scope_escape() {
     let router = router(Arc::new(app("http://127.0.0.1:1", &["host:read"])));
     let body = json!({"op":"host.facts", "params":{"host":"alpha"}});

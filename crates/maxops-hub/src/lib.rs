@@ -21,6 +21,8 @@ use std::{
 use tokio::sync::Semaphore;
 use utoipa::OpenApi;
 
+mod metrics;
+
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(execute, catalog), components(schemas(Request)), modifiers(&BearerSecurity))]
 struct ApiDoc;
@@ -134,6 +136,12 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
         transport::validate_url(&host.agent_url)?;
         let token = Token::read(&host.agent_token_file)?;
         color_eyre::eyre::ensure!(
+            !hosts
+                .values()
+                .any(|other: &Host| other.token.same_as(&token)),
+            "each agent requires a distinct credential"
+        );
+        color_eyre::eyre::ensure!(
             hosts
                 .insert(
                     host.name.clone(),
@@ -197,6 +205,16 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
                     && !hosts.values().any(|h| h.token.same_as(&token)),
                 "alert ingress requires a dedicated token"
             );
+            if let Some(sink) = &sink_token {
+                color_eyre::eyre::ensure!(
+                    !sink.same_as(&token)
+                        && !clients
+                            .iter()
+                            .any(|principal| principal.token.same_as(sink))
+                        && !hosts.values().any(|host| host.token.same_as(sink)),
+                    "notification sink requires a dedicated token"
+                );
+            }
             Ok(AlertIngress {
                 token,
                 sink_url: ingress.sink_url,
@@ -374,6 +392,20 @@ async fn exporter_samples(app: &App) -> (&'static str, BTreeMap<String, Value>) 
     ("available", result)
 }
 
+async fn fleet_pressure(app: &App, principal: &Principal) -> BTreeMap<String, Value> {
+    let names: Vec<_> = principal.hosts.iter().collect();
+    let mut results = BTreeMap::new();
+    for chunk in names.chunks(8) {
+        results.extend(
+            join_all(chunk.iter().map(|name| async move {
+                ((*name).clone(), metrics::host_metrics(app, name).await)
+            }))
+            .await,
+        );
+    }
+    results
+}
+
 async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value, ApiError> {
     let upstream_error = || ApiError(StatusCode::BAD_GATEWAY, "upstream observation unavailable");
     match request {
@@ -383,16 +415,27 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
                 .iter()
                 .filter_map(|name| app.hosts.get(name))
                 .collect();
-            let (observations, (prometheus, samples)) =
-                tokio::join!(snapshots(app, hosts), exporter_samples(app));
+            let pressure = fleet_pressure(app, principal);
+            let (observations, (prometheus, samples), pressure) =
+                tokio::join!(snapshots(app, hosts), exporter_samples(app), pressure);
             let rows: Vec<_> = observations.into_iter().map(|(host, result)| {
                 let observation = match result {
                     Ok(snapshot) => json!({"state": "reachable", "observed_at": snapshot.observed_at,
                         "failed_units": snapshot.units.iter().filter(|u| u.active_state == "failed").count()}),
                     Err(_) => json!({"state": "unavailable", "observed_at": null, "failed_units": null}),
                 };
-                json!({"host": host.config.name, "site": host.config.site, "agent": observation,
-                    "exporter": samples.get(&host.config.name).cloned().unwrap_or(json!({"state": "unknown", "sample_at_unix_seconds": null}))})
+                let exporter = samples.get(&host.config.name).cloned().unwrap_or(json!({"state": "unknown", "sample_at_unix_seconds": null}));
+                let assessment = match (observation["state"].as_str(), exporter["state"].as_str()) {
+                    (Some("reachable"), Some("up")) => "observed_up",
+                    (Some("reachable"), Some("down")) => "exporter_unavailable",
+                    (Some("reachable"), _) => "agent_reachable_exporter_unknown",
+                    (_, Some("up")) => "agent_unavailable",
+                    (_, Some("down")) => "unreachable",
+                    _ => "unknown",
+                };
+                let metrics = pressure.get(&host.config.name).cloned().unwrap_or(Value::Null);
+                json!({"host": host.config.name, "site": host.config.site, "agent": observation, "exporter": exporter, "assessment": assessment,
+                    "pressure": {"state": metrics["state"], "load1": metrics["metrics"]["load1"], "filesystem_available_bytes": metrics["metrics"]["filesystem_available_bytes"], "filesystem_size_bytes": metrics["metrics"]["filesystem_size_bytes"]}})
             }).collect();
             Ok(json!({"observed_at": now(), "prometheus": prometheus, "hosts": rows}))
         }
@@ -419,19 +462,59 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
                 json!({"host": snapshot.host, "observed_at": snapshot.observed_at, "facts": snapshot.facts}),
             )
         }
+        Request::HostMetrics(params) => {
+            let host = host_for(app, principal, &params.host)?;
+            let metrics = metrics::host_metrics(app, &host.config.name).await;
+            Ok(json!({"host": host.config.name, "observed_at": now(), "observation": metrics}))
+        }
+        Request::DeployStatus(params) => {
+            let hosts = match params.host {
+                Some(name) => vec![host_for(app, principal, &name)?],
+                None => principal
+                    .hosts
+                    .iter()
+                    .filter_map(|name| app.hosts.get(name))
+                    .collect(),
+            };
+            let rows: Vec<_> = snapshots(app, hosts).await.into_iter().map(|(host, result)| match result {
+                Ok(snapshot) => json!({"host": host.config.name, "state": "available", "observed_at": snapshot.observed_at,
+                    "running_closure": snapshot.facts.system_closure, "system_profile": snapshot.facts.system_profile,
+                    "profile_generation": snapshot.facts.profile_generation, "profile_matches_running": snapshot.facts.profile_matches_running,
+                    "activated_at": null}),
+                Err(_) => json!({"host": host.config.name, "state": "unavailable", "observed_at": null}),
+            }).collect();
+            Ok(json!({"observed_at": now(), "hosts": rows}))
+        }
+        Request::UnitsList(params) => {
+            let host = host_for(app, principal, &params.host)?;
+            let snapshot = observe(app, host).await.map_err(|_| upstream_error())?;
+            Ok(
+                json!({"host": snapshot.host, "observed_at": snapshot.observed_at, "units": snapshot.units}),
+            )
+        }
         Request::UnitsStatus(params) => {
             let host = host_for(app, principal, &params.host)?;
             unit_allowed(host, &params.unit)?;
-            let snapshot = observe(app, host).await.map_err(|_| upstream_error())?;
-            let unit = snapshot
-                .units
-                .into_iter()
-                .find(|u| u.unit == params.unit)
-                .ok_or(ApiError(
-                    StatusCode::BAD_GATEWAY,
-                    "agent did not report requested unit",
-                ))?;
-            Ok(json!({"host": snapshot.host, "observed_at": snapshot.observed_at, "unit": unit}))
+            let observation: maxops_proto::UnitObservation = transport::read_json(
+                host.token
+                    .apply(app.client.post(format!(
+                        "{}/v1/unit",
+                        host.config.agent_url.trim_end_matches('/')
+                    )))
+                    .json(&params),
+            )
+            .await
+            .map_err(|_| upstream_error())?;
+            if observation.host != params.host
+                || observation.unit.unit != params.unit
+                || observation.observed_at.as_second() > now().as_second() + 30
+                || now().as_second() - observation.observed_at.as_second() > 90
+            {
+                return Err(upstream_error());
+            }
+            Ok(
+                json!({"host": observation.host, "observed_at": observation.observed_at, "unit": observation.unit}),
+            )
         }
         Request::UnitsLogs(params) => {
             params
@@ -534,7 +617,9 @@ async fn alerts(
         None => request,
     };
     match request.send().await {
-        Ok(response) if response.status().is_success() => Ok(Json(json!({"delivered": true}))),
+        Ok(response) if response.status().is_success() => Ok(Json(
+            json!({"accepted": true, "stage": "sink_acknowledged"}),
+        )),
         _ => Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "notification not acknowledged; retry",

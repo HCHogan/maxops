@@ -4,7 +4,8 @@ A small, read-only fleet control plane. Nix owns deployment and inventory;
 Prometheus owns metrics; maxops provides authenticated observations and optional
 Alertmanager webhook forwarding. No host or user from a private fleet is built in.
 
-This is an initial implementation, deployed as a read-only single-host NixOS pilot.
+Version 0.2 extends the initial single-host pilot with fleet observations.
+Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
 ## Implemented
 
@@ -15,7 +16,10 @@ This is an initial implementation, deployed as a read-only single-host NixOS pil
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
-  target, and optionally bounded journal queries.
+  target, persistent profile/generation, detailed service properties, and
+  optionally bounded journal queries.
+- `units.list`, `deploy.status`, and host-scoped `host.metrics`; fleet overview
+  includes load/filesystem pressure and cautious combined availability states.
 - Hub: partial fleet results, optional Prometheus exporter observations and
   host-scoped Alertmanager queries. Unreachable or stale observations remain
   unknown; they are not labelled as a host failure.
@@ -25,9 +29,9 @@ This is an initial implementation, deployed as a read-only single-host NixOS pil
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
 Not implemented: MCP, QQ impersonation/delegation, service changes, reboot,
-deployment, durable notification storage, custom PromQL, rich resource metrics,
-Nix generation numbers or trustworthy activation timestamps. A closure path is
-reported as a closure path; filesystem ctime is not called deployment time.
+deployment, hub-side durable notification storage, arbitrary PromQL, or
+trustworthy activation timestamps. Persistent profile generation is distinct
+from the running closure; filesystem ctime is never called deployment time.
 
 ## Develop
 
@@ -70,6 +74,9 @@ maxopsctl operations
 maxopsctl fleet.overview
 maxopsctl units.failed
 maxopsctl host.facts --host example
+maxopsctl host.metrics --host example
+maxopsctl deploy.status
+maxopsctl units.list --host example
 maxopsctl units.status --host example --unit nginx.service
 maxopsctl units.logs --host example --unit nginx.service --lines 50 --since-seconds 3600
 maxopsctl alerts.active
@@ -90,6 +97,7 @@ HTTP endpoints:
 | `POST /v1/execute` | Client token | `{"op":"host.facts","params":{"host":"example"}}` |
 | `POST /v1/alerts` | Separate ingress token | Forward an Alertmanager v4 webhook |
 | Agent `GET /v1/snapshot` | Agent token | Collect current permitted host observations |
+| Agent `POST /v1/unit` | Agent token | Detailed properties for one allowlisted service |
 | Agent `POST /v1/logs` | Agent token | Bounded log query with explicit host and unit |
 
 Hub and agent also accept `--config /path/to/config.json` when run outside NixOS.
@@ -155,3 +163,8 @@ notifications. In particular:
   an allowed inventory host. Fleet-wide and unlabelled alerts are omitted.
 - Prometheus must expose node-exporter series as `up{job="node",instance="<host>"}`.
   Source errors, stale samples and ambiguous duplicate instances are explicit.
+- `host.metrics` requires `metrics:read`. Fixed expressions read CPU idle rates,
+  load, memory, filesystem sizes/availability and network byte rates, always
+  with an exact host selector. CPU busy fraction is one minus idle rate per CPU.
+  Source times are queried separately; stale, future, missing, duplicate and
+  non-finite observations are not healthy zeroes. Arbitrary PromQL is disabled.

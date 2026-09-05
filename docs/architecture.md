@@ -51,8 +51,23 @@ query evaluation timestamp. Samples older than 90 seconds or more than 30
 seconds ahead are stale. The same tolerance applies to agent observations.
 
 Unit status uses systemd's loaded-unit list. An allowlisted unit that has not
-been loaded is explicitly unknown. The initial API does not promise runtime
-PID, memory, exit status or a complete list of every installed service.
+been loaded is explicitly unknown. `units.list` uses this bounded snapshot.
+`units.status` separately reads Service D-Bus properties for PID, memory,
+restart count and last main-process exit code/status. Unsupported memory
+accounting remains null, not zero. This is not a list of every installed unit.
+
+`host.metrics` uses fixed host-scoped expressions, including separate raw
+source timestamp queries for the counters underlying five-minute rates.
+Only selected dimension labels are exposed. Duplicate visible series remain
+ambiguous even when hidden labels differ. A source returning more than 4096
+points or malformed/oversized data is unavailable, never a healthy zero.
+Fleet overview combines exporter and agent observations without inferring a
+power failure or a network partition. Both unreachable means only unreachable.
+
+Facts and `deploy.status` distinguish `/run/current-system` from the resolved
+persistent profile. `profile_generation` comes from a `system-N-link` name and
+does not claim to identify a different running closure. `activated_at` remains
+null: symlink ctime is not evidence of a successful system activation.
 
 ## Notifications
 

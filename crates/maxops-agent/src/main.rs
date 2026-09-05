@@ -6,7 +6,8 @@ use axum::{
 };
 use clap::Parser;
 use maxops_proto::{
-    Facts, LogEntry, LogParams, Snapshot, UnitStatus, now,
+    Facts, LogEntry, LogParams, Snapshot, UnitDetails, UnitObservation, UnitParams, UnitStatus,
+    now,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -100,6 +101,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let router = Router::new()
         .route("/healthz", get(transport::health))
         .route("/v1/snapshot", get(snapshot))
+        .route("/v1/unit", post(unit_status))
         .route("/v1/logs", post(logs))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(app);
@@ -132,6 +134,7 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
                 load_state: u.2.clone(),
                 active_state: u.3.clone(),
                 sub_state: u.4.clone(),
+                details: None,
             },
             None => UnitStatus {
                 unit: name.clone(),
@@ -139,6 +142,7 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
                 load_state: "not-loaded".into(),
                 active_state: "unknown".into(),
                 sub_state: "unknown".into(),
+                details: None,
             },
         })
         .collect();
@@ -154,6 +158,15 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
     let system_closure = std::fs::read_link("/run/current-system")
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
+    let profile_link = std::fs::read_link("/nix/var/nix/profiles/system").ok();
+    let system_profile = std::fs::canonicalize("/nix/var/nix/profiles/system")
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let profile_generation = profile_link.as_deref().and_then(generation);
+    let profile_matches_running = system_closure
+        .as_ref()
+        .zip(system_profile.as_ref())
+        .map(|(running, profile)| running == profile);
     Ok(Snapshot {
         host: app.config.host.clone(),
         observed_at: now(),
@@ -161,8 +174,97 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
             kernel,
             uptime_seconds,
             system_closure,
+            system_profile,
+            profile_generation,
+            profile_matches_running,
         },
         units,
+    })
+}
+
+fn generation(path: &std::path::Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("system-")?
+        .strip_suffix("-link")?
+        .parse()
+        .ok()
+}
+
+async fn unit_status(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(params): Json<UnitParams>,
+) -> ApiResult<UnitObservation> {
+    authorize(&app, &headers)?;
+    if params.host != app.config.host
+        || !valid_unit(&params.unit)
+        || !app.config.readable_units.contains(&params.unit)
+    {
+        return Err(ApiError(StatusCode::FORBIDDEN, "service not permitted"));
+    }
+    let _slot = app
+        .slots
+        .try_acquire()
+        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "agent busy"))?;
+    match tokio::time::timeout(Duration::from_secs(5), collect_unit(&app, &params.unit)).await {
+        Ok(Ok(unit)) => Ok(Json(UnitObservation {
+            host: app.config.host.clone(),
+            observed_at: now(),
+            unit,
+        })),
+        _ => Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service observation unavailable",
+        )),
+    }
+}
+
+async fn collect_unit(app: &App, name: &str) -> color_eyre::eyre::Result<UnitStatus> {
+    let listed = ManagerProxy::new(&app.bus).await?.list_units().await?;
+    let Some(unit) = listed.iter().find(|unit| unit.0 == name) else {
+        return Ok(UnitStatus {
+            unit: name.into(),
+            description: String::new(),
+            load_state: "not-loaded".into(),
+            active_state: "unknown".into(),
+            sub_state: "unknown".into(),
+            details: None,
+        });
+    };
+    let proxy = zbus::fdo::PropertiesProxy::builder(&app.bus)
+        .destination("org.freedesktop.systemd1")?
+        .path(unit.6.clone())?
+        .build()
+        .await?;
+    let properties = proxy
+        .get_all("org.freedesktop.systemd1.Service".try_into()?)
+        .await?;
+    let details = UnitDetails {
+        main_pid: properties
+            .get("MainPID")
+            .and_then(|value| u32::try_from(value).ok()),
+        memory_current_bytes: properties
+            .get("MemoryCurrent")
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value != u64::MAX),
+        restarts: properties
+            .get("NRestarts")
+            .and_then(|value| u32::try_from(value).ok()),
+        exec_main_code: properties
+            .get("ExecMainCode")
+            .and_then(|value| i32::try_from(value).ok()),
+        exec_main_status: properties
+            .get("ExecMainStatus")
+            .and_then(|value| i32::try_from(value).ok()),
+    };
+    Ok(UnitStatus {
+        unit: unit.0.clone(),
+        description: unit.1.clone(),
+        load_state: unit.2.clone(),
+        active_state: unit.3.clone(),
+        sub_state: unit.4.clone(),
+        details: Some(details),
     })
 }
 
@@ -275,6 +377,18 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generation_is_only_a_profile_link_number() {
+        assert_eq!(generation(std::path::Path::new("system-42-link")), Some(42));
+        assert_eq!(
+            generation(std::path::Path::new("/nix/store/arbitrary-system")),
+            None
+        );
+        assert_eq!(
+            generation(std::path::Path::new("system-invalid-link")),
+            None
+        );
+    }
     #[test]
     fn journal_output_exposes_only_selected_fields() {
         let logs = parse_logs(br#"{"__REALTIME_TIMESTAMP":"123","PRIORITY":"3","MESSAGE":"failed","SECRET_FIELD":"hidden"}

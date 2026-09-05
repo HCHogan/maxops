@@ -88,7 +88,9 @@ with tempfile.TemporaryDirectory(prefix="maxops-smoke-") as directory:
         assert ctl("fleet.overview")["hosts"][0]["agent"]["failed_units"] == 1
         assert ctl("host.facts", "--host", "fixture")["facts"]["kernel"] == "synthetic"
         assert ctl("units.failed")["hosts"][0]["units"][0]["unit"] == "demo.service"
-        assert len(ctl("operations")["operations"]) == 4
+        assert ctl("units.list", "--host", "fixture")["units"][0]["unit"] == "demo.service"
+        assert ctl("deploy.status")["hosts"][0]["activated_at"] is None
+        assert len(ctl("operations")["operations"]) == 6
         with urlopen(Request(base + "/v1/openapi.json", headers={"Authorization": f"Bearer {user_token}"})) as response:
             assert "paths" in json.load(response)
         try:
