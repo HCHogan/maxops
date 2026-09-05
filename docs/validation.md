@@ -42,7 +42,15 @@ measurement per benchmark. This verifies the harness and provides a preliminary
 local baseline, not a fleet performance result. Run `just bench` for the normal
 sampling configuration.
 
-The actual Linux/systemd agent and journal permissions still require the NixOS
-VM test on a Linux builder with KVM. The VM derivation evaluating successfully
-does not establish that those runtime checks pass. Nothing has been deployed
-to the fleet or connected to a real notification destination.
+## Single-host NixOS pilot
+
+Revision `c484672` passed all 15 nextest tests on macOS and in the Linux Nix
+build sandbox. The consuming Nix configuration was then deployed and all six
+operations passed acceptance against real systemd, journal, Prometheus and
+Alertmanager data. The packaged CLI, credential separation, host/unit scope,
+log limits and the live daemon processes' unprivileged state were also checked.
+
+The consumer keeps its inventory, credentials and repeatable acceptance script
+in its own repository. No real notification destination is configured.
+The upstream VM test still requires a Linux builder with KVM and has not run;
+neither successful derivation evaluation nor this pilot replaces that test.

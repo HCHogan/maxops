@@ -4,7 +4,7 @@ A small, read-only fleet control plane. Nix owns deployment and inventory;
 Prometheus owns metrics; maxops provides authenticated observations and optional
 Alertmanager webhook forwarding. No host or user from a private fleet is built in.
 
-This is an initial implementation, not a deployed production service.
+This is an initial implementation, deployed as a read-only single-host NixOS pilot.
 
 ## Implemented
 
