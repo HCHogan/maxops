@@ -37,6 +37,10 @@
           ];
           buildInputs = [ pkgs.openssl ];
           useNextest = true;
+          # The Linux sandbox has no host CA store for reqwest's platform verifier.
+          preCheck = ''
+            export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+          '';
           __darwinAllowLocalNetworking = true;
           meta = {
             description = "Read-only fleet hub, Linux agent and CLI";

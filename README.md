@@ -100,7 +100,7 @@ minimal standalone example with ephemeral test credentials.
 
 ```nix
 # Consuming flake inputs:
-inputs.maxops.url = "path:/path/to/maxops"; # replace with a published Git URL later
+inputs.maxops.url = "github:HCHogan/maxops";
 inputs.maxops.inputs.nixpkgs.follows = "nixpkgs";
 
 # Agent host module:

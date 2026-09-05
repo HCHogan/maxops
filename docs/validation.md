@@ -15,6 +15,12 @@ Validated locally on aarch64-darwin using the devenv toolchain (Rust 1.95.0).
 | `nix flake check --all-systems --no-build` | Packages and both Linux VM test derivations evaluated |
 | `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 14 nextest tests in the Nix build sandbox |
 | Smoke test with Nix-packaged binaries | Passed against the synthetic loopback agent |
+| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 14 nextest tests in the Nix build sandbox |
+
+The Linux build initially failed when reqwest's platform verifier found no CA
+store inside the Nix sandbox. The package now supplies nixpkgs' CA bundle through
+`SSL_CERT_FILE` during checks; TLS verification remains enabled. The complete
+Linux package build and tests passed after this change.
 
 The HTTP tests cover identity/capability/host scope, service filtering, stale and
 oversized agent responses, agent identity mismatch, notification failure and
