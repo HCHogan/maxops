@@ -13,6 +13,7 @@ struct Args {
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = serde_json::from_slice(&std::fs::read(Args::parse().config)?)?;

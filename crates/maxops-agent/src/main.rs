@@ -74,6 +74,7 @@ trait Manager {
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();

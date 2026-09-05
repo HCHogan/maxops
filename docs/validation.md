@@ -22,6 +22,16 @@ store inside the Nix sandbox. The package now supplies nixpkgs' CA bundle throug
 `SSL_CERT_FILE` during checks; TLS verification remains enabled. The complete
 Linux package build and tests passed after this change.
 
+The first live Prometheus acceptance check exposed a label mismatch: `up` carries
+`__name__`, while `timestamp(up)` drops it. Matching now ignores only that label
+and preserves all other labels. A regression test reproduces the real response
+shape and includes another series with the same instance but a different job;
+it failed before the fix with `unknown` instead of `up`.
+
+The journal check also found that ANSI-coloured daemon messages were represented
+as byte arrays by journald. Hub and agent tracing now disable ANSI formatting so
+their own service messages remain plain text.
+
 The HTTP tests cover identity/capability/host scope, service filtering, stale and
 oversized agent responses, agent identity mismatch, notification failure and
 acknowledgement, active-alert scope, Prometheus scrape freshness, and OpenAPI

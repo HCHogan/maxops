@@ -366,3 +366,34 @@ fn openapi_contains_all_registry_operations() {
     }
     assert!(value["components"]["securitySchemes"]["bearer"].is_object());
 }
+
+#[tokio::test]
+async fn exporter_matches_timestamp_labels_without_metric_name() {
+    let scraped_at = now().as_second() - 5;
+    let (url, task) = stub(Router::new().route(
+        "/api/v1/query",
+        get(move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| async move {
+            let result = if query["query"].starts_with("timestamp(") {
+                json!([
+                    {"metric":{"instance":"alpha","job":"other"},"value":[now().as_second(),"1"]},
+                    {"metric":{"instance":"alpha","job":"node"},"value":[now().as_second(),scraped_at.to_string()]}
+                ])
+            } else {
+                json!([
+                    {"metric":{"__name__":"up","instance":"alpha","job":"node"},"value":[now().as_second(),"1"]}
+                ])
+            };
+            Json(json!({"status":"success","data":{"resultType":"vector","result":result}}))
+        }),
+    )).await;
+    let mut state = app("http://127.0.0.1:1", &[]);
+    state.prometheus_url = Some(url);
+    let (status, samples) = exporter_samples(&state).await;
+    assert_eq!(status, "available");
+    assert_eq!(samples["alpha"]["state"], "up");
+    assert_eq!(
+        samples["alpha"]["sample_at_unix_seconds"],
+        scraped_at as f64
+    );
+    task.abort();
+}

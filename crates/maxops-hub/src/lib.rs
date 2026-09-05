@@ -331,9 +331,15 @@ async fn exporter_samples(app: &App) -> (&'static str, BTreeMap<String, Value>) 
         prometheus_vector(app, url, "up{job=\"node\"}"),
         prometheus_vector(app, url, "timestamp(up{job=\"node\"})")
     );
-    let (Ok(values), Ok(times)) = (values, times) else {
+    let (Ok(mut values), Ok(mut times)) = (values, times) else {
         return ("unavailable", BTreeMap::new());
     };
+    // timestamp() drops __name__; match on all remaining series labels.
+    for sample in values.iter_mut().chain(times.iter_mut()) {
+        if let Some(labels) = sample.get_mut("metric").and_then(Value::as_object_mut) {
+            labels.remove("__name__");
+        }
+    }
     let mut result = BTreeMap::new();
     for sample in values {
         let Some(name) = sample["metric"]["instance"].as_str() else {
