@@ -9,6 +9,7 @@ use std::{net::SocketAddr, path::Path, time::Duration};
 use subtle::ConstantTimeEq;
 
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone)]
 pub struct Token(String);
@@ -54,7 +55,7 @@ pub type ApiResult<T> = Result<Json<T>, ApiError>;
 pub fn client() -> color_eyre::eyre::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(8))
+        .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()?)

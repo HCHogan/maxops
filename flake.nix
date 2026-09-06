@@ -19,7 +19,7 @@
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "maxops";
-          version = "0.2.0";
+          version = "0.2.1";
           src = nixpkgs.lib.fileset.toSource {
             root = ./.;
             fileset = nixpkgs.lib.fileset.unions [

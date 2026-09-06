@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
 
+const JOURNAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Parser)]
 #[command(version, about = "Read-only Linux host agent")]
 struct Args {
@@ -358,12 +360,7 @@ async fn logs(
         .slots
         .try_acquire()
         .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "agent busy"))?;
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        read_logs(&app.config.journalctl, &params),
-    )
-    .await
-    {
+    match tokio::time::timeout(JOURNAL_TIMEOUT, read_logs(&app.config.journalctl, &params)).await {
         Ok(Ok(entries)) => Ok(Json(
             serde_json::json!({"observed_at": now(), "host": params.host, "unit": params.unit, "entries": entries}),
         )),
@@ -377,6 +374,11 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn journal_deadline_leaves_time_for_http_response() {
+        assert!(JOURNAL_TIMEOUT + Duration::from_secs(2) <= transport::REQUEST_TIMEOUT);
+    }
+
     #[test]
     fn generation_is_only_a_profile_link_number() {
         assert_eq!(generation(std::path::Path::new("system-42-link")), Some(42));

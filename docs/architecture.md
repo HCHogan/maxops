@@ -32,11 +32,16 @@ than the API allowlist, and is disabled by default.
 
 Limits: 4 KiB query requests, 256 KiB incoming alert payloads, 2 MiB upstream
 JSON, 1 MiB journal output, 1–200 journal entries and a 1–86400 second window.
-The journal subprocess has a five-second timeout and is killed on cancellation;
-HTTP connects have a two-second timeout and requests eight seconds. Requests
+The journal subprocess has a ten-second timeout and is killed on cancellation;
+HTTP connects have a two-second timeout and requests twelve seconds. Requests
 use a shared client with redirects and environment/system proxies disabled.
 At most 16 hub handlers and eight agent observations/log reads run concurrently;
 fleet queries visit at most eight agents per batch. Health checks are exempt.
+
+Cold journal scans can take several seconds even for a small result. The HTTP
+budget leaves room for the journal deadline, and consumers must allow more than
+twelve seconds for a complete hub request. This does not narrow journal history,
+skip service-manager entries, or relax the byte, line or concurrency limits.
 
 ## Observations
 
