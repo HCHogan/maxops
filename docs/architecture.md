@@ -112,9 +112,19 @@ References: [reqwest](https://docs.rs/reqwest/latest/reqwest/),
 
 ## Before mutations
 
-Do not add mutation routes by reusing query authorization alone. They need
-authenticated confirmation outside the LLM, immutable intent parameters,
-expiration, one-time consumption, per-agent operation IDs, durable execution
-records and reconciliation of unknown outcomes. Polkit must restrict the actual
-unit and verb and be tested from the unprivileged agent account. Reboot and
-deployment remain separate decisions.
+Version 0.2 remains read-only. The 2026-09-06 owner decision uses preauthorized
+management clients for future execution, with observation credentials kept
+separate. It does not require per-command human confirmation within the configured
+scope. Immutable job specifications, execution-time checks, idempotency, durable
+records and reconciliation of unknown outcomes remain required.
+
+maxops is one of several fleet writers. People and other tools may push commits,
+rebuild hosts or change services directly. Live observations and remote refs are
+distinct from maxops's own operation history; internal locks do not exclude those
+writers. Plans must revalidate their baselines, and recovery must stop when a
+later external deployment has superseded the operation.
+
+The [implementation plan](implementation-plan.md) defines the independent executor,
+workspace, deployment and recovery stages. It supersedes the earlier per-action
+confirmation proposal for this work. The planned features are not yet implemented;
+reboot and data recovery have separate implementation and verification requirements.

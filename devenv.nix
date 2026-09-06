@@ -25,5 +25,8 @@
     cargo test --workspace --doc --locked
   '';
 
-  scripts.bench.exec = "cargo bench -p maxops-proto --bench protocol --locked";
+  scripts.bench.exec = ''
+    cargo bench -p maxops-proto --bench protocol --locked
+    cargo bench -p maxops-store --bench store --locked
+  '';
 }

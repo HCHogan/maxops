@@ -1,10 +1,12 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use maxops_proto::{
-    Request, operations,
+    PROTOCOL_VERSION, Request, operations,
     transport::{self, Token},
 };
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{io::Read, path::Path};
+
+const MAX_PARAMS_BYTES: u64 = 1024 * 1024;
 
 fn cli() -> Command {
     let mut command = Command::new("maxopsctl")
@@ -30,7 +32,21 @@ fn cli() -> Command {
                 .about("Print the local versioned operation catalog; no connection required"),
         );
     for operation in operations() {
-        let mut subcommand = Command::new(operation.name).about(operation.summary);
+        let mut subcommand = Command::new(operation.name)
+            .about(operation.summary)
+            .arg(
+                Arg::new("params-file")
+                    .long("params-file")
+                    .value_name("PATH")
+                    .conflicts_with("params-stdin")
+                    .help("Read the complete params JSON object from a file"),
+            )
+            .arg(
+                Arg::new("params-stdin")
+                    .long("params-stdin")
+                    .action(ArgAction::SetTrue)
+                    .help("Read the complete params JSON object from stdin"),
+            );
         let schema = serde_json::to_value(operation.params_schema).expect("serializable schema");
         if let Some(properties) = schema["properties"].as_object() {
             for (name, property) in properties {
@@ -39,7 +55,10 @@ fn cli() -> Command {
                     .is_some_and(|items| items.iter().any(|item| item == name));
                 let mut arg = Arg::new(name.clone())
                     .long(name.replace('_', "-"))
-                    .required(required);
+                    .conflicts_with_all(["params-file", "params-stdin"]);
+                if required {
+                    arg = arg.required_unless_present_any(["params-file", "params-stdin"]);
+                }
                 if property["type"] == "integer" {
                     arg = arg.value_parser(clap::value_parser!(u64));
                 }
@@ -59,7 +78,9 @@ async fn main() -> color_eyre::eyre::Result<()> {
     if operation == "schema" {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"version": 1, "operations": operations()}))?
+            serde_json::to_string_pretty(
+                &json!({"version": PROTOCOL_VERSION, "operations": operations()}),
+            )?
         );
         return Ok(());
     }
@@ -76,23 +97,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let request = if operation == "operations" {
         token.apply(client.get(format!("{url}/v1/operations")))
     } else {
-        let definition = operations()
-            .into_iter()
-            .find(|item| item.name == operation)
-            .expect("registered operation");
-        let schema = serde_json::to_value(definition.params_schema)?;
-        let mut params = serde_json::Map::new();
-        if let Some(properties) = schema["properties"].as_object() {
-            for (name, property) in properties {
-                if property["type"] == "integer" {
-                    if let Some(value) = args.get_one::<u64>(name) {
-                        params.insert(name.clone(), json!(value));
-                    }
-                } else if let Some(value) = args.get_one::<String>(name) {
-                    params.insert(name.clone(), json!(value));
-                }
-            }
-        }
+        let params = operation_params(operation, args)?;
         let request: Request = serde_json::from_value(json!({"op": operation, "params": params}))?;
         if let Request::UnitsLogs(params) = &request {
             params.validate().map_err(color_eyre::eyre::Report::msg)?;
@@ -104,6 +109,52 @@ async fn main() -> color_eyre::eyre::Result<()> {
     let response: Value = transport::read_json(request).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
+}
+
+fn operation_params(operation: &str, args: &ArgMatches) -> color_eyre::eyre::Result<Value> {
+    if let Some(path) = args.get_one::<String>("params-file") {
+        let bytes = read_params(std::fs::File::open(path)?)?;
+        return parse_params(&bytes);
+    }
+    if args.get_flag("params-stdin") {
+        let bytes = read_params(std::io::stdin().lock())?;
+        return parse_params(&bytes);
+    }
+
+    let definition = operations()
+        .into_iter()
+        .find(|item| item.name == operation)
+        .expect("registered operation");
+    let schema = serde_json::to_value(definition.params_schema)?;
+    let mut params = serde_json::Map::new();
+    if let Some(properties) = schema["properties"].as_object() {
+        for (name, property) in properties {
+            if property["type"] == "integer" {
+                if let Some(value) = args.get_one::<u64>(name) {
+                    params.insert(name.clone(), json!(value));
+                }
+            } else if let Some(value) = args.get_one::<String>(name) {
+                params.insert(name.clone(), json!(value));
+            }
+        }
+    }
+    Ok(Value::Object(params))
+}
+
+fn read_params(reader: impl Read) -> color_eyre::eyre::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_PARAMS_BYTES + 1).read_to_end(&mut bytes)?;
+    color_eyre::eyre::ensure!(
+        bytes.len() as u64 <= MAX_PARAMS_BYTES,
+        "params JSON exceeds 1 MiB"
+    );
+    Ok(bytes)
+}
+
+fn parse_params(bytes: &[u8]) -> color_eyre::eyre::Result<Value> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    color_eyre::eyre::ensure!(value.is_object(), "params JSON must be an object");
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -140,6 +191,45 @@ mod tests {
             cli()
                 .try_get_matches_from(["maxopsctl", "units.restart"])
                 .is_err()
+        );
+        assert!(
+            cli()
+                .try_get_matches_from(["maxopsctl", "host.facts", "--params-stdin"])
+                .is_ok()
+        );
+        assert!(
+            cli()
+                .try_get_matches_from(["maxopsctl", "host.facts", "--params-stdin", "--host", "a"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn complete_params_input_requires_a_json_object() {
+        assert_eq!(parse_params(br#"{"host":"a"}"#).unwrap()["host"], "a");
+        assert!(parse_params(br#"["a"]"#).is_err());
+        assert!(parse_params(b"not-json").is_err());
+    }
+
+    #[test]
+    fn params_file_supports_nested_values_and_replaces_short_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("params.json");
+        std::fs::write(&path, br#"{"host":"a","nested":{"items":[1,2]}}"#).unwrap();
+        let matches = cli()
+            .try_get_matches_from([
+                "maxopsctl",
+                "host.facts",
+                "--params-file",
+                path.to_str().unwrap(),
+            ])
+            .unwrap();
+        let (operation, args) = matches.subcommand().unwrap();
+        let params = operation_params(operation, args).unwrap();
+        assert_eq!(params["nested"]["items"][1], 2);
+        assert!(
+            serde_json::from_value::<Request>(json!({"op":operation,"params":params})).is_err(),
+            "the protocol type still rejects fields not in the selected operation"
         );
     }
 }

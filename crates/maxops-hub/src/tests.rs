@@ -71,6 +71,23 @@ async fn call(router: Router, path: &str, token: Option<&str>, body: Value) -> (
     )
 }
 
+async fn get_json(router: Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
+    let mut builder = HttpRequest::builder().method("GET").uri(path);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 async fn stub(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -88,6 +105,25 @@ fn snapshot(host: &str) -> Value {
         {"unit": "demo.service", "description": "demo", "load_state": "loaded", "active_state": "failed", "sub_state": "failed"},
         {"unit": "secret.service", "description": "secret", "load_state": "loaded", "active_state": "failed", "sub_state": "failed"}
     ]})
+}
+
+#[tokio::test]
+async fn catalog_serves_shared_protocol_metadata() {
+    let router = router(Arc::new(app(
+        "http://127.0.0.1:1",
+        &["host:read", "units:read"],
+    )));
+    let (status, catalog) = get_json(router, "/v1/operations", Some(USER_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["version"], PROTOCOL_VERSION);
+    for operation in catalog["operations"].as_array().unwrap() {
+        assert_eq!(operation["kind"], "observation");
+        assert_eq!(operation["read_only"], true);
+        assert!(operation["params_schema"].is_object());
+        assert!(operation["response_schema"].is_object());
+        assert_eq!(operation["minimum_protocol_version"], 1);
+        assert_eq!(operation["idempotency"], "none");
+    }
 }
 
 #[tokio::test]

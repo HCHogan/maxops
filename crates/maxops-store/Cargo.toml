@@ -1,16 +1,24 @@
 [package]
-name = "maxopsctl"
+name = "maxops-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 color-eyre.workspace = true
-clap.workspace = true
+jiff.workspace = true
 maxops-proto.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile = "3"
+
+[[bench]]
+name = "store"
+harness = false

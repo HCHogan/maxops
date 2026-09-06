@@ -1,8 +1,19 @@
-//! Versioned, read-only operations shared by every frontend.
+//! Versioned operations and durable execution types shared by every frontend.
+pub mod changes;
+pub mod events;
+pub mod jobs;
+pub mod observations;
 pub mod transport;
+
+pub use changes::*;
+pub use events::*;
+pub use jobs::*;
+pub use observations::*;
 
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Serialize};
+
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -62,19 +73,38 @@ impl LogParams {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Observation,
+    JobSubmission,
+    JobControl,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdempotencyRequirement {
+    None,
+    Required,
+}
+
 #[derive(Clone, Serialize)]
 pub struct Operation {
     pub name: &'static str,
     pub summary: &'static str,
     pub capability: &'static str,
+    pub kind: OperationKind,
     pub read_only: bool,
+    pub minimum_protocol_version: u16,
+    pub idempotency: IdempotencyRequirement,
     pub params_schema: Schema,
+    pub response_schema: Schema,
 }
 
 // Keep wire names, capability names, schemas and CLI discovery together.
 // `tt` keeps the wire-name literal visible to utoipa's serde attribute parser.
 macro_rules! operations {
-    ($( $variant:ident($params:ty), $name:tt, $cap:literal, $summary:literal; )*) => {
+    ($( $variant:ident($params:ty) -> $response:ty, $name:tt, $cap:literal, $kind:expr, $read_only:expr, $idempotency:expr, $summary:literal; )*) => {
         #[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
         #[serde(tag = "op", content = "params", deny_unknown_fields)]
         pub enum Request {
@@ -90,23 +120,30 @@ macro_rules! operations {
         }
         pub fn operations() -> Vec<Operation> {
             vec![$(Operation {
-                name: $name, summary: $summary, capability: $cap, read_only: true,
+                name: $name,
+                summary: $summary,
+                capability: $cap,
+                kind: $kind,
+                read_only: $read_only,
+                minimum_protocol_version: 1,
+                idempotency: $idempotency,
                 params_schema: schema_for!($params),
+                response_schema: schema_for!($response),
             },)*]
         }
     }
 }
 
 operations! {
-    FleetOverview(Empty), "fleet.overview", "fleet:read", "Observed agent and exporter state for permitted hosts";
-    UnitsFailed(FailedParams), "units.failed", "units:read", "Failed readable services; unreachable hosts remain explicit";
-    HostFacts(HostParams), "host.facts", "host:read", "Kernel, uptime and the running system closure";
-    HostMetrics(HostParams), "host.metrics", "metrics:read", "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
-    DeployStatus(FailedParams), "deploy.status", "host:read", "Running closure versus persistent system profile; unavailable hosts remain explicit";
-    UnitsList(HostParams), "units.list", "units:read", "All explicitly readable services, including unloaded services";
-    UnitsStatus(UnitParams), "units.status", "units:read", "State of one explicitly readable service";
-    UnitsLogs(LogParams), "units.logs", "logs:read", "Bounded recent journal entries for one readable service";
-    AlertsActive(Empty), "alerts.active", "alerts:read", "Active alerts with an instance label matching permitted hosts";
+    FleetOverview(Empty) -> serde_json::Value, "fleet.overview", "fleet:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Observed agent and exporter state for permitted hosts";
+    UnitsFailed(FailedParams) -> serde_json::Value, "units.failed", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Failed readable services; unreachable hosts remain explicit";
+    HostFacts(HostParams) -> serde_json::Value, "host.facts", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Kernel, uptime and the running system closure";
+    HostMetrics(HostParams) -> serde_json::Value, "host.metrics", "metrics:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
+    DeployStatus(FailedParams) -> serde_json::Value, "deploy.status", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Running closure versus persistent system profile; unavailable hosts remain explicit";
+    UnitsList(HostParams) -> serde_json::Value, "units.list", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "All explicitly readable services, including unloaded services";
+    UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one explicitly readable service";
+    UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
+    AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -124,62 +161,6 @@ pub fn valid_host(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct Facts {
-    pub kernel: String,
-    pub uptime_seconds: f64,
-    pub system_closure: Option<String>,
-    #[serde(default)]
-    pub system_profile: Option<String>,
-    #[serde(default)]
-    pub profile_generation: Option<u64>,
-    #[serde(default)]
-    pub profile_matches_running: Option<bool>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct UnitStatus {
-    pub unit: String,
-    pub description: String,
-    pub load_state: String,
-    pub active_state: String,
-    pub sub_state: String,
-    #[serde(default)]
-    pub details: Option<UnitDetails>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct UnitDetails {
-    pub main_pid: Option<u32>,
-    pub memory_current_bytes: Option<u64>,
-    pub restarts: Option<u32>,
-    pub exec_main_code: Option<i32>,
-    pub exec_main_status: Option<i32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct UnitObservation {
-    pub host: String,
-    pub observed_at: jiff::Timestamp,
-    pub unit: UnitStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct Snapshot {
-    pub host: String,
-    /// Agent collection time in UTC. Not deployment time.
-    pub observed_at: jiff::Timestamp,
-    pub facts: Facts,
-    pub units: Vec<UnitStatus>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, utoipa::ToSchema)]
-pub struct LogEntry {
-    pub timestamp_us: Option<String>,
-    pub priority: Option<String>,
-    pub message: serde_json::Value,
 }
 
 pub fn now() -> jiff::Timestamp {
@@ -220,5 +201,20 @@ mod tests {
             assert!(!valid_unit(unit));
         }
         assert!(valid_unit("worker@one.service"));
+    }
+
+    #[test]
+    fn registry_exposes_execution_metadata_without_changing_observation_names() {
+        let operations = operations();
+        assert_eq!(operations.len(), 9);
+        assert!(operations.iter().all(|operation| {
+            matches!(operation.kind, OperationKind::Observation)
+                && operation.read_only
+                && operation.minimum_protocol_version == 1
+                && matches!(operation.idempotency, IdempotencyRequirement::None)
+        }));
+        let value = serde_json::to_value(&operations).unwrap();
+        assert!(value[0]["params_schema"].is_object());
+        assert!(value[0]["response_schema"].is_object());
     }
 }

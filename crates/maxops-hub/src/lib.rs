@@ -6,7 +6,7 @@ use axum::{
 };
 use futures::future::join_all;
 use maxops_proto::{
-    Request, Snapshot, now, operations,
+    PROTOCOL_VERSION, Request, Snapshot, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -278,7 +278,7 @@ fn unit_allowed(host: &Host, unit: &str) -> Result<(), ApiError> {
 async fn catalog(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Value> {
     let principal = authenticate(&app, &headers)?;
     Ok(Json(
-        json!({"version": 1, "operations": operations().into_iter()
+        json!({"version": PROTOCOL_VERSION, "operations": operations().into_iter()
         .filter(|op| principal.capabilities.contains(op.capability)).collect::<Vec<_>>()}),
     ))
 }

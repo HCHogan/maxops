@@ -7,12 +7,22 @@ Alertmanager webhook forwarding. No host or user from a private fleet is built i
 Version 0.2 extends the initial single-host pilot with fleet observations.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
+The next-stage [implementation plan](docs/implementation-plan.md) covers durable
+command jobs, configuration workspaces and verified deployments for people and
+any automation client. These capabilities are planned; version 0.2 remains read-only.
+The design supports concurrent manual and external changes to repositories and hosts.
+
 ## Implemented
 
-- Four Rust crates: `maxops-proto`, `maxops-agent`, `maxops-hub`, `maxopsctl`.
+- Five Rust crates: `maxops-proto`, `maxops-store`, `maxops-agent`, `maxops-hub`,
+  `maxopsctl`.
 - A shared operation registry generates request decoding, capability names,
-  parameter JSON Schemas and CLI subcommands. Utoipa derives OpenAPI from the
-  same request types.
+  operation kind, idempotency requirement, parameter/response JSON Schemas and
+  CLI subcommands. Utoipa derives OpenAPI from the same request types.
+- The P0 execution substrate defines durable job/event/change types and a local
+  SQLx/SQLite store with migrations, idempotent submission, revisioned state
+  transitions, external observations and consistent backups. It is not wired to
+  a command executor or enabled through the Hub yet.
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
@@ -28,8 +38,8 @@ Fleet inventory and deployment evidence belong to the consuming Nix repository.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: MCP, QQ impersonation/delegation, service changes, reboot,
-deployment, hub-side durable notification storage, arbitrary PromQL, or
+Not implemented: command execution, MCP, QQ impersonation/delegation, service
+changes, reboot, deployment, hub-side durable notification storage, arbitrary PromQL, or
 trustworthy activation timestamps. Persistent profile generation is distinct
 from the running closure; filesystem ctime is never called deployment time.
 
