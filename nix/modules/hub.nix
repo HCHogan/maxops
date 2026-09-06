@@ -21,12 +21,22 @@ let
   clients = lib.imap0 (i: client: {
     name = client.name;
     token_file = "${credentialDir}/client-${toString i}";
-    inherit (client) hosts capabilities access repositories;
+    inherit (client) hosts capabilities access repositories deployments;
   }) cfg.clients;
   repositories = map (repository: {
     name = repository.name;
     executor_host = repository.executorHost;
   }) cfg.repositories;
+  deployments = map (deployment: {
+    name = deployment.name;
+    repository = deployment.repository;
+    builder_host = deployment.builderHost;
+    target_host = deployment.targetHost;
+    kind = deployment.kind;
+    flake_attribute = deployment.flakeAttribute;
+    source_reference = deployment.sourceReference;
+    plan_ttl_seconds = deployment.planTtlSeconds;
+  }) cfg.deployments;
   secretFiles =
     map (host: host.tokenFile) cfg.hosts
     ++ lib.filter (path: path != null) (map (host: host.executionTokenFile) cfg.hosts)
@@ -38,7 +48,7 @@ let
   configFile = (pkgs.formats.json { }).generate "maxops-hub.json" {
     listen = "${cfg.listenAddress}:${toString cfg.port}";
     state_file = "/var/lib/maxops-hub/state.db";
-    inherit hosts clients repositories;
+    inherit hosts clients repositories deployments;
     prometheus_url = cfg.prometheusUrl;
     alertmanager_url = cfg.alertmanagerUrl;
     alert_ingress =
@@ -158,6 +168,8 @@ in
                   "workspace:read"
                   "workspace:write"
                   "workspace:publish"
+                  "deploy:manage"
+                  "changes:read"
                 ]
               );
               default = [ ];
@@ -167,6 +179,11 @@ in
               type = lib.types.listOf lib.types.str;
               default = [ ];
               description = "Exact configured repository IDs available to this principal.";
+            };
+            deployments = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Exact deployment profile IDs available to this principal.";
             };
             access = lib.mkOption {
               type = lib.types.enum [
@@ -193,6 +210,33 @@ in
             executorHost = lib.mkOption {
               type = lib.types.str;
               description = "Inventory host that owns this repository's mirror and workspaces.";
+            };
+          };
+        }
+      );
+    };
+    deployments = lib.mkOption {
+      default = [ ];
+      description = "Fleet deployment profiles routed across configured builder and target executors.";
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            name = lib.mkOption { type = lib.types.str; };
+            repository = lib.mkOption { type = lib.types.str; };
+            builderHost = lib.mkOption { type = lib.types.str; };
+            targetHost = lib.mkOption { type = lib.types.str; };
+            kind = lib.mkOption {
+              type = lib.types.enum [ "system" "home" ];
+              default = "system";
+            };
+            flakeAttribute = lib.mkOption { type = lib.types.str; };
+            sourceReference = lib.mkOption {
+              type = lib.types.str;
+              default = "refs/heads/main";
+            };
+            planTtlSeconds = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 3600;
             };
           };
         }
@@ -263,6 +307,31 @@ in
           ) client.repositories
         ) cfg.clients;
         message = "maxops-hub client repositories must exist and their executor must be in host scope.";
+      }
+      {
+        assertion = lib.all (deployment:
+          lib.any (repository:
+            repository.name == deployment.repository
+            && repository.executorHost == deployment.builderHost
+          ) cfg.repositories
+          && lib.any (host:
+            host.name == deployment.targetHost && host.executionTokenFile != null
+          ) cfg.hosts
+        ) cfg.deployments;
+        message = "maxops-hub deployments require the configured repository builder and an enabled target executor.";
+      }
+      {
+        assertion = lib.all (client:
+          lib.all (deploymentName:
+            lib.any (deployment:
+              deployment.name == deploymentName
+              && builtins.elem deployment.repository client.repositories
+              && builtins.elem deployment.builderHost client.hosts
+              && builtins.elem deployment.targetHost client.hosts
+            ) cfg.deployments
+          ) client.deployments
+        ) cfg.clients;
+        message = "maxops-hub deployment grants must remain within each client's repository and host scope.";
       }
     ];
     systemd.services.maxops-hub = {

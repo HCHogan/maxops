@@ -1,7 +1,64 @@
 { pkgs, self }:
 pkgs.testers.runNixOSTest {
   name = "maxops-read-only";
-  nodes.machine = { pkgs, ... }: {
+  nodes.machine = { pkgs, ... }:
+    let
+      deploymentBaseline = pkgs.runCommand "maxops-deployment-baseline" { } ''
+        mkdir -p $out/bin
+        cat > $out/bin/switch-to-configuration <<EOF
+        #!${pkgs.runtimeShell}
+        ${pkgs.coreutils}/bin/ln -sfn "$out" /run/maxops-fixture-current
+        ${pkgs.coreutils}/bin/printf 'baseline\n' > /run/maxops-fixture-mode
+        EOF
+        chmod +x $out/bin/switch-to-configuration
+      '';
+      deploymentExternal = pkgs.runCommand "maxops-deployment-external" { } ''
+        mkdir -p $out/bin
+        cat > $out/bin/switch-to-configuration <<EOF
+        #!${pkgs.runtimeShell}
+        ${pkgs.coreutils}/bin/ln -sfn "$out" /run/maxops-fixture-current
+        ${pkgs.coreutils}/bin/printf 'external\n' > /run/maxops-fixture-mode
+        EOF
+        chmod +x $out/bin/switch-to-configuration
+      '';
+      deploymentFlake = pkgs.writeText "maxops-fixture-flake.nix" ''
+        {
+          outputs = { self }:
+            let
+              mode = builtins.readFile ./config.txt;
+            in {
+              packages.x86_64-linux.default = derivation {
+                name = "maxops-fixture-system";
+                system = "x86_64-linux";
+                builder = ./busybox;
+                args = [ "sh" "-c" '''
+                  "$builder" mkdir -p $out/bin
+                  "$builder" cp "$builder" $out/bin/busybox
+                  "$builder" cat > $out/bin/switch-to-configuration <<EOF
+                  #!$out/bin/busybox sh
+                  $out/bin/busybox ln -sfn "$out" /run/maxops-fixture-current
+                  $out/bin/busybox printf '%s' "''${mode}" > /run/maxops-fixture-mode
+                  if [ "''${mode}" = bad ]; then exit 1; fi
+                  EOF
+                  "$builder" chmod +x $out/bin/switch-to-configuration
+                ''' ];
+              };
+            };
+        }
+      '';
+      deploymentLock = pkgs.writeText "maxops-fixture-flake.lock" ''
+        {
+          "nodes": {
+            "root": {
+              "inputs": {}
+            }
+          },
+          "root": "root",
+          "version": 7
+        }
+      '';
+    in
+  {
     imports = [ self.nixosModules.default ];
     networking.hostName = "fixture";
     # The classic initrd avoids case-colliding terminfo directories when this
@@ -20,6 +77,10 @@ pkgs.testers.runNixOSTest {
       "f /run/manager-token 0400 root root - manager-test-token-dddddddddddddddddddd"
       "f /run/manager2-token 0400 root root - manager2-test-token-eeeeeeeeeeeeeeeeeeeee"
       "f /run/job-credential 0400 root root - fixture-credential-value"
+      "d /var/lib/maxops-fixture-deploy 0755 root root - -"
+      "L+ /var/lib/maxops-fixture-deploy/profile - - - - ${deploymentBaseline}"
+      "L+ /run/maxops-fixture-current - - - - ${deploymentBaseline}"
+      "L+ /run/maxops-fixture-external - - - - ${deploymentExternal}"
     ];
     services.maxops-executor = {
       enable = true;
@@ -29,11 +90,23 @@ pkgs.testers.runNixOSTest {
       ];
       credentialSources.fixture = "/run/job-credential";
       profiles.diagnostic = {
-        timeoutSeconds = 30;
+        timeoutSeconds = 600;
         outputLimitBytes = 64;
         tasksMax = 32;
         memoryMaxBytes = 268435456;
         allowedCredentials = [ "fixture" ];
+      };
+      profiles.activation = {
+        user = "root";
+        privileged = true;
+        timeoutSeconds = 300;
+        outputLimitBytes = 65536;
+      };
+      profiles.deployment = {
+        timeoutSeconds = 600;
+        outputLimitBytes = 65536;
+        tasksMax = 32;
+        memoryMaxBytes = 268435456;
       };
       repositories.fixture = {
         url = "/var/lib/maxops-executor/fixture-remote.git";
@@ -50,6 +123,23 @@ pkgs.testers.runNixOSTest {
             ''first=$(cat config.txt); sleep 6; test "$first" = changed && test "$(cat config.txt)" = changed && test -z "''${CREDENTIALS_DIRECTORY+x}"''
           ];
         };
+      };
+      deploymentProfiles.fixture-system = {
+        repository = "fixture";
+        targetHost = "fixture";
+        flakeAttribute = "packages.x86_64-linux.default";
+        buildProfile = "deployment";
+        activateProfile = "activation";
+        verifyProfile = "deployment";
+        profilePath = "/var/lib/maxops-fixture-deploy/profile";
+        runningLink = "/run/maxops-fixture-current";
+        verifyCommands = [
+          [
+            "${pkgs.bash}/bin/bash"
+            "-c"
+            ''test "$(${pkgs.coreutils}/bin/readlink /run/maxops-fixture-current)" = "$(${pkgs.coreutils}/bin/readlink -f /var/lib/maxops-fixture-deploy/profile)" && ${pkgs.gnugrep}/bin/grep -qx published /run/maxops-fixture-mode''
+          ]
+        ];
       };
     };
     services.maxops-agent = {
@@ -76,6 +166,15 @@ pkgs.testers.runNixOSTest {
         {
           name = "fixture";
           executorHost = "fixture";
+        }
+      ];
+      deployments = [
+        {
+          name = "fixture-system";
+          repository = "fixture";
+          builderHost = "fixture";
+          targetHost = "fixture";
+          flakeAttribute = "packages.x86_64-linux.default";
         }
       ];
       hosts = [
@@ -120,8 +219,11 @@ pkgs.testers.runNixOSTest {
             "workspace:read"
             "workspace:write"
             "workspace:publish"
+            "deploy:manage"
+            "changes:read"
           ];
           repositories = [ "fixture" ];
+          deployments = [ "fixture-system" ];
         }
         {
           name = "manager2";
@@ -142,8 +244,12 @@ pkgs.testers.runNixOSTest {
         ${pkgs.git}/bin/git init --bare --initial-branch=main /var/lib/maxops-executor/fixture-remote.git
         ${pkgs.git}/bin/git init --initial-branch=main /var/lib/maxops-executor/fixture-seed
         printf 'initial\n' > /var/lib/maxops-executor/fixture-seed/config.txt
+        cp ${pkgs.pkgsStatic.busybox}/bin/busybox /var/lib/maxops-executor/fixture-seed/busybox
+        chmod +x /var/lib/maxops-executor/fixture-seed/busybox
+        cp ${deploymentFlake} /var/lib/maxops-executor/fixture-seed/flake.nix
+        cp ${deploymentLock} /var/lib/maxops-executor/fixture-seed/flake.lock
         ln -s /etc/shadow /var/lib/maxops-executor/fixture-seed/escape
-        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed add config.txt escape
+        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed add config.txt busybox flake.nix flake.lock escape
         ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed \
           -c user.name=Fixture -c user.email=fixture@example.invalid commit -m initial
         ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed remote add origin /var/lib/maxops-executor/fixture-remote.git
@@ -189,6 +295,8 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("maxops-executor.service")
     machine.wait_for_unit("maxops-hub.service")
     machine.wait_for_open_port(9721)
+    baseline = machine.succeed("readlink /run/maxops-fixture-current").strip()
+    external_deployment = machine.succeed("readlink /run/maxops-fixture-external").strip()
     machine.succeed("curl -fsS http://127.0.0.1:9720/healthz")
     machine.fail("curl -fsS http://127.0.0.1:9720/v1/snapshot")
     ctl = "timeout 60 maxopsctl --token-file /run/client-token "
@@ -349,5 +457,91 @@ pkgs.testers.runNixOSTest {
     machine.succeed("git --git-dir=/var/lib/maxops-executor/fixture-remote.git show refs/heads/main:config.txt | grep -x published")
     machine.fail("git -C /tmp/human diff --quiet")
     machine.succeed("grep -F dirty /tmp/human/config.txt")
+
+    # Build and activate a real Nix store output from the immutable workspace.
+    change = machine.succeed(manager + f"deploy.prepare --repository fixture --workspace-id {workspace2} --expected-revision 4 --target-host fixture --profile fixture-system --idempotency-key deploy-prepare | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {change} | jq -e '.state == \"prepared\" and (.plan.drv_path | startswith(\"/nix/store/\")) and (.plan.lock_digest | length == 64)'", timeout=30)
+    change_revision = machine.succeed(manager + f"changes.status --change-id {change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.build --change-id {change} --expected-revision {change_revision} --idempotency-key deploy-build")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {change} | jq -e '.state == \"ready\" and (.artifact.out_path | startswith(\"/nix/store/\"))'", timeout=60)
+    change_revision = machine.succeed(manager + f"changes.status --change-id {change} | jq -r .revision").strip()
+    # Service actions and deployment mutations share one target-local lock.
+    # The build above remains independent, while activation waits for a slow restart.
+    deployment_lock_restart = machine.succeed(manager + "units.restart --host fixture --unit maxops-managed.service --idempotency-key deployment-lock-restart | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {deployment_lock_restart} | jq -e '.handle.state == \"reconciling\"'", timeout=20)
+    activation_job = machine.succeed(manager + f"deploy.activate --change-id {change} --expected-revision {change_revision} --idempotency-key deploy-activate | jq -r .job_id").strip()
+    machine.succeed("sleep 1")
+    machine.succeed(manager + f"jobs.status --job-id {activation_job} | jq -e '.handle.state == \"queued\" or .handle.state == \"dispatching\"'")
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {baseline}")
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {deployment_lock_restart} | jq -e '.handle.state == \"succeeded\"'", timeout=30)
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {change} | jq -e '.state == \"verifying\"'", timeout=30)
+    change_revision = machine.succeed(manager + f"changes.status --change-id {change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.verify --change-id {change} --expected-revision {change_revision} --idempotency-key deploy-verify")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {change} | jq -e '.state == \"succeeded\"'", timeout=30)
+    deployed = machine.succeed(manager + f"changes.status --change-id {change} | jq -r .artifact.out_path").strip()
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {deployed}")
+    machine.succeed("grep -qx published /run/maxops-fixture-mode")
+
+    # A later human Git push makes the built plan stale; maxops leaves runtime alone.
+    stale_source = machine.succeed(manager + f"deploy.prepare --repository fixture --workspace-id {workspace2} --expected-revision 4 --target-host fixture --profile fixture-system --idempotency-key deploy-stale-source-prepare | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {stale_source} | jq -e '.state == \"prepared\"'", timeout=30)
+    stale_source_revision = machine.succeed(manager + f"changes.status --change-id {stale_source} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.build --change-id {stale_source} --expected-revision {stale_source_revision} --idempotency-key deploy-stale-source-build")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {stale_source} | jq -e '.state == \"ready\"'", timeout=60)
+    machine.succeed("git -C /tmp/external pull --ff-only && printf later\\n > /tmp/external/later.txt && git -C /tmp/external add later.txt && git -C /tmp/external -c user.name=External -c user.email=external@example.invalid commit -m later && git -C /tmp/external push origin main")
+    stale_source_revision = machine.succeed(manager + f"changes.status --change-id {stale_source} | jq -r .revision").strip()
+    machine.fail(manager + f"deploy.activate --change-id {stale_source} --expected-revision {stale_source_revision} --idempotency-key deploy-stale-source-activate")
+    machine.succeed(manager + f"changes.status --change-id {stale_source} | jq -e '.state == \"stale\"'")
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {deployed}")
+
+    # A manual rebuild/profile switch is equally valid and blocks an old plan.
+    stale_runtime = machine.succeed(manager + f"deploy.prepare --repository fixture --workspace-id {workspace2} --expected-revision 4 --target-host fixture --profile fixture-system --idempotency-key deploy-stale-runtime-prepare | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {stale_runtime} | jq -e '.state == \"prepared\"'", timeout=30)
+    stale_runtime_revision = machine.succeed(manager + f"changes.status --change-id {stale_runtime} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.build --change-id {stale_runtime} --expected-revision {stale_runtime_revision} --idempotency-key deploy-stale-runtime-build")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {stale_runtime} | jq -e '.state == \"ready\"'", timeout=60)
+    machine.succeed(f"${pkgs.nix}/bin/nix-env -p /var/lib/maxops-fixture-deploy/profile --set {baseline}")
+    machine.succeed(f"{baseline}/bin/switch-to-configuration switch")
+    stale_runtime_revision = machine.succeed(manager + f"changes.status --change-id {stale_runtime} | jq -r .revision").strip()
+    machine.fail(manager + f"deploy.activate --change-id {stale_runtime} --expected-revision {stale_runtime_revision} --idempotency-key deploy-stale-runtime-activate")
+    machine.succeed(manager + f"changes.status --change-id {stale_runtime} | jq -e '.state == \"stale\"'")
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {baseline}")
+
+    # A failing activation may roll back only while its own output still owns the profile.
+    machine.succeed(manager + "workspace.create --repository fixture --idempotency-key bad-workspace-create --wait > /tmp/bad-workspace.json")
+    bad_workspace = machine.succeed("jq -r .result.workspace.workspace_id /tmp/bad-workspace.json").strip()
+    machine.succeed(f"cat > /tmp/bad-apply.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{bad_workspace}\",\"expected_revision\":1,\"edits\":[{{\"path\":\"config.txt\",\"content\":\"bad\\n\"}}]}}\nEOF")
+    machine.succeed(manager + "workspace.apply --params-file /tmp/bad-apply.json")
+    machine.succeed(manager + f"workspace.commit --repository fixture --workspace-id {bad_workspace} --expected-revision 2 --message 'bad deployment fixture'")
+    bad_change = machine.succeed(manager + f"deploy.prepare --repository fixture --workspace-id {bad_workspace} --expected-revision 3 --target-host fixture --profile fixture-system --idempotency-key bad-deploy-prepare | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {bad_change} | jq -e '.state == \"prepared\"'", timeout=30)
+    bad_revision = machine.succeed(manager + f"changes.status --change-id {bad_change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.build --change-id {bad_change} --expected-revision {bad_revision} --idempotency-key bad-deploy-build")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {bad_change} | jq -e '.state == \"ready\"'", timeout=60)
+    bad_revision = machine.succeed(manager + f"changes.status --change-id {bad_change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.activate --change-id {bad_change} --expected-revision {bad_revision} --idempotency-key bad-deploy-activate")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {bad_change} | jq -e '.state == \"rolled_back\"'", timeout=30)
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {baseline}")
+    machine.succeed("grep -qx baseline /run/maxops-fixture-mode")
+
+    # A manual activation during maxops verification takes ownership and blocks rollback.
+    machine.succeed(manager + "workspace.create --repository fixture --idempotency-key superseded-workspace-create --wait > /tmp/superseded-workspace.json")
+    superseded_workspace = machine.succeed("jq -r .result.workspace.workspace_id /tmp/superseded-workspace.json").strip()
+    machine.succeed(f"cat > /tmp/superseded-apply.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{superseded_workspace}\",\"expected_revision\":1,\"edits\":[{{\"path\":\"config.txt\",\"content\":\"superseded\\n\"}}]}}\nEOF")
+    machine.succeed(manager + "workspace.apply --params-file /tmp/superseded-apply.json")
+    machine.succeed(manager + f"workspace.commit --repository fixture --workspace-id {superseded_workspace} --expected-revision 2 --message 'superseded deployment fixture'")
+    superseded_change = machine.succeed(manager + f"deploy.prepare --repository fixture --workspace-id {superseded_workspace} --expected-revision 3 --target-host fixture --profile fixture-system --idempotency-key superseded-deploy-prepare | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {superseded_change} | jq -e '.state == \"prepared\"'", timeout=30)
+    superseded_revision = machine.succeed(manager + f"changes.status --change-id {superseded_change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.build --change-id {superseded_change} --expected-revision {superseded_revision} --idempotency-key superseded-deploy-build")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {superseded_change} | jq -e '.state == \"ready\"'", timeout=60)
+    superseded_revision = machine.succeed(manager + f"changes.status --change-id {superseded_change} | jq -r .revision").strip()
+    machine.succeed(manager + f"deploy.activate --change-id {superseded_change} --expected-revision {superseded_revision} --idempotency-key superseded-deploy-activate")
+    machine.wait_until_succeeds("grep -qx superseded /run/maxops-fixture-mode", timeout=20)
+    machine.succeed(f"${pkgs.nix}/bin/nix-env -p /var/lib/maxops-fixture-deploy/profile --set {external_deployment}")
+    machine.succeed(f"{external_deployment}/bin/switch-to-configuration switch")
+    machine.wait_until_succeeds(manager + f"changes.status --change-id {superseded_change} | jq -e '.state == \"superseded\"'", timeout=30)
+    machine.succeed(f"test \"$(readlink /run/maxops-fixture-current)\" = {external_deployment}")
+    machine.succeed("grep -qx external /run/maxops-fixture-mode")
   '';
 }

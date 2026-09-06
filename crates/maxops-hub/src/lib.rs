@@ -6,13 +6,18 @@ use axum::{
 };
 use futures::future::join_all;
 use maxops_proto::{
-    ExecutorRequest, ExecutorResponse, IdempotencyRequirement, JobCancelParams, JobId, JobIdParams,
-    JobRecord, JobState, JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, Request,
-    Snapshot, UnitActionParams, WorkspaceTargetRequest, WorkspaceTargetResponse, now, operations,
+    ChangeHistoryResponse, ChangeId, ChangePlan, ChangeRecord, ChangeState, DeployChangeParams,
+    DeployPrepareParams, DeploymentAction, DeploymentArtifact, DeploymentJobSpec, DeploymentKind,
+    DeploymentReport, DeploymentReportStatus, ExecutorRequest, ExecutorResponse,
+    IdempotencyRequirement, JobCancelParams, JobId, JobIdParams, JobRecord, JobState,
+    JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, RepositoryHeadRequest,
+    RepositoryHeadResponse, Request, RuntimeBaseline, RuntimeStateRequest, RuntimeStateResponse,
+    Snapshot, SourceBaseline, UnitActionParams, WorkspaceStatusParams, WorkspaceTargetRequest,
+    WorkspaceTargetResponse, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
-use maxops_store::Store;
+use maxops_store::{ChangeTransition, Store};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -62,6 +67,8 @@ pub struct Config {
     #[serde(default)]
     repositories: Vec<RepositoryConfig>,
     #[serde(default)]
+    deployments: Vec<DeploymentConfig>,
+    #[serde(default)]
     prometheus_url: Option<String>,
     #[serde(default)]
     alertmanager_url: Option<String>,
@@ -97,6 +104,8 @@ struct ClientConfig {
     #[serde(default)]
     repositories: BTreeSet<String>,
     #[serde(default)]
+    deployments: BTreeSet<String>,
+    #[serde(default)]
     access: Access,
 }
 
@@ -105,6 +114,24 @@ struct ClientConfig {
 struct RepositoryConfig {
     name: String,
     executor_host: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentConfig {
+    name: String,
+    repository: String,
+    builder_host: String,
+    target_host: String,
+    kind: DeploymentKind,
+    flake_attribute: String,
+    source_reference: String,
+    #[serde(default = "default_plan_ttl")]
+    plan_ttl_seconds: u32,
+}
+
+fn default_plan_ttl() -> u32 {
+    3600
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
@@ -135,6 +162,7 @@ struct Principal {
     capabilities: BTreeSet<String>,
     access: Access,
     repositories: BTreeSet<String>,
+    deployments: BTreeSet<String>,
 }
 struct AlertIngress {
     token: Token,
@@ -151,6 +179,7 @@ struct App {
     slots: Semaphore,
     store: Option<Store>,
     repositories: BTreeMap<String, String>,
+    deployments: BTreeMap<String, DeploymentConfig>,
 }
 
 pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
@@ -236,6 +265,35 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         );
     }
     let known_caps: BTreeSet<_> = operations().into_iter().map(|op| op.capability).collect();
+    let mut deployments = BTreeMap::new();
+    for deployment in config.deployments {
+        color_eyre::eyre::ensure!(
+            maxops_proto::valid_check_id(&deployment.name),
+            "invalid deployment profile name"
+        );
+        color_eyre::eyre::ensure!(
+            repositories.get(&deployment.repository) == Some(&deployment.builder_host),
+            "deployment builder must own its configured repository"
+        );
+        color_eyre::eyre::ensure!(
+            hosts
+                .get(&deployment.target_host)
+                .is_some_and(|host| host.execution_token.is_some()),
+            "deployment target is unknown or has execution disabled"
+        );
+        color_eyre::eyre::ensure!(
+            !deployment.flake_attribute.is_empty()
+                && !deployment.source_reference.is_empty()
+                && deployment.plan_ttl_seconds > 0,
+            "invalid deployment profile"
+        );
+        color_eyre::eyre::ensure!(
+            deployments
+                .insert(deployment.name.clone(), deployment)
+                .is_none(),
+            "duplicate deployment profile"
+        );
+    }
     let management_caps: BTreeSet<_> = operations()
         .into_iter()
         .filter(|operation| operation.kind != OperationKind::Observation)
@@ -278,6 +336,16 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             }),
             "repository executor must also be in the client's host scope"
         );
+        color_eyre::eyre::ensure!(
+            client.deployments.iter().all(|name| {
+                deployments.get(name).is_some_and(|deployment| {
+                    client.repositories.contains(&deployment.repository)
+                        && client.hosts.contains(&deployment.builder_host)
+                        && client.hosts.contains(&deployment.target_host)
+                })
+            }),
+            "deployment grant must remain within the client's host and repository scope"
+        );
         let token = Token::read(&client.token_file)?;
         color_eyre::eyre::ensure!(
             !clients
@@ -304,6 +372,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             capabilities: client.capabilities,
             access: client.access,
             repositories: client.repositories,
+            deployments: client.deployments,
         });
     }
     color_eyre::eyre::ensure!(
@@ -387,6 +456,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         slots: Semaphore::new(16),
         store,
         repositories,
+        deployments,
     });
     if let Some(store) = &app.store {
         for job in store.nonterminal_jobs().await? {
@@ -440,6 +510,108 @@ fn repository_host<'a>(
         .ok_or(ApiError(StatusCode::FORBIDDEN, "repository not permitted"))?;
     host_for(app, principal, host)?;
     Ok(host)
+}
+
+fn deployment_for<'a>(
+    app: &'a App,
+    principal: &Principal,
+    name: &str,
+) -> Result<&'a DeploymentConfig, ApiError> {
+    if !principal.deployments.contains(name) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "deployment profile not permitted",
+        ));
+    }
+    let deployment = app.deployments.get(name).ok_or(ApiError(
+        StatusCode::FORBIDDEN,
+        "deployment profile not permitted",
+    ))?;
+    repository_host(app, principal, &deployment.repository)?;
+    host_for(app, principal, &deployment.target_host)?;
+    Ok(deployment)
+}
+
+async fn repository_head(
+    app: &App,
+    principal: &Principal,
+    repository: &str,
+    reference: &str,
+) -> Result<RepositoryHeadResponse, ApiError> {
+    let host = repository_host(app, principal, repository)?;
+    let response = agent_request(
+        app,
+        host,
+        &ExecutorRequest::RepositoryHead {
+            principal: principal.name.clone(),
+            request: RepositoryHeadRequest {
+                repository: repository.to_owned(),
+                reference: reference.to_owned(),
+            },
+        },
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository executor unavailable",
+        )
+    })?;
+    let ExecutorResponse::RepositoryHead(response) = response else {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "invalid executor response",
+        ));
+    };
+    if response.repository != repository || response.reference != reference {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "repository observation identity mismatch",
+        ));
+    }
+    Ok(response)
+}
+
+async fn runtime_state(
+    app: &App,
+    principal: &Principal,
+    deployment: &DeploymentConfig,
+) -> Result<RuntimeStateResponse, ApiError> {
+    host_for(app, principal, &deployment.target_host)?;
+    let response = agent_request(
+        app,
+        &deployment.target_host,
+        &ExecutorRequest::RuntimeState {
+            principal: principal.name.clone(),
+            request: RuntimeStateRequest {
+                deployment_profile: deployment.name.clone(),
+            },
+        },
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "target executor unavailable",
+        )
+    })?;
+    let ExecutorResponse::RuntimeState(response) = response else {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "invalid executor response",
+        ));
+    };
+    if response.host != deployment.target_host
+        || response.deployment_profile != deployment.name
+        || response.observed_at.as_second() > now().as_second() + 30
+        || now().as_second() - response.observed_at.as_second() > 90
+    {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "runtime observation identity mismatch",
+        ));
+    }
+    Ok(response)
 }
 
 fn unit_allowed(host: &Host, unit: &str) -> Result<(), ApiError> {
@@ -756,7 +928,14 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         | Request::WorkspaceDiff(_)
         | Request::WorkspaceCommit(_)
         | Request::WorkspaceCheck(_)
-        | Request::WorkspacePublish(_) => Err(ApiError(
+        | Request::WorkspacePublish(_)
+        | Request::DeployPrepare(_)
+        | Request::DeployBuild(_)
+        | Request::DeployActivate(_)
+        | Request::DeployVerify(_)
+        | Request::DeployRollback(_)
+        | Request::ChangesStatus(_)
+        | Request::ChangesHistory(_) => Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job operation routed as observation",
         )),
@@ -794,6 +973,10 @@ fn map_store_error(error: color_eyre::eyre::Report) -> ApiError {
             StatusCode::CONFLICT,
             "job request conflicts with current state",
         )
+    } else if message.contains("change not found") {
+        ApiError(StatusCode::NOT_FOUND, "change not found")
+    } else if message.contains("workspace not found") {
+        ApiError(StatusCode::NOT_FOUND, "workspace not found")
     } else if message.contains("not found") {
         ApiError(StatusCode::NOT_FOUND, "job not found")
     } else {
@@ -906,6 +1089,67 @@ async fn run_job_operation(
                 300,
             )
             .await
+        }
+        Request::DeployPrepare(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            prepare_change(app, principal, headers, params).await
+        }
+        Request::DeployBuild(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            submit_change_stage(app, principal, headers, params, DeploymentAction::Build).await
+        }
+        Request::DeployActivate(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            submit_change_stage(app, principal, headers, params, DeploymentAction::Activate).await
+        }
+        Request::DeployVerify(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            submit_change_stage(app, principal, headers, params, DeploymentAction::Verify).await
+        }
+        Request::DeployRollback(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            submit_change_stage(app, principal, headers, params, DeploymentAction::Rollback).await
+        }
+        Request::ChangesStatus(params) => {
+            let change = refresh_change(app, principal, &params.change_id).await?;
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(change).expect("serializable change"),
+            ))
+        }
+        Request::ChangesHistory(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            if let Some(host) = &params.host {
+                host_for(app, principal, host)?;
+            }
+            let changes = store
+                .list_changes(&principal.name, params.host.as_deref(), params.limit)
+                .await
+                .map_err(map_store_error)?
+                .into_iter()
+                .filter(|change| {
+                    principal
+                        .deployments
+                        .contains(&change.plan.deployment_profile)
+                })
+                .collect();
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(ChangeHistoryResponse { changes })
+                    .expect("serializable change history"),
+            ))
         }
         Request::WorkspaceStatus(params) => {
             params
@@ -1157,6 +1401,563 @@ async fn run_job_operation(
             StatusCode::INTERNAL_SERVER_ERROR,
             "observation routed as job operation",
         )),
+    }
+}
+
+async fn prepare_change(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    params: DeployPrepareParams,
+) -> Result<(StatusCode, Value), ApiError> {
+    let key = idempotency_key(headers)?;
+    let store = durable_store(app)?;
+    if let Some(existing) = store
+        .get_idempotent_job(&principal.name, key)
+        .await
+        .map_err(map_store_error)?
+    {
+        let spec: DeploymentJobSpec =
+            serde_json::from_value(existing.spec.clone()).map_err(|_| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "idempotency key belongs to another request",
+                )
+            })?;
+        if existing.handle.operation != "deploy.prepare"
+            || spec.plan.repository != params.repository
+            || spec.plan.workspace_id != params.workspace_id
+            || spec.plan.workspace_revision != params.expected_revision
+            || spec.plan.target_host != params.target_host
+            || spec.plan.deployment_profile != params.profile
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "idempotency key belongs to another request",
+            ));
+        }
+        if existing.handle.state == JobState::Queued {
+            spawn_dispatch(app.clone(), existing.handle.job_id.clone());
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            serde_json::to_value(existing.handle).expect("serializable job handle"),
+        ));
+    }
+
+    let deployment = deployment_for(app, principal, &params.profile)?;
+    if deployment.repository != params.repository || deployment.target_host != params.target_host {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "deployment request does not match profile",
+        ));
+    }
+    let workspace = match forward_workspace(
+        app,
+        principal,
+        &params.repository,
+        WorkspaceTargetRequest::Status(WorkspaceStatusParams {
+            repository: params.repository.clone(),
+            workspace_id: params.workspace_id.clone(),
+        }),
+    )
+    .await?
+    {
+        WorkspaceTargetResponse::Record(workspace) => workspace,
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "invalid executor response",
+            ));
+        }
+    };
+    if workspace.revision != params.expected_revision {
+        return Err(ApiError(StatusCode::CONFLICT, "workspace revision changed"));
+    }
+    let source_commit = workspace
+        .commit_hash
+        .clone()
+        .ok_or(ApiError(StatusCode::CONFLICT, "workspace is not committed"))?;
+    let workspace_projection = workspace.clone();
+    let source = repository_head(
+        app,
+        principal,
+        &deployment.repository,
+        &deployment.source_reference,
+    )
+    .await?;
+    let runtime = runtime_state(app, principal, deployment).await?;
+    let created_at = now();
+    let expires_at = created_at
+        .checked_add(std::time::Duration::from_secs(u64::from(
+            deployment.plan_ttl_seconds,
+        )))
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid deployment plan lifetime"))?;
+    let job_id = JobId::parse(uuid::Uuid::now_v7().to_string()).map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create change ID",
+        )
+    })?;
+    let change_id = ChangeId::parse(job_id.as_str().to_owned()).map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create change ID",
+        )
+    })?;
+    let plan = ChangePlan {
+        change_id,
+        repository: deployment.repository.clone(),
+        workspace_id: workspace.workspace_id,
+        workspace_revision: workspace.revision,
+        tree_hash: workspace.tree_hash,
+        source_commit,
+        source_reference: deployment.source_reference.clone(),
+        source_remote_head: source.commit.clone(),
+        target_host: deployment.target_host.clone(),
+        deployment_profile: deployment.name.clone(),
+        kind: deployment.kind,
+        flake_attribute: deployment.flake_attribute.clone(),
+        drv_path: None,
+        lock_digest: None,
+        source_baseline: SourceBaseline {
+            repository_id: deployment.repository.clone(),
+            reference: deployment.source_reference.clone(),
+            commit: Some(source.commit),
+            observed_at: source.observed_at,
+            evidence: "configured Git remote fetched by repository executor".into(),
+        },
+        runtime_baseline: RuntimeBaseline {
+            host: runtime.host,
+            profile: runtime.deployment_profile,
+            running_closure: runtime.running_closure,
+            persistent_profile: runtime.persistent_profile,
+            generation: runtime.generation,
+            boot_id: runtime.boot_id,
+            source_commit: None,
+            observed_at: runtime.observed_at,
+            evidence: "target executor read configured running and persistent profile paths".into(),
+        },
+        policy_version: "hub-config-v1".into(),
+        created_at,
+        expires_at,
+    };
+    let job = NewJob {
+        principal: principal.name.clone(),
+        host: deployment.builder_host.clone(),
+        operation: "deploy.prepare".into(),
+        spec_version: 1,
+        spec: serde_json::to_value(DeploymentJobSpec {
+            action: DeploymentAction::Prepare,
+            plan: plan.clone(),
+            artifact: None,
+        })
+        .expect("serializable deployment job"),
+        policy_version: plan.policy_version.clone(),
+        deadline: Some(
+            now()
+                .checked_add(std::time::Duration::from_secs(900))
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?,
+        ),
+    };
+    let submitted = store
+        .submit_job_with_id(key, &job_id, &job)
+        .await
+        .map_err(map_store_error)?;
+    if submitted.created {
+        store
+            .record_workspace(&workspace_projection)
+            .await
+            .map_err(map_store_error)?;
+        store
+            .create_change(&plan, &principal.name, &job_id)
+            .await
+            .map_err(map_store_error)?;
+    }
+    if submitted.created || submitted.job.handle.state == JobState::Queued {
+        spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+    ))
+}
+
+async fn submit_change_stage(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    params: DeployChangeParams,
+    action: DeploymentAction,
+) -> Result<(StatusCode, Value), ApiError> {
+    let key = idempotency_key(headers)?;
+    if let Some(existing) = durable_store(app)?
+        .get_idempotent_job(&principal.name, key)
+        .await
+        .map_err(map_store_error)?
+    {
+        let spec: DeploymentJobSpec =
+            serde_json::from_value(existing.spec.clone()).map_err(|_| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "idempotency key belongs to another request",
+                )
+            })?;
+        if existing.handle.operation != operation_for_deployment(action)
+            || spec.action != action
+            || spec.plan.change_id != params.change_id
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "idempotency key belongs to another request",
+            ));
+        }
+        if existing.handle.state == JobState::Queued {
+            spawn_dispatch(app.clone(), existing.handle.job_id.clone());
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            serde_json::to_value(existing.handle).expect("serializable job handle"),
+        ));
+    }
+    let mut change = refresh_change(app, principal, &params.change_id).await?;
+    if change.revision != params.expected_revision {
+        return Err(ApiError(StatusCode::CONFLICT, "change revision changed"));
+    }
+    let deployment = deployment_for(app, principal, &change.plan.deployment_profile)?;
+    let (required, next, operation, host, timeout) = match action {
+        DeploymentAction::Build => (
+            &[ChangeState::Prepared][..],
+            ChangeState::Building,
+            "deploy.build",
+            deployment.builder_host.clone(),
+            7200,
+        ),
+        DeploymentAction::Activate => (
+            &[ChangeState::Ready][..],
+            ChangeState::Activating,
+            "deploy.activate",
+            deployment.target_host.clone(),
+            900,
+        ),
+        DeploymentAction::Verify => (
+            &[ChangeState::Verifying][..],
+            ChangeState::Verifying,
+            "deploy.verify",
+            deployment.target_host.clone(),
+            900,
+        ),
+        DeploymentAction::Rollback => (
+            &[ChangeState::Verifying, ChangeState::Succeeded][..],
+            ChangeState::Recovering,
+            "deploy.rollback",
+            deployment.target_host.clone(),
+            900,
+        ),
+        DeploymentAction::Prepare => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "invalid deployment stage",
+            ));
+        }
+    };
+    if !required.contains(&change.state) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "change is not ready for this stage",
+        ));
+    }
+    if change.plan.expires_at.as_second() < now().as_second()
+        && matches!(action, DeploymentAction::Activate)
+    {
+        change = transition_change_state(
+            durable_store(app)?,
+            &change,
+            ChangeState::Stale,
+            Some("deployment plan expired"),
+        )
+        .await?;
+        let _ = change;
+        return Err(ApiError(StatusCode::CONFLICT, "deployment plan expired"));
+    }
+    if action == DeploymentAction::Activate {
+        let source = repository_head(
+            app,
+            principal,
+            &change.plan.repository,
+            &change.plan.source_reference,
+        )
+        .await?;
+        let runtime = runtime_state(app, principal, deployment).await?;
+        if source.commit != change.plan.source_remote_head
+            || !runtime_matches_plan(&runtime, &change.plan)
+        {
+            transition_change_state(
+                durable_store(app)?,
+                &change,
+                ChangeState::Stale,
+                Some("source or runtime baseline changed before activation"),
+            )
+            .await?;
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "deployment baseline changed",
+            ));
+        }
+    }
+    let job = NewJob {
+        principal: principal.name.clone(),
+        host,
+        operation: operation.into(),
+        spec_version: 1,
+        spec: serde_json::to_value(DeploymentJobSpec {
+            action,
+            plan: change.plan.clone(),
+            artifact: change.artifact.clone(),
+        })
+        .expect("serializable deployment job"),
+        policy_version: change.plan.policy_version.clone(),
+        deadline: Some(
+            now()
+                .checked_add(std::time::Duration::from_secs(timeout))
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?,
+        ),
+    };
+    let submitted = durable_store(app)?
+        .submit_job(key, &job)
+        .await
+        .map_err(map_store_error)?;
+    if submitted.created {
+        match action {
+            DeploymentAction::Build => {
+                change.jobs.build = Some(submitted.job.handle.job_id.clone())
+            }
+            DeploymentAction::Activate => {
+                change.jobs.activate = Some(submitted.job.handle.job_id.clone())
+            }
+            DeploymentAction::Verify => {
+                change.jobs.verify = Some(submitted.job.handle.job_id.clone())
+            }
+            DeploymentAction::Rollback => {
+                change.jobs.rollback = Some(submitted.job.handle.job_id.clone())
+            }
+            DeploymentAction::Prepare => unreachable!(),
+        }
+        durable_store(app)?
+            .transition_change(
+                &change.plan.change_id,
+                &principal.name,
+                ChangeTransition {
+                    expected_revision: change.revision,
+                    next,
+                    plan: &change.plan,
+                    artifact: change.artifact.as_ref(),
+                    jobs: &change.jobs,
+                    recovery_state: change.recovery_state.as_deref(),
+                },
+            )
+            .await
+            .map_err(map_store_error)?;
+    }
+    if submitted.created || submitted.job.handle.state == JobState::Queued {
+        spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+    ))
+}
+
+async fn refresh_change(
+    app: &Arc<App>,
+    principal: &Principal,
+    id: &ChangeId,
+) -> Result<ChangeRecord, ApiError> {
+    let store = durable_store(app)?;
+    let mut change = store
+        .get_owned_change(&principal.name, id)
+        .await
+        .map_err(map_store_error)?;
+    deployment_for(app, principal, &change.plan.deployment_profile)?;
+    let stage = match change.state {
+        ChangeState::Checking => change.jobs.prepare.clone(),
+        ChangeState::Building | ChangeState::Publishing => change.jobs.build.clone(),
+        ChangeState::Activating => change.jobs.activate.clone(),
+        ChangeState::Verifying => change.jobs.verify.clone(),
+        ChangeState::Recovering => change.jobs.rollback.clone(),
+        _ => None,
+    };
+    let Some(job_id) = stage else {
+        return Ok(change);
+    };
+    let mut job = store
+        .get_owned_job(&principal.name, &job_id)
+        .await
+        .map_err(map_store_error)?;
+    if (!job.handle.state.is_terminal() || job.handle.state == JobState::OutcomeUnknown)
+        && let Ok(ExecutorResponse::Job(target)) = agent_request(
+            app,
+            &job.handle.host,
+            &ExecutorRequest::Status(JobIdParams {
+                job_id: job_id.clone(),
+            }),
+        )
+        .await
+    {
+        job = project_target_job(store, job, target)
+            .await
+            .map_err(map_store_error)?;
+    }
+    if !job.handle.state.is_terminal() {
+        return Ok(change);
+    }
+    let report = job
+        .result
+        .as_ref()
+        .and_then(|value| value.get("deployment"))
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::from_value::<DeploymentReport>(value.clone()).ok());
+    let expected_action = match change.state {
+        ChangeState::Checking => DeploymentAction::Prepare,
+        ChangeState::Building | ChangeState::Publishing => DeploymentAction::Build,
+        ChangeState::Activating => DeploymentAction::Activate,
+        ChangeState::Verifying => DeploymentAction::Verify,
+        ChangeState::Recovering => DeploymentAction::Rollback,
+        _ => return Ok(change),
+    };
+    let Some(report) = report.filter(|report| report.action == expected_action) else {
+        let next = if job.handle.state == JobState::OutcomeUnknown {
+            ChangeState::OutcomeUnknown
+        } else if change.state == ChangeState::Recovering {
+            ChangeState::RecoveryFailed
+        } else {
+            ChangeState::Failed
+        };
+        return transition_change_state(
+            store,
+            &change,
+            next,
+            Some("stage ended without a deployment report"),
+        )
+        .await;
+    };
+    let next = match report.status {
+        DeploymentReportStatus::Prepared => {
+            change.plan.drv_path = report.drv_path.clone();
+            change.plan.lock_digest = report.lock_digest.clone();
+            if change.plan.drv_path.is_none() || change.plan.lock_digest.is_none() {
+                ChangeState::Failed
+            } else {
+                ChangeState::Prepared
+            }
+        }
+        DeploymentReportStatus::Built => {
+            let out_path = report.out_path.clone();
+            match (
+                out_path,
+                change.plan.drv_path.clone(),
+                change.plan.lock_digest.clone(),
+            ) {
+                (Some(out_path), Some(drv_path), Some(lock_digest)) => {
+                    change.artifact = Some(DeploymentArtifact {
+                        builder_host: job.handle.host.clone(),
+                        source_commit: change.plan.source_commit.clone(),
+                        tree_hash: change.plan.tree_hash.clone(),
+                        lock_digest,
+                        drv_path,
+                        out_path,
+                        built_at: report.completed_at,
+                    });
+                    ChangeState::Ready
+                }
+                _ => ChangeState::Failed,
+            }
+        }
+        DeploymentReportStatus::Activated => ChangeState::Verifying,
+        DeploymentReportStatus::Verified => ChangeState::Succeeded,
+        DeploymentReportStatus::RolledBack => ChangeState::RolledBack,
+        DeploymentReportStatus::Stale => ChangeState::Stale,
+        DeploymentReportStatus::Superseded => ChangeState::Superseded,
+        DeploymentReportStatus::RecoveryFailed => ChangeState::RecoveryFailed,
+        DeploymentReportStatus::OutcomeUnknown => ChangeState::OutcomeUnknown,
+        DeploymentReportStatus::Failed => {
+            if change.state == ChangeState::Recovering {
+                ChangeState::RecoveryFailed
+            } else {
+                ChangeState::Failed
+            }
+        }
+    };
+    let recovery = matches!(
+        report.status,
+        DeploymentReportStatus::RolledBack
+            | DeploymentReportStatus::RecoveryFailed
+            | DeploymentReportStatus::Superseded
+    )
+    .then_some(report.detail.as_str());
+    store
+        .transition_change(
+            &change.plan.change_id,
+            &principal.name,
+            ChangeTransition {
+                expected_revision: change.revision,
+                next,
+                plan: &change.plan,
+                artifact: change.artifact.as_ref(),
+                jobs: &change.jobs,
+                recovery_state: recovery.or(change.recovery_state.as_deref()),
+            },
+        )
+        .await
+        .or_else(|error| {
+            if error.to_string().contains("revision changed") {
+                Ok(change.clone())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(map_store_error)
+}
+
+async fn transition_change_state(
+    store: &Store,
+    change: &ChangeRecord,
+    next: ChangeState,
+    recovery: Option<&str>,
+) -> Result<ChangeRecord, ApiError> {
+    store
+        .transition_change(
+            &change.plan.change_id,
+            &change.creator,
+            ChangeTransition {
+                expected_revision: change.revision,
+                next,
+                plan: &change.plan,
+                artifact: change.artifact.as_ref(),
+                jobs: &change.jobs,
+                recovery_state: recovery.or(change.recovery_state.as_deref()),
+            },
+        )
+        .await
+        .map_err(map_store_error)
+}
+
+fn runtime_matches_plan(runtime: &RuntimeStateResponse, plan: &ChangePlan) -> bool {
+    runtime.host == plan.runtime_baseline.host
+        && runtime.deployment_profile == plan.runtime_baseline.profile
+        && runtime.running_closure == plan.runtime_baseline.running_closure
+        && runtime.persistent_profile == plan.runtime_baseline.persistent_profile
+        && runtime.generation == plan.runtime_baseline.generation
+        && runtime.boot_id == plan.runtime_baseline.boot_id
+}
+
+fn operation_for_deployment(action: DeploymentAction) -> &'static str {
+    match action {
+        DeploymentAction::Prepare => "deploy.prepare",
+        DeploymentAction::Build => "deploy.build",
+        DeploymentAction::Activate => "deploy.activate",
+        DeploymentAction::Verify => "deploy.verify",
+        DeploymentAction::Rollback => "deploy.rollback",
     }
 }
 
@@ -1517,12 +2318,41 @@ fn dispatch_authorized(app: &App, job: &JobRecord) -> bool {
         } else {
             true
         };
+        let deployment_still_allowed = if job.handle.operation.starts_with("deploy.") {
+            serde_json::from_value::<DeploymentJobSpec>(job.spec.clone())
+                .ok()
+                .and_then(|spec| {
+                    app.deployments
+                        .get(&spec.plan.deployment_profile)
+                        .map(|deployment| (spec, deployment))
+                })
+                .is_some_and(|(spec, deployment)| {
+                    let expected_host = match spec.action {
+                        DeploymentAction::Prepare | DeploymentAction::Build => {
+                            &deployment.builder_host
+                        }
+                        DeploymentAction::Activate
+                        | DeploymentAction::Verify
+                        | DeploymentAction::Rollback => &deployment.target_host,
+                    };
+                    principal.deployments.contains(&deployment.name)
+                        && principal.repositories.contains(&deployment.repository)
+                        && deployment.repository == spec.plan.repository
+                        && deployment.target_host == spec.plan.target_host
+                        && deployment.kind == spec.plan.kind
+                        && deployment.flake_attribute == spec.plan.flake_attribute
+                        && expected_host == &job.handle.host
+                })
+        } else {
+            true
+        };
         principal.name == job.principal
             && principal.access == Access::Manage
             && capability.is_some_and(|capability| principal.capabilities.contains(capability))
             && principal.hosts.contains(&job.handle.host)
             && target_still_allowed
             && repository_still_allowed
+            && deployment_still_allowed
     })
 }
 

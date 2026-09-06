@@ -3,8 +3,8 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_executor::{RunnerResult, RunnerSpec};
 use maxops_proto::{
-    ExecRunParams, ExecutorRequest, ExecutorResponse, ExecutorWireResponse, JobId, JobLogsResponse,
-    JobRecord, JobState, UnitActionParams,
+    DeploymentKind, ExecRunParams, ExecutorRequest, ExecutorResponse, ExecutorWireResponse, JobId,
+    JobLogsResponse, JobRecord, JobState, UnitActionParams,
 };
 use maxops_store::Store;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use tokio::{
     process::Command,
 };
 
+mod deployment;
 mod workspace;
 
 const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -47,7 +48,10 @@ struct Config {
     systemd_run: PathBuf,
     systemctl: PathBuf,
     runner: PathBuf,
+    deploy_runner: PathBuf,
     git: PathBuf,
+    nix: PathBuf,
+    nix_env: PathBuf,
     workspace_root: PathBuf,
     repository_root: PathBuf,
     #[serde(default)]
@@ -57,6 +61,8 @@ struct Config {
     profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     repositories: BTreeMap<String, RepositoryConfig>,
+    #[serde(default)]
+    deployment_profiles: BTreeMap<String, DeploymentProfileConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -71,6 +77,33 @@ struct RepositoryConfig {
     checks: BTreeMap<String, Vec<String>>,
     author_name: String,
     author_email: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentProfileConfig {
+    repository: String,
+    target_host: String,
+    kind: DeploymentKind,
+    flake_attribute: String,
+    build_profile: String,
+    activate_profile: String,
+    verify_profile: String,
+    profile_path: PathBuf,
+    running_link: PathBuf,
+    activation_program: String,
+    #[serde(default)]
+    activation_arguments: Vec<String>,
+    #[serde(default)]
+    artifact_source: Option<String>,
+    #[serde(default)]
+    verify_commands: Vec<Vec<String>>,
+    #[serde(default = "default_verify_attempts")]
+    verify_attempts: u16,
+    #[serde(default = "default_verify_interval")]
+    verify_interval_seconds: u32,
+    #[serde(default)]
+    automatic_rollback: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -109,12 +142,19 @@ fn default_output_limit() -> u64 {
 fn default_tasks_max() -> u32 {
     256
 }
+fn default_verify_attempts() -> u16 {
+    1
+}
+fn default_verify_interval() -> u32 {
+    1
+}
 
 struct App {
     config: Config,
     store: Store,
     bus: zbus::Connection,
     service_workers: Mutex<HashSet<JobId>>,
+    command_workers: Mutex<HashSet<JobId>>,
     workspace_workers: Mutex<HashSet<JobId>>,
     workspace_serial: tokio::sync::Mutex<()>,
 }
@@ -223,6 +263,7 @@ async fn main() -> Result<()> {
         store,
         bus,
         service_workers: Mutex::new(HashSet::new()),
+        command_workers: Mutex::new(HashSet::new()),
         workspace_workers: Mutex::new(HashSet::new()),
         workspace_serial: tokio::sync::Mutex::new(()),
     });
@@ -260,7 +301,10 @@ fn validate_config(config: &Config) -> Result<()> {
         &config.systemd_run,
         &config.systemctl,
         &config.runner,
+        &config.deploy_runner,
         &config.git,
+        &config.nix,
+        &config.nix_env,
         &config.workspace_root,
         &config.repository_root,
     ] {
@@ -382,6 +426,76 @@ fn validate_config(config: &Config) -> Result<()> {
             }),
             "invalid configured repository check"
         );
+    }
+    for (name, deployment) in &config.deployment_profiles {
+        ensure!(
+            maxops_proto::valid_check_id(name),
+            "invalid deployment profile name"
+        );
+        ensure!(
+            maxops_proto::valid_repository_id(&deployment.repository),
+            "deployment profile has an invalid repository ID"
+        );
+        ensure!(
+            maxops_proto::valid_host(&deployment.target_host),
+            "deployment profile has an invalid target host"
+        );
+        ensure!(
+            !deployment.flake_attribute.is_empty()
+                && deployment.flake_attribute.len() <= 512
+                && !deployment.flake_attribute.contains(['\0', '\n', '\r']),
+            "deployment profile has an invalid flake attribute"
+        );
+        for profile in [
+            &deployment.build_profile,
+            &deployment.activate_profile,
+            &deployment.verify_profile,
+        ] {
+            ensure!(
+                config.profiles.contains_key(profile),
+                "deployment profile references an unknown execution profile"
+            );
+        }
+        ensure!(
+            deployment.profile_path.is_absolute() && deployment.running_link.is_absolute(),
+            "deployment runtime paths must be absolute"
+        );
+        let activation = Path::new(&deployment.activation_program);
+        ensure!(
+            !activation.is_absolute()
+                && activation
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "activation program must be a relative store path"
+        );
+        ensure!(
+            deployment.activation_arguments.len() <= 64
+                && deployment.activation_arguments.iter().all(|argument| {
+                    argument.len() <= 16 * 1024 && !argument.contains(['\0', '\n', '\r'])
+                }),
+            "invalid activation arguments"
+        );
+        ensure!(
+            deployment.verify_attempts > 0 && deployment.verify_interval_seconds > 0,
+            "deployment verification policy must be positive"
+        );
+        ensure!(
+            deployment.verify_commands.iter().all(|argv| {
+                !argv.is_empty()
+                    && argv.len() <= 64
+                    && Path::new(&argv[0]).is_absolute()
+                    && argv
+                        .iter()
+                        .all(|argument| argument.len() <= 16 * 1024 && !argument.contains('\0'))
+            }),
+            "invalid deployment verification command"
+        );
+        if deployment.kind == DeploymentKind::System {
+            ensure!(
+                config.profiles[&deployment.activate_profile].privileged,
+                "system deployment activation profile must be privileged"
+            );
+        }
     }
     Ok(())
 }
@@ -506,6 +620,31 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
             {
                 return workspace::cancel(&app, params).await;
             }
+            if deployment::serializes_host_changes(&existing.handle.operation) {
+                ensure!(
+                    existing.handle.state == JobState::Queued,
+                    "active deployment cancellation requires an explicit recovery or rollback"
+                );
+                let requested = app
+                    .store
+                    .request_cancel(&params.job_id, params.expected_revision, &params.reason)
+                    .await?;
+                let cancelled = app
+                    .store
+                    .transition_job(
+                        &params.job_id,
+                        requested.handle.revision,
+                        JobState::Cancelled,
+                        &json!({"phase":"host_queue"}),
+                        Some(&json!({"cancelled":true,"effect":"not_started"})),
+                    )
+                    .await?;
+                let _ = app
+                    .store
+                    .release_resource("systemd_manager", &app.config.host, &params.job_id)
+                    .await;
+                return Ok(ExecutorResponse::Job(cancelled));
+            }
             let requested = app
                 .store
                 .request_cancel(&params.job_id, params.expected_revision, &params.reason)
@@ -534,6 +673,14 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
         ExecutorRequest::Workspace { principal, request } => Ok(ExecutorResponse::Workspace(
             workspace::handle(&app, &principal, request).await?,
         )),
+        ExecutorRequest::RepositoryHead { principal, request } => {
+            Ok(ExecutorResponse::RepositoryHead(
+                workspace::observe_repository_head(&app, &principal, request).await?,
+            ))
+        }
+        ExecutorRequest::RuntimeState { principal, request } => Ok(ExecutorResponse::RuntimeState(
+            deployment::observe_runtime(&app, &principal, request)?,
+        )),
     }
 }
 
@@ -547,7 +694,8 @@ async fn submit_job(
     ensure!(
         job.operation == "exec.run"
             || service_action.is_some()
-            || workspace::is_workspace_job(&job.operation),
+            || workspace::is_workspace_job(&job.operation)
+            || deployment::is_deployment_job(&job.operation),
         "unsupported executor operation"
     );
     let accepted = app.store.accept_job(&job_id, &job).await?;
@@ -612,6 +760,25 @@ async fn submit_job(
         }
         return Ok(ExecutorResponse::Job(accepted.job));
     }
+    if deployment::is_deployment_job(&job.operation) {
+        if accepted.created
+            && let Err(error) = deployment::validate_job(&app, &job).await
+        {
+            tracing::warn!(job_id = %job_id, %error, "deployment job validation failed");
+            let failed = app
+                .store
+                .transition_job(
+                    &job_id,
+                    accepted.job.handle.revision,
+                    JobState::Failed,
+                    &json!({"phase":"validation"}),
+                    Some(&json!({"error":"deployment job is not permitted by the target"})),
+                )
+                .await?;
+            return Ok(ExecutorResponse::Job(failed));
+        }
+        return submit_command_job(app, job_id, job, accepted).await;
+    }
     submit_command_job(app, job_id, job, accepted).await
 }
 
@@ -624,7 +791,18 @@ async fn submit_command_job(
     if accepted.created {
         let prepared = async {
             let params = runner_params(&app, &job.principal, &job.operation, &job.spec).await?;
-            let prepared = prepare_runner_spec(&app.config, &params)?;
+            let mut prepared = prepare_runner_spec(&app.config, &params)?;
+            prepared.pass_credentials_directory = deployment::is_deployment_job(&job.operation);
+            if prepared.pass_credentials_directory {
+                prepared.env.insert(
+                    "HOME".into(),
+                    app.config
+                        .spool_root
+                        .join(job_id.as_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             Result::<_>::Ok((params, prepared))
         }
         .await;
@@ -642,7 +820,15 @@ async fn submit_command_job(
                 return Ok(ExecutorResponse::Job(failed));
             }
         };
-        if let Err(error) = persist_runner_spec(&app.config, &job_id, &prepared).await {
+        let persisted = async {
+            persist_runner_spec(&app.config, &job_id, &prepared).await?;
+            if deployment::is_deployment_job(&job.operation) {
+                deployment::persist_spec(&app, &job_id, &job.spec).await?;
+            }
+            Result::<_>::Ok(())
+        }
+        .await;
+        if let Err(error) = persisted {
             tracing::warn!(job_id = %job_id, %error, "persisting job specification failed");
             let failed = app.store.transition_job(
                 &job_id,
@@ -652,6 +838,10 @@ async fn submit_command_job(
                 Some(&json!({"phase":"prepare","error":"target could not persist the job specification"})),
             ).await?;
             return Ok(ExecutorResponse::Job(failed));
+        }
+        if deployment::serializes_host_changes(&job.operation) {
+            recover_job(app, accepted.job.clone());
+            return Ok(ExecutorResponse::Job(accepted.job));
         }
         let dispatching = app
             .store
@@ -698,7 +888,7 @@ async fn submit_command_job(
 }
 
 fn is_runner_job(operation: &str) -> bool {
-    matches!(operation, "exec.run" | "workspace.check")
+    matches!(operation, "exec.run" | "workspace.check") || deployment::is_deployment_job(operation)
 }
 
 async fn runner_params(
@@ -709,6 +899,9 @@ async fn runner_params(
 ) -> Result<ExecRunParams> {
     if operation == "workspace.check" {
         return workspace::check_exec_params(app, principal, spec).await;
+    }
+    if deployment::is_deployment_job(operation) {
+        return deployment::runner_params(app, principal, spec).await;
     }
     ensure!(operation == "exec.run", "unsupported runner job");
     let params: ExecRunParams = serde_json::from_value(spec.clone())?;
@@ -1360,6 +1553,7 @@ fn prepare_runner_spec(config: &Config, params: &ExecRunParams) -> Result<Runner
         cwd,
         env,
         credential_refs: params.credential_refs.clone(),
+        pass_credentials_directory: false,
         output_limit_bytes: profile.output_limit_bytes,
     })
 }
@@ -1411,6 +1605,13 @@ async fn launch(
             "--property=LoadCredential=spec:{}",
             spec_path(config, id).display()
         ));
+    let deployment_path = deployment_spec_path(config, id);
+    if deployment_path.exists() {
+        command.arg(format!(
+            "--property=LoadCredential=deployment:{}",
+            deployment_path.display()
+        ));
+    }
     if let Some(bytes) = profile.memory_max_bytes {
         command.arg(format!("--property=MemoryMax={bytes}"));
     }
@@ -1462,14 +1663,56 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
         workspace::spawn(app, job.handle.job_id);
         return;
     }
+    let inserted = app
+        .command_workers
+        .lock()
+        .expect("command worker lock poisoned")
+        .insert(job.handle.job_id.clone());
+    if !inserted {
+        return;
+    }
     let id = job.handle.job_id;
     tokio::spawn(async move {
+        let job = match wait_for_command_resource(&app, &id).await {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(job_id = %id, %error, "command resource wait failed");
+                let _ = record_command_worker_error(&app, &id).await;
+                app.command_workers
+                    .lock()
+                    .expect("command worker lock poisoned")
+                    .remove(&id);
+                return;
+            }
+        };
+        if job.handle.state.is_terminal() {
+            app.command_workers
+                .lock()
+                .expect("command worker lock poisoned")
+                .remove(&id);
+            return;
+        }
         if job.handle.state == JobState::Queued {
             let recovered = async {
                 let params =
                     runner_params(&app, &job.principal, &job.handle.operation, &job.spec).await?;
-                let prepared = prepare_runner_spec(&app.config, &params)?;
+                let mut prepared = prepare_runner_spec(&app.config, &params)?;
+                prepared.pass_credentials_directory =
+                    deployment::is_deployment_job(&job.handle.operation);
+                if prepared.pass_credentials_directory {
+                    prepared.env.insert(
+                        "HOME".into(),
+                        app.config
+                            .spool_root
+                            .join(id.as_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
                 persist_runner_spec(&app.config, &id, &prepared).await?;
+                if deployment::is_deployment_job(&job.handle.operation) {
+                    deployment::persist_spec(&app, &id, &job.spec).await?;
+                }
                 let dispatching = app
                     .store
                     .transition_job(
@@ -1494,16 +1737,11 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
             .await;
             if let Err(error) = recovered {
                 tracing::warn!(job_id = %id, %error, "queued job recovery failed");
-                let _ = app
-                    .store
-                    .transition_job(
-                        &id,
-                        job.handle.revision,
-                        JobState::Failed,
-                        &json!({"phase":"recovery"}),
-                        Some(&json!({"phase":"recovery","error":"target could not recover the queued job"})),
-                    )
-                    .await;
+                let _ = record_command_worker_error(&app, &id).await;
+                app.command_workers
+                    .lock()
+                    .expect("command worker lock poisoned")
+                    .remove(&id);
                 return;
             }
         } else if job.handle.state == JobState::Dispatching {
@@ -1529,8 +1767,23 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
                         let params =
                             runner_params(&app, &job.principal, &job.handle.operation, &job.spec)
                                 .await?;
-                        let prepared = prepare_runner_spec(&app.config, &params)?;
+                        let mut prepared = prepare_runner_spec(&app.config, &params)?;
+                        prepared.pass_credentials_directory =
+                            deployment::is_deployment_job(&job.handle.operation);
+                        if prepared.pass_credentials_directory {
+                            prepared.env.insert(
+                                "HOME".into(),
+                                app.config
+                                    .spool_root
+                                    .join(id.as_str())
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
                         persist_runner_spec(&app.config, &id, &prepared).await?;
+                        if deployment::is_deployment_job(&job.handle.operation) {
+                            deployment::persist_spec(&app, &id, &job.spec).await?;
+                        }
                         launch(&app.config, &id, &params, &prepared, job.deadline).await?;
                         app.store
                             .transition_job(
@@ -1552,29 +1805,184 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
             .await;
             if let Err(error) = recovered {
                 tracing::warn!(job_id = %id, %error, "dispatched job recovery failed");
+                let _ = record_command_worker_error(&app, &id).await;
+                app.command_workers
+                    .lock()
+                    .expect("command worker lock poisoned")
+                    .remove(&id);
                 return;
             }
         }
-        monitor(app, id);
+        monitor_loop(&app, &id).await;
+        app.command_workers
+            .lock()
+            .expect("command worker lock poisoned")
+            .remove(&id);
     });
 }
 
-fn monitor(app: Arc<App>, id: JobId) {
-    tokio::spawn(async move {
-        loop {
-            match reconcile_once(&app, &id).await {
-                Ok(job) if job.handle.state.is_terminal() => break,
-                Ok(_) => tokio::time::sleep(RECONCILE_INTERVAL).await,
-                Err(error) => {
-                    tracing::warn!(job_id = %id, %error, "job reconciliation failed");
-                    tokio::time::sleep(RECONCILE_INTERVAL).await;
-                }
+async fn wait_for_command_resource(app: &App, id: &JobId) -> Result<JobRecord> {
+    let mut job = app.store.get_job(id).await?;
+    if !deployment::serializes_host_changes(&job.handle.operation) {
+        return Ok(job);
+    }
+
+    loop {
+        let acquired = app
+            .store
+            .try_acquire_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        job = app.store.get_job(id).await?;
+        if job.handle.state.is_terminal() {
+            if acquired {
+                app.store
+                    .release_resource("systemd_manager", &app.config.host, id)
+                    .await?;
+            }
+            return Ok(job);
+        }
+        if job.handle.state == JobState::Queued
+            && job
+                .deadline
+                .is_some_and(|deadline| deadline <= maxops_proto::now())
+        {
+            let timed_out = app
+                .store
+                .transition_job(
+                    id,
+                    job.handle.revision,
+                    JobState::TimedOut,
+                    &json!({"phase":"host_queue"}),
+                    Some(&json!({"error":"deadline_expired_before_deployment"})),
+                )
+                .await?;
+            if acquired {
+                app.store
+                    .release_resource("systemd_manager", &app.config.host, id)
+                    .await?;
+            }
+            return Ok(timed_out);
+        }
+        if job.handle.state == JobState::Queued && job.cancel_requested {
+            let cancelled = app
+                .store
+                .transition_job(
+                    id,
+                    job.handle.revision,
+                    JobState::Cancelled,
+                    &json!({"phase":"host_queue"}),
+                    Some(&json!({"cancelled":true,"effect":"not_started"})),
+                )
+                .await?;
+            if acquired {
+                app.store
+                    .release_resource("systemd_manager", &app.config.host, id)
+                    .await?;
+            }
+            return Ok(cancelled);
+        }
+        if acquired {
+            return Ok(job);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn record_command_worker_error(app: &App, id: &JobId) -> Result<()> {
+    let mut job = app.store.get_job(id).await?;
+    if job.handle.state.is_terminal() {
+        if deployment::serializes_host_changes(&job.handle.operation) {
+            app.store
+                .release_resource("systemd_manager", &app.config.host, id)
+                .await?;
+        }
+        return Ok(());
+    }
+
+    if matches!(job.handle.state, JobState::Dispatching | JobState::Running) {
+        job = app
+            .store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::Reconciling,
+                &json!({"phase":"executor_error","effect":"may_have_started"}),
+                job.result.as_ref(),
+            )
+            .await?;
+    }
+    let (state, effect) = if job.handle.state == JobState::Reconciling {
+        (JobState::OutcomeUnknown, "unknown")
+    } else {
+        (JobState::Failed, "not_started")
+    };
+    let terminal = app
+        .store
+        .transition_job(
+            id,
+            job.handle.revision,
+            state,
+            &json!({"phase":"executor_error","effect":effect}),
+            Some(&json!({"error":"command_worker_failed","effect":effect})),
+        )
+        .await?;
+    if deployment::serializes_host_changes(&terminal.handle.operation) {
+        app.store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn monitor_loop(app: &App, id: &JobId) {
+    loop {
+        match reconcile_once(app, id).await {
+            Ok(job) if job.handle.state.is_terminal() => break,
+            Ok(_) => tokio::time::sleep(RECONCILE_INTERVAL).await,
+            Err(error) => {
+                tracing::warn!(job_id = %id, %error, "job reconciliation failed");
+                tokio::time::sleep(RECONCILE_INTERVAL).await;
             }
         }
+    }
+}
+
+fn monitor(app: Arc<App>, id: JobId) {
+    let inserted = app
+        .command_workers
+        .lock()
+        .expect("command worker lock poisoned")
+        .insert(id.clone());
+    if !inserted {
+        return;
+    }
+    tokio::spawn(async move {
+        monitor_loop(&app, &id).await;
+        app.command_workers
+            .lock()
+            .expect("command worker lock poisoned")
+            .remove(&id);
     });
 }
 
 async fn reconcile_once(app: &App, id: &JobId) -> Result<JobRecord> {
+    let job = match reconcile_runner_state(app, id).await {
+        Ok(job) => job,
+        Err(error) if error.to_string().contains("job revision changed") => {
+            app.store.get_job(id).await?
+        }
+        Err(error) => return Err(error),
+    };
+    if job.handle.state.is_terminal() && deployment::serializes_host_changes(&job.handle.operation)
+    {
+        app.store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+    }
+    Ok(job)
+}
+
+async fn reconcile_runner_state(app: &App, id: &JobId) -> Result<JobRecord> {
     let job = app.store.get_job(id).await?;
     if job.handle.state.is_terminal() && job.handle.state != JobState::OutcomeUnknown {
         return Ok(job);
@@ -1587,6 +1995,19 @@ async fn reconcile_once(app: &App, id: &JobId) -> Result<JobRecord> {
         } else {
             JobState::Failed
         };
+        let result_value = if deployment::is_deployment_job(&job.handle.operation) {
+            let stdout_path = app.config.spool_root.join(id.as_str()).join("stdout.bin");
+            let deployment = tokio::fs::read(&stdout_path)
+                .await
+                .ok()
+                .filter(|bytes| bytes.len() <= 64 * 1024)
+                .and_then(|bytes| {
+                    serde_json::from_slice::<maxops_proto::DeploymentReport>(&bytes).ok()
+                });
+            json!({"runner":result,"deployment":deployment})
+        } else {
+            serde_json::to_value(result)?
+        };
         return app
             .store
             .transition_job(
@@ -1594,7 +2015,7 @@ async fn reconcile_once(app: &App, id: &JobId) -> Result<JobRecord> {
                 job.handle.revision,
                 state,
                 &json!({"completion":"runner_result"}),
-                Some(&serde_json::to_value(result)?),
+                Some(&result_value),
             )
             .await;
     }
@@ -1808,6 +2229,12 @@ fn spec_path(config: &Config, id: &JobId) -> PathBuf {
     config.spec_directory.join(format!("{}.json", id.as_str()))
 }
 
+fn deployment_spec_path(config: &Config, id: &JobId) -> PathBuf {
+    config
+        .spec_directory
+        .join(format!("{}.deployment.json", id.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1823,7 +2250,10 @@ mod tests {
             systemd_run: "systemd-run".into(),
             systemctl: "/run/current-system/sw/bin/systemctl".into(),
             runner: "/nix/store/example/bin/maxops-job-runner".into(),
+            deploy_runner: "/nix/store/example/bin/maxops-deploy-runner".into(),
             git: "/run/current-system/sw/bin/git".into(),
+            nix: "/run/current-system/sw/bin/nix".into(),
+            nix_env: "/run/current-system/sw/bin/nix-env".into(),
             workspace_root: "/var/lib/maxops-workspaces".into(),
             repository_root: "/var/lib/maxops-executor/repositories".into(),
             manageable_units: BTreeSet::new(),
@@ -1844,6 +2274,7 @@ mod tests {
                 },
             )]),
             repositories: BTreeMap::new(),
+            deployment_profiles: BTreeMap::new(),
         };
         assert!(validate_config(&config).is_err());
     }

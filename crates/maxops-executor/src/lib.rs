@@ -20,6 +20,8 @@ pub struct RunnerSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub credential_refs: Vec<String>,
+    #[serde(default)]
+    pub pass_credentials_directory: bool,
     pub output_limit_bytes: u64,
 }
 
@@ -58,7 +60,7 @@ pub async fn run_spec(spec: &RunnerSpec, output_directory: &Path) -> Result<Runn
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    if !spec.credential_refs.is_empty() {
+    if !spec.credential_refs.is_empty() || spec.pass_credentials_directory {
         let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
             .ok_or_else(|| eyre!("credential directory is unavailable"))?;
         command.env("CREDENTIALS_DIRECTORY", directory);
@@ -153,6 +155,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             credential_refs: Vec::new(),
+            pass_credentials_directory: false,
             output_limit_bytes: 4,
         };
         let result = run_spec(&spec, directory.path()).await.unwrap();
@@ -206,6 +209,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             credential_refs: Vec::new(),
+            pass_credentials_directory: false,
             output_limit_bytes: 64,
         };
         let result = run_spec(&spec, directory.path()).await;

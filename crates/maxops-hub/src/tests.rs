@@ -2,7 +2,7 @@ use super::*;
 use axum::{body::Body, http::Request as HttpRequest};
 use http_body_util::BodyExt;
 use std::sync::{
-    Arc as StdArc,
+    Arc as StdArc, Mutex as StdMutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt;
@@ -55,6 +55,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
             access: Access::Observe,
             repositories: BTreeSet::new(),
+            deployments: BTreeSet::new(),
         }],
         client: transport::client().unwrap(),
         prometheus_url: None,
@@ -63,6 +64,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
         slots: Semaphore::new(16),
         store: None,
         repositories: BTreeMap::new(),
+        deployments: BTreeMap::new(),
     }
 }
 
@@ -159,7 +161,139 @@ async fn successful_executor(
             },
         ))),
         ExecutorRequest::Cancel(_) => Err(StatusCode::CONFLICT),
+        ExecutorRequest::Workspace { .. }
+        | ExecutorRequest::RepositoryHead { .. }
+        | ExecutorRequest::RuntimeState { .. } => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Clone)]
+struct DeploymentExecutor {
+    store: Store,
+    remote_head: StdArc<StdMutex<String>>,
+    runtime: StdArc<StdMutex<String>>,
+}
+
+async fn deployment_executor(
+    State(state): State<DeploymentExecutor>,
+    headers: HeaderMap,
+    Json(request): Json<ExecutorRequest>,
+) -> Result<Json<ExecutorResponse>, StatusCode> {
+    if !Token::parse(EXECUTION_TOKEN.into())
+        .unwrap()
+        .matches(&headers)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match request {
+        ExecutorRequest::Workspace {
+            request: WorkspaceTargetRequest::Status(params),
+            ..
+        } => Ok(Json(ExecutorResponse::Workspace(
+            WorkspaceTargetResponse::Record(maxops_proto::WorkspaceRecord {
+                workspace_id: params.workspace_id,
+                repository: params.repository,
+                executor: "alpha".into(),
+                base_commit: "1".repeat(40),
+                revision: 4,
+                tree_hash: "2".repeat(40),
+                commit_hash: Some("3".repeat(40)),
+                state: maxops_proto::WorkspaceState::Committed,
+                creator: "manager".into(),
+                created_at: now(),
+                retain_until: None,
+            }),
+        ))),
         ExecutorRequest::Workspace { .. } => Err(StatusCode::BAD_REQUEST),
+        ExecutorRequest::RepositoryHead { request, .. } => {
+            let commit = state.remote_head.lock().unwrap().clone();
+            Ok(Json(ExecutorResponse::RepositoryHead(
+                RepositoryHeadResponse {
+                    repository: request.repository,
+                    reference: request.reference,
+                    commit,
+                    observed_at: now(),
+                },
+            )))
+        }
+        ExecutorRequest::RuntimeState { request, .. } => {
+            let closure = state.runtime.lock().unwrap().clone();
+            Ok(Json(ExecutorResponse::RuntimeState(RuntimeStateResponse {
+                host: "alpha".into(),
+                deployment_profile: request.deployment_profile,
+                running_closure: Some(closure.clone()),
+                persistent_profile: Some(closure),
+                generation: Some(7),
+                boot_id: Some("boot-a".into()),
+                observed_at: now(),
+            })))
+        }
+        ExecutorRequest::Submit { job_id, job } => {
+            let accepted = state.store.accept_job(&job_id, &job).await.unwrap();
+            if accepted.created {
+                let spec: DeploymentJobSpec = serde_json::from_value(job.spec).unwrap();
+                let (status, drv_path, out_path, lock_digest) = match spec.action {
+                    DeploymentAction::Prepare => (
+                        DeploymentReportStatus::Prepared,
+                        Some("/nix/store/prepared.drv".into()),
+                        None,
+                        Some("4".repeat(64)),
+                    ),
+                    DeploymentAction::Build => (
+                        DeploymentReportStatus::Built,
+                        spec.plan.drv_path,
+                        Some("/nix/store/built-system".into()),
+                        spec.plan.lock_digest,
+                    ),
+                    DeploymentAction::Activate => {
+                        (DeploymentReportStatus::Activated, None, None, None)
+                    }
+                    DeploymentAction::Verify => {
+                        (DeploymentReportStatus::Verified, None, None, None)
+                    }
+                    DeploymentAction::Rollback => {
+                        (DeploymentReportStatus::RolledBack, None, None, None)
+                    }
+                };
+                let report = DeploymentReport {
+                    action: spec.action,
+                    status,
+                    drv_path,
+                    out_path,
+                    lock_digest,
+                    observed_running: None,
+                    observed_profile: None,
+                    detail: "fixture stage complete".into(),
+                    completed_at: now(),
+                };
+                let dispatching = state
+                    .store
+                    .transition_job(&job_id, 1, JobState::Dispatching, &json!({}), None)
+                    .await
+                    .unwrap();
+                state
+                    .store
+                    .transition_job(
+                        &job_id,
+                        dispatching.handle.revision,
+                        JobState::Succeeded,
+                        &json!({}),
+                        Some(&json!({"deployment":report})),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Ok(Json(ExecutorResponse::Job(
+                state.store.get_job(&job_id).await.unwrap(),
+            )))
+        }
+        ExecutorRequest::Status(params) => state
+            .store
+            .get_job(&params.job_id)
+            .await
+            .map(|job| Json(ExecutorResponse::Job(job)))
+            .map_err(|_| StatusCode::NOT_FOUND),
+        _ => Err(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -250,6 +384,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
             ]),
             access: Access::Manage,
             repositories: BTreeSet::new(),
+            deployments: BTreeSet::new(),
         }],
         client: transport::client().unwrap(),
         prometheus_url: None,
@@ -258,7 +393,34 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
         slots: Semaphore::new(16),
         store: Some(Store::open(state_file).await.unwrap()),
         repositories: BTreeMap::new(),
+        deployments: BTreeMap::new(),
     }
+}
+
+async fn deployment_management_app(agent_url: &str, state_file: &std::path::Path) -> App {
+    let mut app = management_app(agent_url, state_file).await;
+    app.clients[0].capabilities.extend([
+        "workspace:read".into(),
+        "deploy:manage".into(),
+        "changes:read".into(),
+    ]);
+    app.clients[0].repositories.insert("fixture".into());
+    app.clients[0].deployments.insert("fixture-system".into());
+    app.repositories.insert("fixture".into(), "alpha".into());
+    app.deployments.insert(
+        "fixture-system".into(),
+        DeploymentConfig {
+            name: "fixture-system".into(),
+            repository: "fixture".into(),
+            builder_host: "alpha".into(),
+            target_host: "alpha".into(),
+            kind: DeploymentKind::System,
+            flake_attribute: "nixosConfigurations.alpha.config.system.build.toplevel".into(),
+            source_reference: "refs/heads/main".into(),
+            plan_ttl_seconds: 3600,
+        },
+    );
+    app
 }
 
 async fn get_json(router: Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -370,6 +532,144 @@ async fn management_submission_is_durable_idempotent_and_target_confirmed() {
     }
     assert_eq!(observed["handle"]["state"], "succeeded");
     assert_eq!(observed["result"]["exit_code"], 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn deployment_reobserves_remote_and_runtime_before_activation() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let remote_head = StdArc::new(StdMutex::new("a".repeat(40)));
+    let runtime = StdArc::new(StdMutex::new("/nix/store/base-system".into()));
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(deployment_executor))
+            .with_state(DeploymentExecutor {
+                store: Store::open(&target_directory.path().join("target.db"))
+                    .await
+                    .unwrap(),
+                remote_head: remote_head.clone(),
+                runtime: runtime.clone(),
+            }),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let router = router(Arc::new(
+        deployment_management_app(&url, &hub_directory.path().join("hub.db")).await,
+    ));
+    let workspace_id = "11111111-1111-1111-1111-111111111111";
+
+    let prepare_and_build = |suffix: &'static str, router: Router| async move {
+        let (status, prepare) = call_with_idempotency(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            Some(&format!("prepare-{suffix}")),
+            json!({
+                "op":"deploy.prepare",
+                "params":{
+                    "repository":"fixture",
+                    "workspace_id":workspace_id,
+                    "expected_revision":4,
+                    "target_host":"alpha",
+                    "profile":"fixture-system"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{prepare}");
+        let change_id = prepare["job_id"].as_str().unwrap().to_owned();
+        let mut change = Value::Null;
+        for _ in 0..20 {
+            let (_, value) = call(
+                router.clone(),
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op":"changes.status","params":{"change_id":change_id}}),
+            )
+            .await;
+            change = value;
+            if change["state"] == "prepared" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(change["state"], "prepared");
+        let revision = change["revision"].as_u64().unwrap();
+        let (status, _) = call_with_idempotency(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            Some(&format!("build-{suffix}")),
+            json!({
+                "op":"deploy.build",
+                "params":{"change_id":change_id,"expected_revision":revision}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        for _ in 0..20 {
+            let (_, value) = call(
+                router.clone(),
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op":"changes.status","params":{"change_id":change_id}}),
+            )
+            .await;
+            change = value;
+            if change["state"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(change["state"], "ready");
+        (change_id, change["revision"].as_u64().unwrap())
+    };
+
+    let (remote_change, revision) = prepare_and_build("remote", router.clone()).await;
+    *remote_head.lock().unwrap() = "b".repeat(40);
+    let (status, _) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("activate-after-remote-change"),
+        json!({
+            "op":"deploy.activate",
+            "params":{"change_id":remote_change,"expected_revision":revision}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, stale) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"changes.status","params":{"change_id":remote_change}}),
+    )
+    .await;
+    assert_eq!(stale["state"], "stale");
+
+    let (runtime_change, revision) = prepare_and_build("runtime", router.clone()).await;
+    *runtime.lock().unwrap() = "/nix/store/human-rebuild".into();
+    let (status, _) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("activate-after-runtime-change"),
+        json!({
+            "op":"deploy.activate",
+            "params":{"change_id":runtime_change,"expected_revision":revision}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, stale) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"changes.status","params":{"change_id":runtime_change}}),
+    )
+    .await;
+    assert_eq!(stale["state"], "stale");
     task.abort();
 }
 

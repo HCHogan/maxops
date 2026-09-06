@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Facts {
     pub kernel: String,
     pub uptime_seconds: f64,
+    #[serde(default)]
+    pub boot_id: Option<String>,
     pub system_closure: Option<String>,
     #[serde(default)]
     pub system_profile: Option<String>,

@@ -15,6 +15,7 @@ let
     output_limit_bytes = profile.outputLimitBytes;
     working_roots = profile.workingRoots ++ lib.optional (
       lib.any (repository: repository.checkProfile == name) (lib.attrValues cfg.repositories)
+      || lib.any (deployment: deployment.buildProfile == name) (lib.attrValues cfg.deploymentProfiles)
     ) workspaceRoot;
     allowed_credentials = profile.allowedCredentials;
     tasks_max = profile.tasksMax;
@@ -29,6 +30,24 @@ let
     author_name = repository.authorName;
     author_email = repository.authorEmail;
   }) cfg.repositories;
+  deploymentProfiles = lib.mapAttrs (_: deployment: {
+    repository = deployment.repository;
+    target_host = deployment.targetHost;
+    kind = deployment.kind;
+    flake_attribute = deployment.flakeAttribute;
+    build_profile = deployment.buildProfile;
+    activate_profile = deployment.activateProfile;
+    verify_profile = deployment.verifyProfile;
+    profile_path = deployment.profilePath;
+    running_link = deployment.runningLink;
+    activation_program = deployment.activationProgram;
+    activation_arguments = deployment.activationArguments;
+    artifact_source = deployment.artifactSource;
+    verify_commands = deployment.verifyCommands;
+    verify_attempts = deployment.verifyAttempts;
+    verify_interval_seconds = deployment.verifyIntervalSeconds;
+    automatic_rollback = deployment.automaticRollback;
+  }) cfg.deploymentProfiles;
   configFile = (pkgs.formats.json { }).generate "maxops-executor.json" {
     host = cfg.hostName;
     socket_path = cfg.socketPath;
@@ -38,12 +57,17 @@ let
     systemd_run = "${pkgs.systemd}/bin/systemd-run";
     systemctl = "${pkgs.systemd}/bin/systemctl";
     runner = "${cfg.package}/bin/maxops-job-runner";
+    deploy_runner = "${cfg.package}/bin/maxops-deploy-runner";
     git = "${pkgs.git}/bin/git";
+    nix = "${pkgs.nix}/bin/nix";
+    nix_env = "${pkgs.nix}/bin/nix-env";
     workspace_root = workspaceRoot;
     repository_root = "/var/lib/maxops-executor/repositories";
     manageable_units = cfg.manageableUnits;
     credential_sources = cfg.credentialSources;
-    inherit profiles repositories;
+    profiles = profiles;
+    repositories = repositories;
+    deployment_profiles = deploymentProfiles;
   };
 in
 {
@@ -181,6 +205,70 @@ in
         }
       );
     };
+    deploymentProfiles = lib.mkOption {
+      default = { };
+      description = "Server-owned Nix build, activation, verification, and recovery policies.";
+      type = lib.types.attrsOf (
+        lib.types.submodule {
+          options = {
+            repository = lib.mkOption { type = lib.types.str; };
+            targetHost = lib.mkOption { type = lib.types.str; };
+            kind = lib.mkOption {
+              type = lib.types.enum [ "system" "home" ];
+              default = "system";
+            };
+            flakeAttribute = lib.mkOption { type = lib.types.str; };
+            buildProfile = lib.mkOption {
+              type = lib.types.str;
+              default = "diagnostic";
+            };
+            activateProfile = lib.mkOption { type = lib.types.str; };
+            verifyProfile = lib.mkOption {
+              type = lib.types.str;
+              default = "diagnostic";
+            };
+            profilePath = lib.mkOption {
+              type = lib.types.str;
+              default = "/nix/var/nix/profiles/system";
+            };
+            runningLink = lib.mkOption {
+              type = lib.types.str;
+              default = "/run/current-system";
+            };
+            activationProgram = lib.mkOption {
+              type = lib.types.str;
+              default = "bin/switch-to-configuration";
+            };
+            activationArguments = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "switch" ];
+            };
+            artifactSource = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Optional trusted Nix copy source when the target lacks the built output.";
+            };
+            verifyCommands = lib.mkOption {
+              type = lib.types.listOf (lib.types.listOf lib.types.str);
+              default = [ ];
+              description = "Target-local structured argv acceptance checks.";
+            };
+            verifyAttempts = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 3;
+            };
+            verifyIntervalSeconds = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 2;
+            };
+            automaticRollback = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+            };
+          };
+        }
+      );
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -212,6 +300,21 @@ in
           repository: builtins.hasAttr repository.checkProfile cfg.profiles
         ) (lib.attrValues cfg.repositories);
         message = "maxops executor repository checks must reference a configured profile.";
+      }
+      {
+        assertion = lib.all (deployment:
+          builtins.hasAttr deployment.buildProfile cfg.profiles
+          && builtins.hasAttr deployment.activateProfile cfg.profiles
+          && builtins.hasAttr deployment.verifyProfile cfg.profiles
+        ) (lib.attrValues cfg.deploymentProfiles);
+        message = "maxops executor deployment profiles must reference configured execution profiles.";
+      }
+      {
+        assertion = lib.all (deployment:
+          deployment.kind != "system"
+          || cfg.profiles.${deployment.activateProfile}.privileged
+        ) (lib.attrValues cfg.deploymentProfiles);
+        message = "system deployment activation profiles must explicitly be privileged.";
       }
     ];
 

@@ -324,6 +324,46 @@ pub struct JobLogsResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryHeadRequest {
+    pub repository: String,
+    pub reference: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryHeadResponse {
+    pub repository: String,
+    pub reference: String,
+    pub commit: String,
+    #[schemars(with = "String")]
+    pub observed_at: jiff::Timestamp,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStateRequest {
+    pub deployment_profile: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStateResponse {
+    pub host: String,
+    pub deployment_profile: String,
+    #[serde(default)]
+    pub running_closure: Option<String>,
+    #[serde(default)]
+    pub persistent_profile: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    #[schemars(with = "String")]
+    pub observed_at: jiff::Timestamp,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(tag = "action", content = "params", rename_all = "snake_case")]
 pub enum ExecutorRequest {
     Submit {
@@ -337,6 +377,14 @@ pub enum ExecutorRequest {
         principal: String,
         request: WorkspaceTargetRequest,
     },
+    RepositoryHead {
+        principal: String,
+        request: RepositoryHeadRequest,
+    },
+    RuntimeState {
+        principal: String,
+        request: RuntimeStateRequest,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
@@ -345,6 +393,8 @@ pub enum ExecutorResponse {
     Job(JobRecord),
     Logs(JobLogsResponse),
     Workspace(WorkspaceTargetResponse),
+    RepositoryHead(RepositoryHeadResponse),
+    RuntimeState(RuntimeStateResponse),
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]

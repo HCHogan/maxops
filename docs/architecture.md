@@ -189,6 +189,41 @@ coordinate maxops jobs only. If a push may have succeeded but its result cannot
 be confirmed, the job is `outcome_unknown`; recovery re-observes the remote and
 does not blindly repeat or overwrite it.
 
+## Nix deployment changes
+
+Deployment profiles are declared independently on the Hub and executors. The
+Hub routes a named profile to one repository builder and one target; the
+executors own the exact flake attribute, activation program, profile links,
+verification argv and rollback policy. API callers can select a granted profile
+but cannot replace any command or path in it.
+
+`deploy.prepare` creates a durable change whose ID is also the prepare job ID.
+It observes the configured remote ref and the target's running closure,
+persistent profile, generation and boot ID, then freezes those facts with an
+immutable workspace revision and source commit. Prepare evaluates the exact Nix
+derivation and records a digest of `flake.lock`. Build realizes that derivation
+and records the output path. Every stage has a separate durable job and change
+revision, so a caller must re-read the record before proceeding.
+
+Immediately before activation, the Hub re-observes both the remote ref and the
+target runtime. Any difference from the plan makes the change `stale`; maxops
+does not reset the branch, profile or host. The target also compares the live
+runtime under its host mutation lock before invoking the configured activation
+program. Service actions, activation, verification and rollback share that lock;
+Nix evaluation and builds do not. The lock coordinates maxops jobs only.
+
+Verification checks both profile links and runs the target-owned acceptance
+argv. Automatic rollback restores the recorded baseline only while the failed
+change still owns both the running and persistent profile links. If a person or
+another tool activates a different output during acceptance, the change becomes
+`superseded` and recovery leaves that output running. Restoring a baseline can
+create a new Nix profile generation, so recovery proves closure identity rather
+than requiring the old generation number to reappear.
+
+System and Home Manager deployments are separate profile kinds and closures.
+Their paths, flake attributes and activation programs must be declared
+separately; a system activation does not imply a home activation.
+
 ## Library choices
 
 - `reqwest`: shared async HTTP client, rustls, explicit deadlines and bounded
@@ -213,7 +248,7 @@ References: [reqwest](https://docs.rs/reqwest/latest/reqwest/),
 
 ## Mutation boundary
 
-Version 0.2 includes preauthorized command and service execution with
+Version 0.2 includes preauthorized command, service and Nix deployment execution with
 observation credentials kept separate. It does not require per-command human
 confirmation within the configured scope. Immutable job specifications,
 execution-time checks, idempotency, durable records and reconciliation of
@@ -225,6 +260,6 @@ distinct from maxops's own operation history; internal locks do not exclude thos
 writers. Plans must revalidate their baselines, and recovery must stop when a
 later external deployment has superseded the operation.
 
-The [implementation plan](implementation-plan.md) defines the service, workspace,
-deployment, event and recovery stages after the command slice. Reboot and data
-recovery have separate implementation and verification requirements.
+The [implementation plan](implementation-plan.md) defines the event and client
+stages that follow deployment. Reboot and data recovery have separate
+implementation and verification requirements.

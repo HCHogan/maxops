@@ -1,10 +1,11 @@
 use super::{App, RepositoryConfig};
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_proto::{
-    JobId, JobRecord, JobState, NewJob, WorkspaceApplyParams, WorkspaceCheckParams,
-    WorkspaceCommitParams, WorkspaceCreateParams, WorkspaceDiff, WorkspaceFile, WorkspaceId,
-    WorkspacePublishParams, WorkspaceReadParams, WorkspaceRecord, WorkspaceRevisionParams,
-    WorkspaceState, WorkspaceTargetRequest, WorkspaceTargetResponse,
+    JobId, JobRecord, JobState, NewJob, RepositoryHeadRequest, RepositoryHeadResponse,
+    WorkspaceApplyParams, WorkspaceCheckParams, WorkspaceCommitParams, WorkspaceCreateParams,
+    WorkspaceDiff, WorkspaceFile, WorkspaceId, WorkspacePublishParams, WorkspaceReadParams,
+    WorkspaceRecord, WorkspaceRevisionParams, WorkspaceState, WorkspaceTargetRequest,
+    WorkspaceTargetResponse,
 };
 use serde_json::json;
 use std::{
@@ -24,6 +25,34 @@ pub(super) fn is_workspace_job(operation: &str) -> bool {
         operation,
         "workspace.create" | "workspace.check" | "workspace.publish"
     )
+}
+
+pub(super) async fn observe_repository_head(
+    app: &App,
+    principal: &str,
+    request: RepositoryHeadRequest,
+) -> Result<RepositoryHeadResponse> {
+    ensure!(!principal.is_empty(), "empty repository observer identity");
+    ensure!(
+        maxops_proto::valid_repository_id(&request.repository),
+        "invalid repository ID"
+    );
+    let repository = repository(app, &request.repository)?;
+    ensure!(
+        request.reference == repository.default_ref
+            || repository.publish_refs.contains(&request.reference),
+        "repository ref is not configured"
+    );
+    let _serial = app.workspace_serial.lock().await;
+    let mirror = ensure_mirror(app, &request.repository, repository).await?;
+    fetch(app, &mirror, repository).await?;
+    let commit = resolve_remote_head(app, &mirror, &request.reference).await?;
+    Ok(RepositoryHeadResponse {
+        repository: request.repository,
+        reference: request.reference,
+        commit,
+        observed_at: maxops_proto::now(),
+    })
 }
 
 pub(super) async fn validate_job(app: &App, job: &NewJob) -> Result<()> {
@@ -410,7 +439,14 @@ async fn mark_published_if_needed(
     if workspace.state == WorkspaceState::Published {
         return Ok(workspace.clone());
     }
-    app.store
+    let next = workspace
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| eyre!("workspace revision is exhausted"))?;
+    copy_revision(app, &workspace.workspace_id, workspace.revision, next)
+        .wrap_err("copy workspace revision before publish")?;
+    let result = app
+        .store
         .transition_workspace(
             &workspace.workspace_id,
             &workspace.creator,
@@ -419,7 +455,11 @@ async fn mark_published_if_needed(
             Some(commit),
             WorkspaceState::Published,
         )
-        .await
+        .await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(revision_directory(app, &workspace.workspace_id, next));
+    }
+    result
 }
 
 async fn finish_publish_success(

@@ -281,12 +281,17 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
         .as_ref()
         .zip(system_profile.as_ref())
         .map(|(running, profile)| running == profile);
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     Ok(Snapshot {
         host: app.config.host.clone(),
         observed_at: now(),
         facts: Facts {
             kernel,
             uptime_seconds,
+            boot_id,
             system_closure,
             system_profile,
             profile_generation,

@@ -1,16 +1,17 @@
 # maxops
 
-A small fleet control plane with authenticated observations and opt-in durable
-command and systemd service jobs. Nix owns deployment and inventory; Prometheus
-owns metrics. No host or user from a private fleet is built in.
+A small fleet control plane with authenticated observations, durable operations,
+versioned configuration workspaces and guarded Nix deployment. Nix owns policy
+and inventory; Prometheus owns metrics. No host or user from a private fleet is
+built in.
 
 Version 0.2 extends the initial single-host pilot with fleet observations.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
 The [implementation plan](docs/implementation-plan.md) covers the remaining
-configuration, deployment, event and client stages. Every API is usable
-by people and arbitrary automation clients. The design supports concurrent manual
-and external changes to repositories and hosts.
+event and client stages. Every API is usable by people and arbitrary automation
+clients. The design supports concurrent manual and external changes to
+repositories and hosts.
 
 ## Implemented
 
@@ -38,6 +39,15 @@ and external changes to repositories and hosts.
   read or mutation uses revision compare-and-swap; checks run against a frozen
   revision, and publish re-observes the remote ref before a normal fast-forward
   push. Human checkouts are never used or cleaned.
+- `deploy.prepare/build/activate/verify/rollback` coordinate a durable change
+  across builder and target executors. Plans freeze the workspace revision,
+  remote source head, Nix derivation, lock digest and observed runtime baseline.
+  Activation and recovery use exact closure/profile ownership checks; a later
+  human push or rebuild makes the old operation stale or superseded instead of
+  being overwritten.
+- Deployment and service mutations share a durable per-host lock for maxops
+  jobs. Builds remain independent, and the lock never claims to exclude a human
+  or another fleet tool.
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
@@ -53,9 +63,8 @@ and external changes to repositories and hosts.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: deployment, MCP, QQ impersonation/delegation, reboot,
-hub-side durable notification storage,
-arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
+Not implemented: durable event subscriptions, MCP, QQ impersonation/delegation,
+reboot, arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
 generation is distinct from the running closure; filesystem ctime is never
 called deployment time.
 
@@ -123,6 +132,15 @@ maxopsctl workspace.commit --repository nix-config --workspace-id "$WORKSPACE" \
   --expected-revision 2 --message 'fix: update example host'
 maxopsctl workspace.publish --params-file ./workspace-publish.json \
   --idempotency-key change-123-publish --wait
+CHANGE=$(maxopsctl deploy.prepare --repository nix-config --workspace-id "$WORKSPACE" \
+  --expected-revision 4 --target-host example --profile example-system \
+  --idempotency-key change-123-prepare | jq -r .job_id)
+maxopsctl changes.status --change-id "$CHANGE"
+REVISION=$(maxopsctl changes.status --change-id "$CHANGE" | jq -r .revision)
+maxopsctl deploy.build --change-id "$CHANGE" --expected-revision "$REVISION" \
+  --idempotency-key change-123-build --wait
+# Re-read the change revision before each later activate/verify/rollback stage.
+maxopsctl changes.history --host example
 maxopsctl jobs.list
 maxopsctl jobs.status --job-id 00000000-0000-0000-0000-000000000000
 maxopsctl jobs.logs --job-id 00000000-0000-0000-0000-000000000000
@@ -187,6 +205,22 @@ services.maxops-executor = {
   manageableUnits = [ "nginx.service" ];
   credentialSources.github-token = "/run/secrets/github-token";
   profiles.diagnostic.allowedCredentials = [ "github-token" ];
+  profiles.activation = {
+    user = "root";
+    privileged = true;
+  };
+  repositories.nix-config = {
+    url = "ssh://git@github.com/example/nix-config.git";
+    publishRefs = [ "refs/heads/main" ];
+    checks.flake-check = [ "${pkgs.nix}/bin/nix" "flake" "check" "--no-build" ];
+  };
+  deploymentProfiles.example-system = {
+    repository = "nix-config";
+    targetHost = "example";
+    flakeAttribute = "nixosConfigurations.example.config.system.build.toplevel";
+    activateProfile = "activation";
+    verifyCommands = [ [ "${pkgs.systemd}/bin/systemctl" "is-system-running" "--wait" ] ];
+  };
 };
 services.maxops-agent = {
   enable = true;
@@ -221,13 +255,24 @@ services.maxops-hub = {
     hosts = [ "example" ];
     capabilities = [ "fleet:read" "host:read" "units:read" ];
   }];
+  repositories = [{ name = "nix-config"; executorHost = "example"; }];
+  deployments = [{
+    name = "example-system";
+    repository = "nix-config";
+    builderHost = "example";
+    targetHost = "example";
+    flakeAttribute = "nixosConfigurations.example.config.system.build.toplevel";
+  }];
   prometheusUrl = "http://127.0.0.1:9009";
   alertmanagerUrl = "http://127.0.0.1:9093";
 };
 ```
 
 Add a separate client with `access = "manage"` and the `units:manage`, `exec:run`,
-`jobs:read` and `jobs:cancel` capabilities for the corresponding job APIs.
+`jobs:read`, `jobs:cancel`, `workspace:read`, `workspace:write`,
+`workspace:publish`, `deploy:manage` and `changes:read`
+capabilities needed by that client. Grant its exact `repositories` and
+`deployments` as well.
 Observation clients remain read-only. A unit must appear in the Hub, Agent and
 Executor `manageableUnits` lists; these are exact names and are separate from
 the broader readable inventory. Execution profiles and their users, timeout,

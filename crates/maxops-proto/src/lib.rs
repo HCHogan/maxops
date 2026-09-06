@@ -192,6 +192,13 @@ operations! {
     WorkspaceCommit(WorkspaceCommitParams) -> WorkspaceRecord, "workspace.commit", "workspace:write", OperationKind::JobControl, false, IdempotencyRequirement::None, "Commit an exact workspace tree using the configured author identity";
     WorkspaceCheck(WorkspaceCheckParams) -> JobHandle, "workspace.check", "workspace:write", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run one configured check against an immutable workspace revision";
     WorkspacePublish(WorkspacePublishParams) -> JobHandle, "workspace.publish", "workspace:publish", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Publish an exact committed workspace revision if the remote ref baseline is unchanged";
+    DeployPrepare(DeployPrepareParams) -> JobHandle, "deploy.prepare", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Freeze source and observed runtime baselines into a durable change plan";
+    DeployBuild(DeployChangeParams) -> JobHandle, "deploy.build", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Build the exact prepared workspace revision into a verified Nix artifact";
+    DeployActivate(DeployChangeParams) -> JobHandle, "deploy.activate", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Conditionally activate a built artifact against the plan runtime baseline";
+    DeployVerify(DeployChangeParams) -> JobHandle, "deploy.verify", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run target-owned acceptance checks against the activated artifact";
+    DeployRollback(DeployChangeParams) -> JobHandle, "deploy.rollback", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Conditionally restore the plan baseline only while this change still owns runtime state";
+    ChangesStatus(ChangeStatusParams) -> ChangeRecord, "changes.status", "changes:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a durable change plan and reconcile its current stage job";
+    ChangesHistory(ChangeHistoryParams) -> ChangeHistoryResponse, "changes.history", "changes:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "List durable changes owned by the authenticated principal";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -261,7 +268,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 26);
+        assert_eq!(operations.len(), 33);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only

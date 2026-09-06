@@ -5,8 +5,9 @@
 
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_proto::{
-    JobEvent, JobEventKind, JobHandle, JobId, JobRecord, JobState, NewJob, ResourceObservation,
-    WorkspaceId, WorkspaceRecord, WorkspaceState,
+    ChangeId, ChangeJobs, ChangePlan, ChangeRecord, ChangeState, DeploymentArtifact, JobEvent,
+    JobEventKind, JobHandle, JobId, JobRecord, JobState, NewJob, ResourceObservation, WorkspaceId,
+    WorkspaceRecord, WorkspaceState,
 };
 use serde_json::Value;
 use sqlx::{
@@ -32,6 +33,15 @@ pub struct SubmitResult {
     pub created: bool,
 }
 
+pub struct ChangeTransition<'a> {
+    pub expected_revision: u64,
+    pub next: ChangeState,
+    pub plan: &'a ChangePlan,
+    pub artifact: Option<&'a DeploymentArtifact>,
+    pub jobs: &'a ChangeJobs,
+    pub recovery_state: Option<&'a str>,
+}
+
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         let options = SqliteConnectOptions::new()
@@ -55,6 +65,17 @@ impl Store {
     }
 
     pub async fn submit_job(&self, idempotency_key: &str, new: &NewJob) -> Result<SubmitResult> {
+        let id =
+            JobId::parse(uuid::Uuid::now_v7().to_string()).map_err(|message| eyre!(message))?;
+        self.submit_job_with_id(idempotency_key, &id, new).await
+    }
+
+    pub async fn submit_job_with_id(
+        &self,
+        idempotency_key: &str,
+        id: &JobId,
+        new: &NewJob,
+    ) -> Result<SubmitResult> {
         validate_new_job(idempotency_key, new)?;
         let spec = canonical_json(&new.spec);
         let spec_json = serde_json::to_string(&spec)?;
@@ -82,7 +103,6 @@ impl Store {
             });
         }
 
-        let id = uuid::Uuid::now_v7().to_string();
         let at = maxops_proto::now().to_string();
         let deadline = new.deadline.map(|value| value.to_string());
         sqlx::query(
@@ -91,7 +111,7 @@ impl Store {
                 state, revision, policy_version, created_at, updated_at, deadline
              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)",
         )
-        .bind(&id)
+        .bind(id.as_str())
         .bind(&new.principal)
         .bind(&new.host)
         .bind(&new.operation)
@@ -111,7 +131,7 @@ impl Store {
         .bind(&new.principal)
         .bind(idempotency_key)
         .bind(&spec_hash)
-        .bind(&id)
+        .bind(id.as_str())
         .bind(&at)
         .execute(&mut *transaction)
         .await?;
@@ -119,13 +139,13 @@ impl Store {
             "INSERT INTO job_events (job_id, kind, state, occurred_at, payload_json)
              VALUES (?, 'submitted', 'queued', ?, '{}')",
         )
-        .bind(&id)
+        .bind(id.as_str())
         .bind(&at)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
         Ok(SubmitResult {
-            job: self.get_job_by_text(&id).await?,
+            job: self.get_job(id).await?,
             created: true,
         })
     }
@@ -191,6 +211,25 @@ impl Store {
 
     pub async fn get_job(&self, id: &JobId) -> Result<JobRecord> {
         self.get_job_by_text(id.as_str()).await
+    }
+
+    pub async fn get_idempotent_job(
+        &self,
+        principal: &str,
+        key: &str,
+    ) -> Result<Option<JobRecord>> {
+        let row = sqlx::query("SELECT job_id FROM idempotency WHERE principal = ? AND key = ?")
+            .bind(principal)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => Ok(Some(
+                self.get_job_by_text(row.try_get::<&str, _>("job_id")?)
+                    .await?,
+            )),
+            None => Ok(None),
+        }
     }
 
     pub async fn get_owned_job(&self, principal: &str, id: &JobId) -> Result<JobRecord> {
@@ -395,6 +434,51 @@ impl Store {
         self.get_workspace(id).await
     }
 
+    /// Persist an executor-owned workspace projection in the hub database.
+    /// A later observation may advance content but cannot reassign identity.
+    pub async fn record_workspace(&self, workspace: &WorkspaceRecord) -> Result<WorkspaceRecord> {
+        let _writer = self.writer.lock().await;
+        let changed = sqlx::query(
+            "INSERT INTO workspaces (
+                id, repository_id, executor, base_commit, revision, tree_hash,
+                commit_hash, state, creator, created_at, retain_until
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                revision = excluded.revision,
+                tree_hash = excluded.tree_hash,
+                commit_hash = excluded.commit_hash,
+                state = excluded.state,
+                retain_until = excluded.retain_until
+             WHERE workspaces.repository_id = excluded.repository_id
+               AND workspaces.executor = excluded.executor
+               AND workspaces.base_commit = excluded.base_commit
+               AND workspaces.creator = excluded.creator",
+        )
+        .bind(workspace.workspace_id.as_str())
+        .bind(&workspace.repository)
+        .bind(&workspace.executor)
+        .bind(&workspace.base_commit)
+        .bind(to_i64(workspace.revision, "workspace revision")?)
+        .bind(workspace.tree_hash.to_ascii_lowercase())
+        .bind(
+            workspace
+                .commit_hash
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase()),
+        )
+        .bind(workspace.state.as_str())
+        .bind(&workspace.creator)
+        .bind(workspace.created_at.to_string())
+        .bind(workspace.retain_until.map(|value| value.to_string()))
+        .execute(&self.pool)
+        .await?;
+        ensure!(
+            changed.rows_affected() == 1,
+            "workspace projection identity changed"
+        );
+        self.get_workspace(&workspace.workspace_id).await
+    }
+
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<WorkspaceRecord> {
         let row = sqlx::query(
             "SELECT id, repository_id, executor, base_commit, revision, tree_hash,
@@ -456,6 +540,164 @@ impl Store {
         .await?;
         ensure!(changed.rows_affected() == 1, "workspace revision changed");
         self.get_workspace(id).await
+    }
+
+    pub async fn create_change(
+        &self,
+        plan: &ChangePlan,
+        creator: &str,
+        prepare_job: &JobId,
+    ) -> Result<ChangeRecord> {
+        ensure!(
+            !creator.is_empty() && creator.len() <= 128,
+            "invalid change creator"
+        );
+        let jobs = ChangeJobs {
+            prepare: Some(prepare_job.clone()),
+            ..ChangeJobs::default()
+        };
+        let _writer = self.writer.lock().await;
+        let at = maxops_proto::now().to_string();
+        sqlx::query(
+            "INSERT INTO changes (
+                id, workspace_id, workspace_revision, host, profile, source_json,
+                artifact_json, baseline_json, intent_json, state, recovery_state,
+                created_at, updated_at, creator, revision, jobs_json
+             ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 'checking', NULL, ?, ?, ?, 1, ?)",
+        )
+        .bind(plan.change_id.as_str())
+        .bind(plan.workspace_id.as_str())
+        .bind(to_i64(plan.workspace_revision, "workspace revision")?)
+        .bind(&plan.target_host)
+        .bind(&plan.deployment_profile)
+        .bind(serde_json::to_string(&canonical_json(
+            &serde_json::to_value(&plan.source_baseline)?,
+        ))?)
+        .bind(serde_json::to_string(&canonical_json(
+            &serde_json::to_value(&plan.runtime_baseline)?,
+        ))?)
+        .bind(serde_json::to_string(&canonical_json(
+            &serde_json::to_value(plan)?,
+        ))?)
+        .bind(&at)
+        .bind(&at)
+        .bind(creator)
+        .bind(serde_json::to_string(&jobs)?)
+        .execute(&self.pool)
+        .await?;
+        self.get_change(&plan.change_id).await
+    }
+
+    pub async fn get_change(&self, id: &ChangeId) -> Result<ChangeRecord> {
+        let row = sqlx::query(
+            "SELECT intent_json, artifact_json, state, recovery_state, creator,
+                    revision, jobs_json, updated_at
+             FROM changes WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| eyre!("change not found"))?;
+        row_to_change(&row)
+    }
+
+    pub async fn get_owned_change(&self, creator: &str, id: &ChangeId) -> Result<ChangeRecord> {
+        let change = self.get_change(id).await?;
+        ensure!(change.creator == creator, "change not found");
+        Ok(change)
+    }
+
+    pub async fn list_changes(
+        &self,
+        creator: &str,
+        host: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<ChangeRecord>> {
+        ensure!(
+            (1..=200).contains(&limit),
+            "change list limit must be 1..200"
+        );
+        let rows = sqlx::query(
+            "SELECT intent_json, artifact_json, state, recovery_state, creator,
+                    revision, jobs_json, updated_at
+             FROM changes
+             WHERE creator = ? AND (? IS NULL OR host = ?)
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(creator)
+        .bind(host)
+        .bind(host)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_change).collect()
+    }
+
+    pub async fn transition_change(
+        &self,
+        id: &ChangeId,
+        creator: &str,
+        update: ChangeTransition<'_>,
+    ) -> Result<ChangeRecord> {
+        let ChangeTransition {
+            expected_revision,
+            next,
+            plan,
+            artifact,
+            jobs,
+            recovery_state,
+        } = update;
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT state, revision FROM changes WHERE id = ? AND creator = ?")
+            .bind(id.as_str())
+            .bind(creator)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| eyre!("change not found"))?;
+        let current = ChangeState::from_str(row.try_get::<&str, _>("state")?)
+            .map_err(|message| eyre!(message))?;
+        let revision = to_u64(row.try_get("revision")?, "change revision")?;
+        ensure!(revision == expected_revision, "change revision changed");
+        ensure!(
+            current == next || current.can_transition_to(next),
+            "invalid change state transition from {} to {}",
+            current.as_str(),
+            next.as_str()
+        );
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or_else(|| eyre!("change revision overflow"))?;
+        let at = maxops_proto::now().to_string();
+        let changed = sqlx::query(
+            "UPDATE changes
+             SET state = ?, revision = ?, intent_json = ?, artifact_json = ?,
+                 jobs_json = ?, recovery_state = ?, updated_at = ?
+             WHERE id = ? AND creator = ? AND revision = ?",
+        )
+        .bind(next.as_str())
+        .bind(to_i64(next_revision, "change revision")?)
+        .bind(serde_json::to_string(&canonical_json(
+            &serde_json::to_value(plan)?,
+        ))?)
+        .bind(
+            artifact
+                .map(serde_json::to_value)
+                .transpose()?
+                .map(|value| serde_json::to_string(&canonical_json(&value)))
+                .transpose()?,
+        )
+        .bind(serde_json::to_string(jobs)?)
+        .bind(recovery_state)
+        .bind(at)
+        .bind(id.as_str())
+        .bind(creator)
+        .bind(to_i64(expected_revision, "change revision")?)
+        .execute(&mut *transaction)
+        .await?;
+        ensure!(changed.rows_affected() == 1, "change revision changed");
+        transaction.commit().await?;
+        self.get_change(id).await
     }
 
     pub async fn transition_job(
@@ -809,6 +1051,23 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> Result<WorkspaceRecord> {
             .try_get::<Option<String>, _>("retain_until")?
             .map(parse_timestamp)
             .transpose()?,
+    })
+}
+
+fn row_to_change(row: &sqlx::sqlite::SqliteRow) -> Result<ChangeRecord> {
+    Ok(ChangeRecord {
+        plan: serde_json::from_str(row.try_get("intent_json")?)?,
+        creator: row.try_get("creator")?,
+        revision: to_u64(row.try_get("revision")?, "change revision")?,
+        state: ChangeState::from_str(row.try_get::<&str, _>("state")?)
+            .map_err(|message| eyre!(message))?,
+        artifact: row
+            .try_get::<Option<String>, _>("artifact_json")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        jobs: serde_json::from_str(row.try_get("jobs_json")?)?,
+        recovery_state: row.try_get("recovery_state")?,
+        updated_at: parse_timestamp(row.try_get("updated_at")?)?,
     })
 }
 

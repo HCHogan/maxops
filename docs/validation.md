@@ -154,3 +154,39 @@ workspace jobs skipped the protocol's `dispatching` state, bare
 inherit the check account's dedicated group. CLI calls and polling assertions
 also have explicit test timeouts so a nonterminal regression fails the gate
 instead of hanging it.
+
+## Guarded Nix deployment
+
+On 2026-09-06, P4 passed the devenv gate with all 50 nextest tests, strict
+clippy, and full flake evaluation. The final
+`checks.x86_64-linux.agent-vm` derivation ran to completion under KVM on b650
+from `/tmp/maxops-build-p4`. The package build repeated the 50 tests before the
+VM started; it did not activate b650 or change its running configuration.
+
+The VM built real Nix derivations from immutable workspace revisions and
+verified:
+
+- prepare freezes the source commit, remote head, workspace tree, `flake.lock`
+  digest, derivation path and directly observed target runtime;
+- build realizes the exact prepared derivation and records the resulting store
+  path before activation is allowed;
+- a slow systemd restart and deployment activation serialize through the same
+  target-local maxops lock, while the earlier Nix build remains independent;
+- activation changes both the persistent profile and fixture runtime link, and
+  target-owned acceptance commands must pass before the explicit verify stage
+  records success;
+- a later external Git push makes a built plan stale without changing runtime;
+- a manual profile switch/rebuild makes a plan stale before activation and is
+  left intact;
+- failed target acceptance restores the exact baseline closure and reports
+  `rolled_back`; and
+- a manual activation during maxops acceptance takes ownership, makes the old
+  change `superseded`, and prevents its recovery path from rolling back the
+  external generation.
+
+The gate exposed and fixed lost immutable workspace revisions after publish,
+truncated deployment reports, a missing fixture lock file, target commands that
+depended on ambient paths, and rollback checks that incorrectly required a
+restored closure to reuse an old Nix profile generation number. The durable
+host lock coordinates maxops service and deployment mutations only; direct Git,
+`systemctl`, profile and activation operations remain valid external writes.
