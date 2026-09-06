@@ -1,10 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
-#[derive(
-    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize, utoipa::ToSchema,
-)]
+#[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct JobId(String);
 
@@ -31,6 +33,16 @@ impl JobId {
 impl fmt::Display for JobId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for JobId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -80,10 +92,10 @@ impl JobState {
         use JobState::*;
         matches!(
             (self, next),
-            (Queued, Dispatching | Cancelled)
+            (Queued, Dispatching | Failed | Cancelled)
                 | (
                     Dispatching,
-                    Running | Reconciling | Failed | Cancelled | TimedOut
+                    Running | Reconciling | Succeeded | Failed | Cancelled | TimedOut
                 )
                 | (
                     Running,
@@ -91,7 +103,7 @@ impl JobState {
                 )
                 | (
                     Reconciling,
-                    Succeeded | Failed | Cancelled | TimedOut | OutcomeUnknown
+                    Running | Succeeded | Failed | Cancelled | TimedOut | OutcomeUnknown
                 )
                 | (OutcomeUnknown, Succeeded | Failed | Cancelled | TimedOut)
         )
@@ -156,4 +168,179 @@ pub struct JobRecord {
     pub deadline: Option<jiff::Timestamp>,
     pub cancel_requested: bool,
     pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSpec {
+    Argv(Vec<String>),
+    Script(String),
+}
+
+impl CommandSpec {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Argv(argv)
+                if !argv.is_empty()
+                    && argv.len() <= 256
+                    && argv.iter().all(|value| value.len() <= 16 * 1024) =>
+            {
+                Ok(())
+            }
+            Self::Script(script) if !script.is_empty() && script.len() <= 64 * 1024 => Ok(()),
+            Self::Argv(_) => Err("argv must contain 1..256 bounded arguments"),
+            Self::Script(_) => Err("script must contain 1..65536 bytes"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecRunParams {
+    pub host: String,
+    pub profile: String,
+    pub command: CommandSpec,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub credential_refs: Vec<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+}
+
+impl ExecRunParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.command.validate()?;
+        if !crate::valid_host(&self.host) {
+            return Err("invalid host");
+        }
+        if self.profile.is_empty()
+            || self.profile.len() > 64
+            || !self
+                .profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err("invalid execution profile");
+        }
+        if self.env.len() > 128
+            || self.env.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 256
+                    || value.len() > 16 * 1024
+                    || !key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+        {
+            return Err("invalid environment");
+        }
+        if self.credential_refs.len() > 32
+            || self.credential_refs.iter().collect::<BTreeSet<_>>().len()
+                != self.credential_refs.len()
+            || self.credential_refs.iter().any(|value| {
+                value.is_empty()
+                    || value.len() > 128
+                    || value == "spec"
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+        {
+            return Err("credential references must be unique valid names");
+        }
+        if self.timeout_seconds.is_some_and(|value| value == 0) {
+            return Err("timeout must be positive");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobsListParams {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub states: Vec<JobState>,
+    #[serde(default = "default_job_limit")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: u16,
+}
+
+pub fn default_job_limit() -> u16 {
+    50
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobIdParams {
+    pub job_id: JobId,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobLogsParams {
+    pub job_id: JobId,
+    #[serde(default)]
+    pub stdout_offset: u64,
+    #[serde(default)]
+    pub stderr_offset: u64,
+    #[serde(default = "default_log_limit")]
+    #[schemars(range(min = 1, max = 65536))]
+    pub limit: u32,
+}
+
+pub fn default_log_limit() -> u32 {
+    64 * 1024
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobCancelParams {
+    pub job_id: JobId,
+    pub expected_revision: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+pub struct JobsListResponse {
+    pub jobs: Vec<JobRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+pub struct JobLogsResponse {
+    pub job_id: JobId,
+    pub encoding: String,
+    pub stdout_base64: String,
+    pub stderr_base64: String,
+    pub next_stdout_offset: u64,
+    pub next_stderr_offset: u64,
+    pub complete: bool,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(tag = "action", content = "params", rename_all = "snake_case")]
+pub enum ExecutorRequest {
+    Submit { job_id: JobId, job: NewJob },
+    Status(JobIdParams),
+    Logs(JobLogsParams),
+    Cancel(JobCancelParams),
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(tag = "result", content = "value", rename_all = "snake_case")]
+pub enum ExecutorResponse {
+    Job(JobRecord),
+    Logs(JobLogsResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExecutorWireResponse {
+    Ok { response: Box<ExecutorResponse> },
+    Error { code: String, message: String },
 }

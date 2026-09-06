@@ -6,10 +6,13 @@ use axum::{
 };
 use futures::future::join_all;
 use maxops_proto::{
-    PROTOCOL_VERSION, Request, Snapshot, now, operations,
+    ExecutorRequest, ExecutorResponse, IdempotencyRequirement, JobCancelParams, JobId, JobIdParams,
+    JobRecord, JobState, JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, Request,
+    Snapshot, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
+use maxops_store::Store;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -62,6 +65,8 @@ pub struct Config {
     alertmanager_url: Option<String>,
     #[serde(default)]
     alert_ingress: Option<AlertIngressConfig>,
+    #[serde(default)]
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +78,8 @@ struct HostConfig {
     agent_url: String,
     agent_token_file: PathBuf,
     #[serde(default)]
+    execution_token_file: Option<PathBuf>,
+    #[serde(default)]
     readable_units: BTreeSet<String>,
 }
 
@@ -83,6 +90,16 @@ struct ClientConfig {
     token_file: PathBuf,
     hosts: BTreeSet<String>,
     capabilities: BTreeSet<String>,
+    #[serde(default)]
+    access: Access,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Access {
+    #[default]
+    Observe,
+    Manage,
 }
 
 #[derive(Deserialize)]
@@ -96,12 +113,14 @@ struct AlertIngressConfig {
 struct Host {
     config: HostConfig,
     token: Token,
+    execution_token: Option<Token>,
 }
 struct Principal {
     name: String,
     token: Token,
     hosts: BTreeSet<String>,
     capabilities: BTreeSet<String>,
+    access: Access,
 }
 struct AlertIngress {
     token: Token,
@@ -116,9 +135,10 @@ struct App {
     alertmanager_url: Option<String>,
     alert_ingress: Option<AlertIngress>,
     slots: Semaphore,
+    store: Option<Store>,
 }
 
-pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
+pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
     transport::validate_listen(config.listen)?;
     for url in [&config.prometheus_url, &config.alertmanager_url]
         .into_iter()
@@ -135,11 +155,31 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
         );
         transport::validate_url(&host.agent_url)?;
         let token = Token::read(&host.agent_token_file)?;
+        let execution_token = host
+            .execution_token_file
+            .as_deref()
+            .map(Token::read)
+            .transpose()?;
+        if let Some(execution_token) = &execution_token {
+            color_eyre::eyre::ensure!(
+                !execution_token.same_as(&token),
+                "agent observation and execution credentials must differ"
+            );
+        }
         color_eyre::eyre::ensure!(
-            !hosts
-                .values()
-                .any(|other: &Host| other.token.same_as(&token)),
-            "each agent requires a distinct credential"
+            !hosts.values().any(|other: &Host| {
+                other.token.same_as(&token)
+                    || execution_token
+                        .as_ref()
+                        .is_some_and(|execution| other.token.same_as(execution))
+                    || other.execution_token.as_ref().is_some_and(|execution| {
+                        execution.same_as(&token)
+                            || execution_token
+                                .as_ref()
+                                .is_some_and(|candidate| execution.same_as(candidate))
+                    })
+            }),
+            "each agent endpoint requires distinct credentials"
         );
         color_eyre::eyre::ensure!(
             hosts
@@ -147,7 +187,8 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
                     host.name.clone(),
                     Host {
                         config: host,
-                        token
+                        token,
+                        execution_token,
                     }
                 )
                 .is_none(),
@@ -155,6 +196,11 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
         );
     }
     let known_caps: BTreeSet<_> = operations().into_iter().map(|op| op.capability).collect();
+    let management_caps: BTreeSet<_> = operations()
+        .into_iter()
+        .filter(|operation| operation.kind != OperationKind::Observation)
+        .map(|operation| operation.capability)
+        .collect();
     let mut clients: Vec<Principal> = Vec::new();
     for client in config.clients {
         color_eyre::eyre::ensure!(!client.name.is_empty(), "empty client name");
@@ -164,6 +210,14 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
                 .iter()
                 .all(|cap| known_caps.contains(cap.as_str())),
             "unknown capability"
+        );
+        color_eyre::eyre::ensure!(
+            client.access == Access::Manage
+                || client
+                    .capabilities
+                    .iter()
+                    .all(|capability| !management_caps.contains(capability.as_str())),
+            "observation client cannot receive job capabilities"
         );
         color_eyre::eyre::ensure!(
             client.hosts.iter().all(|name| hosts.contains_key(name)),
@@ -180,17 +234,51 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
             !hosts.values().any(|h| h.token.same_as(&token)),
             "client and agent credentials must differ"
         );
+        color_eyre::eyre::ensure!(
+            !hosts.values().any(|host| {
+                host.execution_token
+                    .as_ref()
+                    .is_some_and(|execution| execution.same_as(&token))
+            }),
+            "client and agent execution credentials must differ"
+        );
         clients.push(Principal {
             name: client.name,
             token,
             hosts: client.hosts,
             capabilities: client.capabilities,
+            access: client.access,
         });
     }
     color_eyre::eyre::ensure!(
         !clients.is_empty(),
         "at least one authenticated client is required"
     );
+    let management_enabled = clients.iter().any(|client| client.access == Access::Manage);
+    color_eyre::eyre::ensure!(
+        !management_enabled || config.state_file.is_some(),
+        "management clients require a durable hub state_file"
+    );
+    if management_enabled {
+        for principal in clients
+            .iter()
+            .filter(|client| client.access == Access::Manage)
+        {
+            color_eyre::eyre::ensure!(
+                principal.hosts.iter().all(|name| {
+                    hosts
+                        .get(name)
+                        .and_then(|host| host.execution_token.as_ref())
+                        .is_some()
+                }),
+                "management client references a host without execution credentials"
+            );
+        }
+    }
+    let store = match config.state_file.as_deref() {
+        Some(path) => Some(Store::open(path).await?),
+        None => None,
+    };
     let alert_ingress = config
         .alert_ingress
         .map(|ingress| -> color_eyre::eyre::Result<_> {
@@ -202,7 +290,13 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
                 .transpose()?;
             color_eyre::eyre::ensure!(
                 !clients.iter().any(|p| p.token.same_as(&token))
-                    && !hosts.values().any(|h| h.token.same_as(&token)),
+                    && !hosts.values().any(|host| {
+                        host.token.same_as(&token)
+                            || host
+                                .execution_token
+                                .as_ref()
+                                .is_some_and(|execution| execution.same_as(&token))
+                    }),
                 "alert ingress requires a dedicated token"
             );
             if let Some(sink) = &sink_token {
@@ -211,7 +305,12 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
                         && !clients
                             .iter()
                             .any(|principal| principal.token.same_as(sink))
-                        && !hosts.values().any(|host| host.token.same_as(sink)),
+                        && !hosts.values().any(|host| host.token.same_as(sink))
+                        && !hosts.values().any(|host| {
+                            host.execution_token
+                                .as_ref()
+                                .is_some_and(|execution| execution.same_as(sink))
+                        }),
                     "notification sink requires a dedicated token"
                 );
             }
@@ -230,7 +329,13 @@ pub fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
         alertmanager_url: config.alertmanager_url,
         alert_ingress,
         slots: Semaphore::new(16),
+        store,
     });
+    if let Some(store) = &app.store {
+        for job in store.nonterminal_jobs().await? {
+            spawn_dispatch(app.clone(), job.handle.job_id);
+        }
+    }
     Ok((config.listen, router(app)))
 }
 
@@ -241,7 +346,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/v1/openapi.json", get(openapi))
         .route(
             "/v1/execute",
-            post(execute).layer(DefaultBodyLimit::max(4096)),
+            post(execute).layer(DefaultBodyLimit::max(128 * 1024)),
         )
         .route("/v1/alerts", post(alerts))
         .layer(DefaultBodyLimit::max(256 * 1024))
@@ -555,11 +660,450 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             }).collect::<Vec<_>>()}),
             )
         }
+        Request::ExecRun(_)
+        | Request::JobsList(_)
+        | Request::JobsStatus(_)
+        | Request::JobsLogs(_)
+        | Request::JobsCancel(_) => Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "job operation routed as observation",
+        )),
+    }
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<&str, ApiError> {
+    if headers.get_all("idempotency-key").iter().count() != 1 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "one Idempotency-Key header is required",
+        ));
+    }
+    let value = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid Idempotency-Key"))?;
+    if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid Idempotency-Key"));
+    }
+    Ok(value)
+}
+
+fn durable_store(app: &App) -> Result<&Store, ApiError> {
+    app.store.as_ref().ok_or(ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "durable job storage is disabled",
+    ))
+}
+
+fn map_store_error(error: color_eyre::eyre::Report) -> ApiError {
+    let message = error.to_string();
+    if message.contains("idempotency key") || message.contains("revision changed") {
+        ApiError(
+            StatusCode::CONFLICT,
+            "job request conflicts with current state",
+        )
+    } else if message.contains("not found") {
+        ApiError(StatusCode::NOT_FOUND, "job not found")
+    } else {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable job storage failed",
+        )
+    }
+}
+
+async fn run_job_operation(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    request: Request,
+) -> Result<(StatusCode, Value), ApiError> {
+    let store = durable_store(app)?;
+    match request {
+        Request::ExecRun(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let host = host_for(app, principal, &params.host)?;
+            if host.execution_token.is_none() {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host execution disabled",
+                ));
+            }
+            let key = idempotency_key(headers)?;
+            let deadline = now()
+                .checked_add(std::time::Duration::from_secs(u64::from(
+                    params.timeout_seconds.unwrap_or(300),
+                )))
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?;
+            let job = NewJob {
+                principal: principal.name.clone(),
+                host: params.host.clone(),
+                operation: "exec.run".into(),
+                spec_version: 1,
+                spec: serde_json::to_value(params).expect("serializable command request"),
+                policy_version: "hub-config-v1".into(),
+                deadline: Some(deadline),
+            };
+            let submitted = store.submit_job(key, &job).await.map_err(map_store_error)?;
+            if submitted.created || submitted.job.handle.state == JobState::Queued {
+                spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
+            }
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+            ))
+        }
+        Request::JobsList(params) => {
+            if let Some(host) = &params.host {
+                host_for(app, principal, host)?;
+            }
+            if !(1..=200).contains(&params.limit) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "job list limit must be 1..200",
+                ));
+            }
+            let jobs = store
+                .list_jobs(
+                    Some(&principal.name),
+                    params.host.as_deref(),
+                    &params.states,
+                    params.limit,
+                )
+                .await
+                .map_err(map_store_error)?
+                .into_iter()
+                .filter(|job| principal.hosts.contains(&job.handle.host))
+                .collect();
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(JobsListResponse { jobs }).expect("serializable jobs"),
+            ))
+        }
+        Request::JobsStatus(params) => {
+            let mut job = store
+                .get_owned_job(&principal.name, &params.job_id)
+                .await
+                .map_err(map_store_error)?;
+            host_for(app, principal, &job.handle.host)?;
+            if (!job.handle.state.is_terminal() || job.handle.state == JobState::OutcomeUnknown)
+                && let Ok(ExecutorResponse::Job(target)) = agent_request(
+                    app,
+                    &job.handle.host,
+                    &ExecutorRequest::Status(JobIdParams {
+                        job_id: params.job_id.clone(),
+                    }),
+                )
+                .await
+            {
+                job = project_target_job(store, job, target)
+                    .await
+                    .map_err(map_store_error)?;
+            }
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(job).expect("serializable job"),
+            ))
+        }
+        Request::JobsLogs(params) => {
+            let job = store
+                .get_owned_job(&principal.name, &params.job_id)
+                .await
+                .map_err(map_store_error)?;
+            host_for(app, principal, &job.handle.host)?;
+            let response = agent_request(app, &job.handle.host, &ExecutorRequest::Logs(params))
+                .await
+                .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"))?;
+            let ExecutorResponse::Logs(logs) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(logs).expect("serializable logs"),
+            ))
+        }
+        Request::JobsCancel(params) => {
+            if params.reason.is_empty() || params.reason.len() > 1024 {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "cancellation reason must contain 1..1024 bytes",
+                ));
+            }
+            let job = store
+                .get_owned_job(&principal.name, &params.job_id)
+                .await
+                .map_err(map_store_error)?;
+            host_for(app, principal, &job.handle.host)?;
+            if job.handle.revision != params.expected_revision {
+                return Err(ApiError(StatusCode::CONFLICT, "job revision changed"));
+            }
+            let target = agent_request(
+                app,
+                &job.handle.host,
+                &ExecutorRequest::Status(JobIdParams {
+                    job_id: params.job_id.clone(),
+                }),
+            )
+            .await
+            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"))?;
+            let ExecutorResponse::Job(target) = target else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            let response = agent_request(
+                app,
+                &job.handle.host,
+                &ExecutorRequest::Cancel(JobCancelParams {
+                    job_id: params.job_id.clone(),
+                    expected_revision: target.handle.revision,
+                    reason: params.reason.clone(),
+                }),
+            )
+            .await
+            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"))?;
+            let ExecutorResponse::Job(target) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            let requested = store
+                .request_cancel(&params.job_id, job.handle.revision, &params.reason)
+                .await
+                .map_err(map_store_error)?;
+            let updated = project_target_job(store, requested, target)
+                .await
+                .map_err(map_store_error)?;
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(updated).expect("serializable job"),
+            ))
+        }
+        _ => Err(ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "observation routed as job operation",
+        )),
+    }
+}
+
+async fn agent_request(
+    app: &App,
+    host_name: &str,
+    request: &ExecutorRequest,
+) -> color_eyre::eyre::Result<ExecutorResponse> {
+    let host = app
+        .hosts
+        .get(host_name)
+        .ok_or_else(|| color_eyre::eyre::eyre!("host missing"))?;
+    let token = host
+        .execution_token
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("execution disabled"))?;
+    transport::read_json(
+        token
+            .apply(app.client.post(format!(
+                "{}/v1/manage",
+                host.config.agent_url.trim_end_matches('/')
+            )))
+            .json(request),
+    )
+    .await
+}
+
+async fn project_target_job(
+    store: &Store,
+    current: JobRecord,
+    target: JobRecord,
+) -> color_eyre::eyre::Result<JobRecord> {
+    color_eyre::eyre::ensure!(
+        current.handle.job_id == target.handle.job_id
+            && current.handle.host == target.handle.host
+            && current.spec_hash == target.spec_hash,
+        "executor job identity mismatch"
+    );
+    if current.handle.state == target.handle.state
+        || !current.handle.state.can_transition_to(target.handle.state)
+    {
+        return Ok(current);
+    }
+    store
+        .transition_job(
+            &current.handle.job_id,
+            current.handle.revision,
+            target.handle.state,
+            &json!({"source":"executor","target_revision":target.handle.revision}),
+            target.result.as_ref(),
+        )
+        .await
+}
+
+fn spawn_dispatch(app: Arc<App>, id: JobId) {
+    tokio::spawn(async move {
+        if let Err(error) = dispatch(app, id.clone()).await {
+            tracing::warn!(job_id = %id, %error, "job dispatch or reconciliation stopped");
+        }
+    });
+}
+
+async fn dispatch(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()> {
+    let store = app
+        .store
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
+    let mut job = store.get_job(&id).await?;
+    let authorized = dispatch_authorized(&app, &job);
+    if !authorized {
+        if job.handle.state == JobState::Queued {
+            store
+                .transition_job(
+                    &id,
+                    job.handle.revision,
+                    JobState::Cancelled,
+                    &json!({"reason":"authorization no longer permits dispatch"}),
+                    Some(&json!({"started":false,"cancelled":true})),
+                )
+                .await?;
+        }
+        return Ok(());
+    }
+    if job.handle.state == JobState::Running {
+        return monitor_target(app, id).await;
+    }
+    if job.handle.state == JobState::Queued {
+        job = store
+            .transition_job(
+                &id,
+                job.handle.revision,
+                JobState::Dispatching,
+                &json!({"target":job.handle.host}),
+                None,
+            )
+            .await?;
+    }
+    let request = submit_request(&job);
+    match agent_request(&app, &job.handle.host, &request).await {
+        Ok(ExecutorResponse::Job(target)) => {
+            job = project_target_job(store, job, target).await?;
+        }
+        Ok(_) => color_eyre::eyre::bail!("invalid executor response"),
+        Err(error) => {
+            if job.handle.state != JobState::Reconciling
+                && job.handle.state.can_transition_to(JobState::Reconciling)
+                && let Ok(updated) = store
+                    .transition_job(
+                        &id,
+                        job.handle.revision,
+                        JobState::Reconciling,
+                        &json!({"reason":"dispatch acknowledgement unavailable"}),
+                        None,
+                    )
+                    .await
+            {
+                job = updated;
+            }
+            tracing::warn!(job_id = %id, %error, "dispatch acknowledgement unavailable");
+        }
+    }
+    if !job.handle.state.is_terminal() {
+        monitor_target(app, id).await?;
+    }
+    Ok(())
+}
+
+async fn monitor_target(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()> {
+    loop {
+        let store = app
+            .store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
+        let current = store.get_job(&id).await?;
+        if current.handle.state.is_terminal() && current.handle.state != JobState::OutcomeUnknown {
+            return Ok(());
+        }
+        match agent_request(
+            &app,
+            &current.handle.host,
+            &ExecutorRequest::Status(JobIdParams { job_id: id.clone() }),
+        )
+        .await
+        {
+            Ok(ExecutorResponse::Job(target)) => {
+                let updated = project_target_job(store, current, target).await?;
+                if updated.handle.state.is_terminal()
+                    && updated.handle.state != JobState::OutcomeUnknown
+                {
+                    return Ok(());
+                }
+            }
+            Ok(_) => color_eyre::eyre::bail!("invalid executor response"),
+            Err(error) => {
+                // A lost submit acknowledgement leaves the hub unable to tell whether the
+                // target accepted the job. Re-sending the same stable job ID is safe because
+                // the executor persists and deduplicates it before launching systemd.
+                if matches!(
+                    current.handle.state,
+                    JobState::Dispatching | JobState::Reconciling
+                ) && dispatch_authorized(&app, &current)
+                {
+                    match agent_request(&app, &current.handle.host, &submit_request(&current)).await
+                    {
+                        Ok(ExecutorResponse::Job(target)) => {
+                            let updated = project_target_job(store, current, target).await?;
+                            if updated.handle.state.is_terminal()
+                                && updated.handle.state != JobState::OutcomeUnknown
+                            {
+                                return Ok(());
+                            }
+                        }
+                        Ok(_) => color_eyre::eyre::bail!("invalid executor response"),
+                        Err(retry_error) => tracing::debug!(
+                            job_id = %id,
+                            %error,
+                            %retry_error,
+                            "target status and idempotent submit retry unavailable"
+                        ),
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+fn dispatch_authorized(app: &App, job: &JobRecord) -> bool {
+    app.clients.iter().any(|principal| {
+        principal.name == job.principal
+            && principal.access == Access::Manage
+            && principal.capabilities.contains("exec:run")
+            && principal.hosts.contains(&job.handle.host)
+    })
+}
+
+fn submit_request(job: &JobRecord) -> ExecutorRequest {
+    ExecutorRequest::Submit {
+        job_id: job.handle.job_id.clone(),
+        job: NewJob {
+            principal: job.principal.clone(),
+            host: job.handle.host.clone(),
+            operation: job.handle.operation.clone(),
+            spec_version: job.spec_version,
+            spec: job.spec.clone(),
+            policy_version: job.policy_version.clone(),
+            deadline: job.deadline,
+        },
     }
 }
 
 #[utoipa::path(post, path = "/v1/execute", request_body = Request, responses(
     (status = 200, description = "Read-only observation; aggregate responses may include unavailable hosts", body = Value),
+    (status = 202, description = "Durable job accepted", body = maxops_proto::JobHandle),
     (status = 401, description = "Missing or invalid bearer token"),
     (status = 403, description = "Capability, host or unit not permitted"),
     (status = 422, description = "Request does not match the operation schema"),
@@ -569,7 +1113,7 @@ async fn execute(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Json(request): Json<Request>,
-) -> ApiResult<Value> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let principal = authenticate(&app, &headers)?;
     if !principal.capabilities.contains(request.capability()) {
         return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
@@ -579,9 +1123,32 @@ async fn execute(
         .try_acquire()
         .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "hub busy"))?;
     let operation = request.name();
-    let result = run(&app, principal, request).await;
+    let (kind, idempotency) = operations()
+        .into_iter()
+        .find(|definition| definition.name == operation)
+        .map(|definition| (definition.kind, definition.idempotency))
+        .expect("request operation is registered");
+    if kind != OperationKind::Observation && principal.access != Access::Manage {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "management access required",
+        ));
+    }
+    if idempotency == IdempotencyRequirement::None && headers.contains_key("idempotency-key") {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key is not used by this operation",
+        ));
+    }
+    let result = if kind == OperationKind::Observation {
+        run(&app, principal, request)
+            .await
+            .map(|value| (StatusCode::OK, value))
+    } else {
+        run_job_operation(&app, principal, &headers, request).await
+    };
     tracing::info!(actor = %principal.name, operation, success = result.is_ok(), "query completed");
-    result.map(Json)
+    result.map(|(status, value)| (status, Json(value)))
 }
 
 async fn alerts(

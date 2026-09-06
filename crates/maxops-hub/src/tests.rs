@@ -1,11 +1,16 @@
 use super::*;
 use axum::{body::Body, http::Request as HttpRequest};
 use http_body_util::BodyExt;
+use std::sync::{
+    Arc as StdArc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tower::ServiceExt;
 
 const USER_TOKEN: &str = "user-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AGENT_TOKEN: &str = "agent-token-bbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ALERT_TOKEN: &str = "alert-token-cccccccccccccccccccccccccc";
+const EXECUTION_TOKEN: &str = "execution-token-dddddddddddddddddddddddd";
 
 fn app(agent_url: &str, capabilities: &[&str]) -> App {
     App {
@@ -18,9 +23,11 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         site: Some("test".into()),
                         agent_url: agent_url.into(),
                         agent_token_file: PathBuf::new(),
+                        execution_token_file: None,
                         readable_units: BTreeSet::from(["demo.service".into()]),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
+                    execution_token: None,
                 },
             ),
             (
@@ -31,9 +38,11 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         site: None,
                         agent_url: agent_url.into(),
                         agent_token_file: PathBuf::new(),
+                        execution_token_file: None,
                         readable_units: BTreeSet::new(),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
+                    execution_token: None,
                 },
             ),
         ]),
@@ -42,22 +51,37 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
             token: Token::parse(USER_TOKEN.into()).unwrap(),
             hosts: BTreeSet::from(["alpha".into()]),
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
+            access: Access::Observe,
         }],
         client: transport::client().unwrap(),
         prometheus_url: None,
         alertmanager_url: None,
         alert_ingress: None,
         slots: Semaphore::new(16),
+        store: None,
     }
 }
 
 async fn call(router: Router, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+    call_with_idempotency(router, path, token, None, body).await
+}
+
+async fn call_with_idempotency(
+    router: Router,
+    path: &str,
+    token: Option<&str>,
+    idempotency_key: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
     let mut builder = HttpRequest::builder()
         .method("POST")
         .uri(path)
         .header("content-type", "application/json");
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(key) = idempotency_key {
+        builder = builder.header("idempotency-key", key);
     }
     let response = router
         .oneshot(builder.body(Body::from(body.to_string())).unwrap())
@@ -69,6 +93,163 @@ async fn call(router: Router, path: &str, token: Option<&str>, body: Value) -> (
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+async fn successful_executor(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Json(request): Json<ExecutorRequest>,
+) -> Result<Json<ExecutorResponse>, StatusCode> {
+    if !Token::parse(EXECUTION_TOKEN.into())
+        .unwrap()
+        .matches(&headers)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match request {
+        ExecutorRequest::Submit { job_id, job } => {
+            let accepted = store.accept_job(&job_id, &job).await.unwrap();
+            let job = if accepted.created {
+                let dispatching = store
+                    .transition_job(&job_id, 1, JobState::Dispatching, &json!({}), None)
+                    .await
+                    .unwrap();
+                let running = store
+                    .transition_job(
+                        &job_id,
+                        dispatching.handle.revision,
+                        JobState::Running,
+                        &json!({}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .transition_job(
+                        &job_id,
+                        running.handle.revision,
+                        JobState::Succeeded,
+                        &json!({}),
+                        Some(&json!({"exit_code":0})),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                accepted.job
+            };
+            Ok(Json(ExecutorResponse::Job(job)))
+        }
+        ExecutorRequest::Status(params) => Ok(Json(ExecutorResponse::Job(
+            store.get_job(&params.job_id).await.unwrap(),
+        ))),
+        ExecutorRequest::Logs(params) => Ok(Json(ExecutorResponse::Logs(
+            maxops_proto::JobLogsResponse {
+                job_id: params.job_id,
+                encoding: "base64".into(),
+                stdout_base64: String::new(),
+                stderr_base64: String::new(),
+                next_stdout_offset: 0,
+                next_stderr_offset: 0,
+                complete: true,
+                truncated: false,
+            },
+        ))),
+        ExecutorRequest::Cancel(_) => Err(StatusCode::CONFLICT),
+    }
+}
+
+#[derive(Clone)]
+struct AckLossExecutor {
+    store: Store,
+    submissions: StdArc<AtomicUsize>,
+}
+
+async fn executor_with_lost_first_ack(
+    State(state): State<AckLossExecutor>,
+    headers: HeaderMap,
+    Json(request): Json<ExecutorRequest>,
+) -> Result<Json<ExecutorResponse>, StatusCode> {
+    if !Token::parse(EXECUTION_TOKEN.into())
+        .unwrap()
+        .matches(&headers)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match request {
+        ExecutorRequest::Submit { job_id, job } => {
+            let accepted = state.store.accept_job(&job_id, &job).await.unwrap();
+            if accepted.created {
+                let dispatching = state
+                    .store
+                    .transition_job(&job_id, 1, JobState::Dispatching, &json!({}), None)
+                    .await
+                    .unwrap();
+                state
+                    .store
+                    .transition_job(
+                        &job_id,
+                        dispatching.handle.revision,
+                        JobState::Succeeded,
+                        &json!({}),
+                        Some(&json!({"exit_code":0})),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let attempt = state.submissions.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            Ok(Json(ExecutorResponse::Job(
+                state.store.get_job(&job_id).await.unwrap(),
+            )))
+        }
+        ExecutorRequest::Status(params) if state.submissions.load(Ordering::SeqCst) < 2 => {
+            let _ = params;
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        ExecutorRequest::Status(params) => Ok(Json(ExecutorResponse::Job(
+            state.store.get_job(&params.job_id).await.unwrap(),
+        ))),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
+    App {
+        hosts: BTreeMap::from([(
+            "alpha".into(),
+            Host {
+                config: HostConfig {
+                    name: "alpha".into(),
+                    site: Some("test".into()),
+                    agent_url: agent_url.into(),
+                    agent_token_file: PathBuf::new(),
+                    execution_token_file: None,
+                    readable_units: BTreeSet::new(),
+                },
+                token: Token::parse(AGENT_TOKEN.into()).unwrap(),
+                execution_token: Some(Token::parse(EXECUTION_TOKEN.into()).unwrap()),
+            },
+        )]),
+        clients: vec![Principal {
+            name: "manager".into(),
+            token: Token::parse(USER_TOKEN.into()).unwrap(),
+            hosts: BTreeSet::from(["alpha".into()]),
+            capabilities: BTreeSet::from([
+                "exec:run".into(),
+                "jobs:read".into(),
+                "jobs:cancel".into(),
+            ]),
+            access: Access::Manage,
+        }],
+        client: transport::client().unwrap(),
+        prometheus_url: None,
+        alertmanager_url: None,
+        alert_ingress: None,
+        slots: Semaphore::new(16),
+        store: Some(Store::open(state_file).await.unwrap()),
+    }
 }
 
 async fn get_json(router: Router, path: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -105,6 +286,222 @@ fn snapshot(host: &str) -> Value {
         {"unit": "demo.service", "description": "demo", "load_state": "loaded", "active_state": "failed", "sub_state": "failed"},
         {"unit": "secret.service", "description": "secret", "load_state": "loaded", "active_state": "failed", "sub_state": "failed"}
     ]})
+}
+
+#[tokio::test]
+async fn management_submission_is_durable_idempotent_and_target_confirmed() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_store = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(successful_executor))
+            .with_state(target_store),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let router = router(Arc::new(
+        management_app(&url, &hub_directory.path().join("hub.db")).await,
+    ));
+    let body = json!({
+        "op":"exec.run",
+        "params":{
+            "host":"alpha",
+            "profile":"diagnostic",
+            "command":{"argv":["/bin/true"]},
+            "timeout_seconds":30
+        }
+    });
+    assert_eq!(
+        call(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            body.clone()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, submitted) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("durable-submit-1"),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job_id = submitted["job_id"].as_str().unwrap().to_owned();
+    let (_, repeated) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("durable-submit-1"),
+        body,
+    )
+    .await;
+    assert_eq!(repeated["job_id"], job_id);
+
+    let mut observed = Value::Null;
+    for _ in 0..20 {
+        let (_, value) = call(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            json!({"op":"jobs.status","params":{"job_id":job_id}}),
+        )
+        .await;
+        observed = value;
+        if observed["handle"]["state"] == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(observed["handle"]["state"], "succeeded");
+    assert_eq!(observed["result"]["exit_code"], 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn lost_submit_ack_retries_same_job_without_duplicate_target_execution() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_store = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let submissions = StdArc::new(AtomicUsize::new(0));
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(executor_with_lost_first_ack))
+            .with_state(AckLossExecutor {
+                store: target_store,
+                submissions: submissions.clone(),
+            }),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let router = router(Arc::new(
+        management_app(&url, &hub_directory.path().join("hub.db")).await,
+    ));
+    let body = json!({
+        "op":"exec.run",
+        "params":{
+            "host":"alpha",
+            "profile":"diagnostic",
+            "command":{"argv":["/bin/true"]},
+            "timeout_seconds":30
+        }
+    });
+    let (_, submitted) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("lost-ack"),
+        body,
+    )
+    .await;
+    let job_id = submitted["job_id"].as_str().unwrap();
+    let mut observed = Value::Null;
+    for _ in 0..40 {
+        let (_, value) = call(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            json!({"op":"jobs.status","params":{"job_id":job_id}}),
+        )
+        .await;
+        observed = value;
+        if observed["handle"]["state"] == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(observed["handle"]["state"], "succeeded");
+    assert_eq!(submissions.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn late_target_evidence_resolves_outcome_unknown() {
+    let hub_directory = tempfile::tempdir().unwrap();
+    let target_directory = tempfile::tempdir().unwrap();
+    let hub = Store::open(&hub_directory.path().join("hub.db"))
+        .await
+        .unwrap();
+    let target = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let request = NewJob {
+        principal: "manager".into(),
+        host: "alpha".into(),
+        operation: "exec.run".into(),
+        spec_version: 1,
+        spec: json!({"host":"alpha","profile":"diagnostic","command":{"argv":["/bin/true"]}}),
+        policy_version: "test".into(),
+        deadline: None,
+    };
+    let submitted = hub.submit_job("late-evidence", &request).await.unwrap().job;
+    let dispatching = hub
+        .transition_job(
+            &submitted.handle.job_id,
+            submitted.handle.revision,
+            JobState::Dispatching,
+            &json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+    let reconciling = hub
+        .transition_job(
+            &submitted.handle.job_id,
+            dispatching.handle.revision,
+            JobState::Reconciling,
+            &json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+    let unknown = hub
+        .transition_job(
+            &submitted.handle.job_id,
+            reconciling.handle.revision,
+            JobState::OutcomeUnknown,
+            &json!({}),
+            Some(&json!({"effect":"unknown"})),
+        )
+        .await
+        .unwrap();
+
+    let accepted = target
+        .accept_job(&submitted.handle.job_id, &request)
+        .await
+        .unwrap()
+        .job;
+    let target_dispatching = target
+        .transition_job(
+            &accepted.handle.job_id,
+            accepted.handle.revision,
+            JobState::Dispatching,
+            &json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+    let succeeded = target
+        .transition_job(
+            &accepted.handle.job_id,
+            target_dispatching.handle.revision,
+            JobState::Succeeded,
+            &json!({}),
+            Some(&json!({"exit_code":0})),
+        )
+        .await
+        .unwrap();
+
+    let resolved = project_target_job(&hub, unknown, succeeded).await.unwrap();
+    assert_eq!(resolved.handle.state, JobState::Succeeded);
+    assert_eq!(resolved.result.unwrap()["exit_code"], 0);
 }
 
 #[tokio::test]

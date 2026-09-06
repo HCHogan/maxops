@@ -99,6 +99,32 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(unix)]
+pub async fn executor_request(
+    socket: &Path,
+    request: &crate::ExecutorRequest,
+) -> color_eyre::eyre::Result<crate::ExecutorResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    let mut stream = tokio::net::UnixStream::connect(socket).await?;
+    let mut bytes = serde_json::to_vec(request)?;
+    color_eyre::eyre::ensure!(bytes.len() <= 128 * 1024, "executor request too large");
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    BufReader::new(stream)
+        .take(MAX_BODY as u64 + 1)
+        .read_until(b'\n', &mut response)
+        .await?;
+    color_eyre::eyre::ensure!(response.len() <= MAX_BODY, "executor response too large");
+    match serde_json::from_slice(&response)? {
+        crate::ExecutorWireResponse::Ok { response } => Ok(*response),
+        crate::ExecutorWireResponse::Error { code, message } => {
+            color_eyre::eyre::bail!("executor rejected request ({code}): {message}")
+        }
+    }
+}
+
 pub async fn shutdown() {
     #[cfg(unix)]
     {

@@ -1,4 +1,4 @@
-# Initial validation
+# Validation
 
 Validated locally on aarch64-darwin using the devenv toolchain (Rust 1.95.0).
 
@@ -52,5 +52,39 @@ log limits and the live daemon processes' unprivileged state were also checked.
 
 The consumer keeps its inventory, credentials and repeatable acceptance script
 in its own repository. No real notification destination is configured.
-The upstream VM test still requires a Linux builder with KVM and has not run;
-neither successful derivation evaluation nor this pilot replaces that test.
+
+## Durable command execution
+
+On 2026-09-06, P1 passed the local Rust gate with 40 nextest tests and the full
+workspace passed `nix flake check --all-systems --no-build`. The nixpkgs records
+in this repository, the consumer lock and devenv lock were identical at
+`34268251cf5547d39063f2c5ea9a196246f7f3a6`.
+
+The `checks.x86_64-linux.agent-vm` derivation then ran to completion under KVM
+on b650 from an isolated `/tmp/maxops-build` checkout. This build did not alter
+the host's NixOS configuration or its running services. The Nix package build
+ran all 40 nextest tests again before the VM started.
+
+The VM exercised the real Hub, Agent, Executor, job runner and systemd manager.
+It verified:
+
+- observer credentials cannot submit jobs and the agent account cannot restart
+  a system service;
+- two submissions with one idempotency key return one job;
+- a running command survives simultaneous Hub, Agent and Executor restarts and
+  retains the exact `firstsecond` output;
+- job units run as `maxops-runner` with cgroup kill semantics,
+  `NoNewPrivileges=yes` and `ProtectSystem=strict`;
+- cancellation stops the transient unit and records `cancelled` with revision
+  checking;
+- systemd runtime expiry becomes `timed_out`;
+- binary output is returned as base64 and reports truncation at the configured
+  bound;
+- a declared credential is injected through systemd credentials, while an
+  undeclared credential produces a durable failed job without exposing a
+  credential value.
+
+The macOS store cannot represent ncurses' case-distinct terminfo directories
+faithfully on its case-insensitive volume. The VM fixture therefore uses the
+classic scripted initrd so the closure avoids that damaged local ncurses path;
+the actual VM execution and package build ran on Linux.

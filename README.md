@@ -1,28 +1,34 @@
 # maxops
 
-A small, read-only fleet control plane. Nix owns deployment and inventory;
-Prometheus owns metrics; maxops provides authenticated observations and optional
-Alertmanager webhook forwarding. No host or user from a private fleet is built in.
+A small fleet control plane with authenticated observations and opt-in durable
+command jobs. Nix owns deployment and inventory; Prometheus owns metrics. No
+host or user from a private fleet is built in.
 
 Version 0.2 extends the initial single-host pilot with fleet observations.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
-The next-stage [implementation plan](docs/implementation-plan.md) covers durable
-command jobs, configuration workspaces and verified deployments for people and
-any automation client. These capabilities are planned; version 0.2 remains read-only.
-The design supports concurrent manual and external changes to repositories and hosts.
+The [implementation plan](docs/implementation-plan.md) covers the remaining
+service, configuration, deployment, event and client stages. Every API is usable
+by people and arbitrary automation clients. The design supports concurrent manual
+and external changes to repositories and hosts.
 
 ## Implemented
 
-- Five Rust crates: `maxops-proto`, `maxops-store`, `maxops-agent`, `maxops-hub`,
-  `maxopsctl`.
+- Six Rust crates: `maxops-proto`, `maxops-store`, `maxops-executor`,
+  `maxops-agent`, `maxops-hub`, `maxopsctl`.
 - A shared operation registry generates request decoding, capability names,
   operation kind, idempotency requirement, parameter/response JSON Schemas and
   CLI subcommands. Utoipa derives OpenAPI from the same request types.
-- The P0 execution substrate defines durable job/event/change types and a local
-  SQLx/SQLite store with migrations, idempotent submission, revisioned state
-  transitions, external observations and consistent backups. It is not wired to
-  a command executor or enabled through the Hub yet.
+- SQLx/SQLite stores durable jobs, idempotency keys, revisioned transitions and
+  events with WAL, synchronous writes, migrations and consistent backups.
+- `exec.run` submits a bounded asynchronous job to a server-defined execution
+  profile. `jobs.list/status/logs/cancel` survive client disconnects and daemon
+  restarts. The Hub retries a lost acknowledgement with the same stable job ID.
+- The Linux executor launches each command as a transient systemd service, uses
+  cgroup-wide cancellation and timeouts, stores bounded binary output, and
+  reconciles persistent result records after restart. Diagnostic profiles run as
+  an ordinary account with systemd hardening; root profiles require an explicit
+  privileged setting.
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
@@ -38,10 +44,11 @@ The design supports concurrent manual and external changes to repositories and h
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: command execution, MCP, QQ impersonation/delegation, service
-changes, reboot, deployment, hub-side durable notification storage, arbitrary PromQL, or
-trustworthy activation timestamps. Persistent profile generation is distinct
-from the running closure; filesystem ctime is never called deployment time.
+Not implemented: service changes, configuration workspaces, deployment, MCP,
+QQ impersonation/delegation, reboot, hub-side durable notification storage,
+arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
+generation is distinct from the running closure; filesystem ctime is never
+called deployment time.
 
 ## Develop
 
@@ -90,8 +97,28 @@ maxopsctl units.list --host example
 maxopsctl units.status --host example --unit nginx.service
 maxopsctl units.logs --host example --unit nginx.service --lines 50 --since-seconds 3600
 maxopsctl alerts.active
+maxopsctl exec.run --params-file ./job.json --idempotency-key incident-123 --wait --follow
+maxopsctl jobs.list
+maxopsctl jobs.status --job-id 00000000-0000-0000-0000-000000000000
+maxopsctl jobs.logs --job-id 00000000-0000-0000-0000-000000000000
 maxopsctl schema                        # local catalog; needs no credentials
 ```
+
+Nested command input uses a JSON object through `--params-file` or
+`--params-stdin`. For example:
+
+```json
+{
+  "host": "example",
+  "profile": "diagnostic",
+  "command": { "argv": ["/run/current-system/sw/bin/systemctl", "is-active", "nginx.service"] },
+  "timeout_seconds": 30
+}
+```
+
+`--wait` polls until the job is terminal. `--follow` also streams decoded binary
+stdout and stderr. The CLI uses distinct exit codes for failed, unknown,
+cancelled and timed-out jobs.
 
 Service names must be explicit canonical `.service` names. Patterns, paths and
 shell expressions are rejected. Status covers the intersection of hub and agent
@@ -109,6 +136,10 @@ HTTP endpoints:
 | Agent `GET /v1/snapshot` | Agent token | Collect current permitted host observations |
 | Agent `POST /v1/unit` | Agent token | Detailed properties for one allowlisted service |
 | Agent `POST /v1/logs` | Agent token | Bounded log query with explicit host and unit |
+| Agent `POST /v1/manage` | Dedicated execution token | Forward a typed request over the local executor socket |
+
+The executor listens only on a mode `0660` Unix socket shared with the agent.
+Observation, execution and client credentials must all be distinct.
 
 Hub and agent also accept `--config /path/to/config.json` when run outside NixOS.
 The Nix modules generate these configurations. `scripts/smoke.py` contains a
@@ -121,8 +152,16 @@ minimal standalone example with ephemeral test credentials.
 inputs.maxops.url = "github:HCHogan/maxops";
 inputs.maxops.inputs.nixpkgs.follows = "nixpkgs";
 
-# Agent host module:
-imports = [ inputs.maxops.nixosModules.agent ];
+# Managed agent host modules:
+imports = [
+  inputs.maxops.nixosModules.agent
+  inputs.maxops.nixosModules.executor
+];
+services.maxops-executor = {
+  enable = true;
+  credentialSources.github-token = "/run/secrets/github-token";
+  profiles.diagnostic.allowedCredentials = [ "github-token" ];
+};
 services.maxops-agent = {
   enable = true;
   hostName = "example";
@@ -130,6 +169,10 @@ services.maxops-agent = {
   tokenFile = "/run/secrets/maxops-agent";
   readableUnits = [ "nginx.service" ];
   allowLogs = false;
+  execution = {
+    enable = true;
+    tokenFile = "/run/secrets/maxops-agent-execution";
+  };
 };
 
 # Hub host module:
@@ -141,6 +184,7 @@ services.maxops-hub = {
     name = "example";
     agentUrl = "http://100.64.0.10:9720";
     tokenFile = "/run/secrets/example-agent";
+    executionTokenFile = "/run/secrets/example-agent-execution";
     readableUnits = [ "nginx.service" ];
   }];
   clients = [{
@@ -153,6 +197,14 @@ services.maxops-hub = {
   alertmanagerUrl = "http://127.0.0.1:9093";
 };
 ```
+
+Add a separate client with `access = "manage"` and the `exec:run`, `jobs:read`
+and `jobs:cancel` capabilities to enable command jobs. Observation clients remain
+read-only. Execution profiles and their users, timeout, output, process, memory,
+working-directory and environment limits are declared under
+`services.maxops-executor.profiles`.
+Credential references are server-side names: the API cannot supply a filesystem
+path, and a profile can request only names in its `allowedCredentials` list.
 
 These are separate configuration fragments, not one combined module. Generate
 the host list and grants in the consuming repository. No `home-manager` module
@@ -178,3 +230,7 @@ notifications. In particular:
   with an exact host selector. CPU busy fraction is one minus idle rate per CPU.
   Source times are queried separately; stale, future, missing, duplicate and
   non-finite observations are not healthy zeroes. Arbitrary PromQL is disabled.
+- Management scope is set by Nix inventory, client capabilities and executor
+  profiles. maxops does not assume it is the fleet's only writer: later service,
+  Git and deployment stages re-observe remote and runtime baselines before each
+  side effect. Internal job locks cannot exclude a human or another tool.

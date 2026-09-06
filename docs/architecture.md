@@ -1,4 +1,4 @@
-# Initial architecture
+# Architecture
 
 ## Ownership
 
@@ -7,17 +7,26 @@ Its small registry macro enumerates operations; it is not a code generation
 framework. Schemars supplies parameter schemas for CLI generation and discovery;
 utoipa supplies the REST OpenAPI document from those same Rust types.
 
-`maxops-agent` reads Linux/systemd observations. It does not expose a shell,
-start/stop/restart endpoints or a polkit grant. Its only subprocess is
-`journalctl`, executed with separate arguments, no shell and a bounded reader.
+`maxops-agent` reads Linux/systemd observations. Its observation token cannot
+reach the separate management endpoint. An execution token may forward typed
+requests over a local Unix socket; the agent itself never receives root or a
+polkit grant. Journal reads still use separate arguments, no shell and a bounded
+reader.
 
-`maxops-hub` authenticates clients, applies host and capability grants, and
-queries agents or existing monitoring services. `maxopsctl` is a thin HTTP
-client. Inventory, credentials and principals belong to the consuming Nix repo.
+`maxops-executor` is the privileged local coordinator. It durably accepts a
+stable job ID before starting a transient systemd unit. The job runner executes
+one structured argv or an explicit-interpreter script as the configured profile
+user and writes bounded output plus an atomically renamed completion record.
+
+`maxops-hub` authenticates clients, applies host and capability grants, stores
+its view of jobs, and queries agents or existing monitoring services.
+`maxopsctl` is a thin HTTP client. Inventory, execution profiles, credentials
+and principals belong to the consuming Nix repo.
 
 ## Authentication and limits
 
-Every agent has a token; every client has a different token. Hub startup rejects
+Every agent has observation and optional execution tokens; every client has a
+different token. Hub startup rejects
 duplicate client identities, duplicate client tokens, reused client/agent
 credentials, unknown hosts and unknown capabilities. Alert ingress requires a
 separate token. Tokens are not accepted in query strings or request parameters.
@@ -30,7 +39,7 @@ The service uses a dynamic unprivileged user with no capabilities or privilege
 escalation. Journal membership remains a broader process-level read privilege
 than the API allowlist, and is disabled by default.
 
-Limits: 4 KiB query requests, 256 KiB incoming alert payloads, 2 MiB upstream
+Limits: 128 KiB execution requests, 256 KiB incoming alert payloads, 2 MiB upstream
 JSON, 1 MiB journal output, 1–200 journal entries and a 1–86400 second window.
 The journal subprocess has a ten-second timeout and is killed on cancellation;
 HTTP connects have a two-second timeout and requests twelve seconds. Requests
@@ -88,6 +97,32 @@ Keep a basic direct Alertmanager receiver independent of the hub. A future
 queue/sink abstraction should be justified by delivery needs, not added before
 the first real receiver exists.
 
+## Durable command jobs
+
+The Hub and target executor keep separate records. Submission requires an
+idempotency key scoped to the authenticated principal and operation. The Hub
+assigns the job ID and the target accepts that same ID transactionally. If an
+HTTP acknowledgement is lost, the Hub may resubmit only the identical immutable
+specification under the same ID; the target returns its existing job instead of
+launching another transient unit.
+
+Transient unit names derive only from validated UUID job IDs. `Type=exec`,
+`ExitType=cgroup`, `KillMode=control-group` and `RuntimeMaxSec` make start,
+process-tree lifetime, cancellation and timeout systemd-owned. Result and output
+files live in a per-job `StateDirectory`. The executor reconciles the result
+file, unit state and its database after restart. Missing evidence moves through
+`reconciling` to `outcome_unknown`; a later completion record can still resolve
+that state.
+
+Profiles cap timeout, output bytes, tasks and optionally memory. They select an
+existing account, allowed working roots, an explicit script interpreter and a
+non-secret base environment. Diagnostic profiles apply filesystem, device,
+kernel and capability hardening. A root profile must be declared privileged.
+Credential references resolve through a Nix-declared runtime path map and a
+per-profile allowlist. The target passes only requested names through systemd's
+`LoadCredential`; API clients cannot choose source paths or read credential
+contents through job metadata.
+
 ## Library choices
 
 - `reqwest`: shared async HTTP client, rustls, explicit deadlines and bounded
@@ -110,13 +145,13 @@ References: [reqwest](https://docs.rs/reqwest/latest/reqwest/),
 [Jiff](https://docs.rs/jiff/latest/jiff/),
 [systemd D-Bus](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html).
 
-## Before mutations
+## Mutation boundary
 
-Version 0.2 remains read-only. The 2026-09-06 owner decision uses preauthorized
-management clients for future execution, with observation credentials kept
-separate. It does not require per-command human confirmation within the configured
-scope. Immutable job specifications, execution-time checks, idempotency, durable
-records and reconciliation of unknown outcomes remain required.
+Version 0.2 includes preauthorized command execution with observation credentials
+kept separate. It does not require per-command human confirmation within the
+configured scope. Immutable job specifications, execution-time checks,
+idempotency, durable records and reconciliation of unknown outcomes remain
+required.
 
 maxops is one of several fleet writers. People and other tools may push commits,
 rebuild hosts or change services directly. Live observations and remote refs are
@@ -124,7 +159,6 @@ distinct from maxops's own operation history; internal locks do not exclude thos
 writers. Plans must revalidate their baselines, and recovery must stop when a
 later external deployment has superseded the operation.
 
-The [implementation plan](implementation-plan.md) defines the independent executor,
-workspace, deployment and recovery stages. It supersedes the earlier per-action
-confirmation proposal for this work. The planned features are not yet implemented;
-reboot and data recovery have separate implementation and verification requirements.
+The [implementation plan](implementation-plan.md) defines the service, workspace,
+deployment, event and recovery stages after the command slice. Reboot and data
+recovery have separate implementation and verification requirements.

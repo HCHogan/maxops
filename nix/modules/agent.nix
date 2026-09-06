@@ -11,6 +11,12 @@ let
     host = cfg.hostName;
     listen = "${cfg.listenAddress}:${toString cfg.port}";
     token_file = "/run/credentials/maxops-agent.service/token";
+    execution_token_file =
+      if cfg.execution.enable then
+        "/run/credentials/maxops-agent.service/execution-token"
+      else
+        null;
+    executor_socket = if cfg.execution.enable then cfg.execution.socketPath else null;
     readable_units = cfg.readableUnits;
     allow_logs = cfg.allowLogs;
     journalctl = "${pkgs.systemd}/bin/journalctl";
@@ -53,6 +59,19 @@ in
       default = false;
       description = "Allow bounded journal queries. Grants the process access to the system journal group.";
     };
+    execution = {
+      enable = lib.mkEnableOption "forwarding authenticated management jobs to the local executor";
+      tokenFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Dedicated runtime credential accepted only by the management endpoint.";
+      };
+      socketPath = lib.mkOption {
+        type = lib.types.str;
+        default = "/run/maxops-executor/control.sock";
+        description = "Unix socket exposed by the local maxops executor.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -70,21 +89,35 @@ in
         assertion = lib.hasPrefix "/" cfg.tokenFile && !(lib.hasPrefix builtins.storeDir cfg.tokenFile);
         message = "maxops-agent.tokenFile must be a runtime path outside the Nix store.";
       }
+      {
+        assertion =
+          !cfg.execution.enable
+          || (
+            lib.hasPrefix "/" cfg.execution.tokenFile
+            && !(lib.hasPrefix builtins.storeDir cfg.execution.tokenFile)
+          );
+        message = "maxops-agent.execution.tokenFile must be a runtime path outside the Nix store.";
+      }
     ];
+    users.groups.maxops-executor = lib.mkIf cfg.execution.enable { };
     systemd.services.maxops-agent = {
       description = "maxops read-only host agent";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"
         "tailscaled.service"
-      ];
-      wants = [ "network-online.target" ];
+      ] ++ lib.optional cfg.execution.enable "maxops-executor.service";
+      wants = [ "network-online.target" ] ++ lib.optional cfg.execution.enable "maxops-executor.service";
       environment.RUST_LOG = "info";
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/maxops-agent --config ${configFile}";
         DynamicUser = true;
-        LoadCredential = [ "token:${cfg.tokenFile}" ];
-        SupplementaryGroups = lib.optional cfg.allowLogs "systemd-journal";
+        LoadCredential =
+          [ "token:${cfg.tokenFile}" ]
+          ++ lib.optional cfg.execution.enable "execution-token:${cfg.execution.tokenFile}";
+        SupplementaryGroups =
+          lib.optional cfg.allowLogs "systemd-journal"
+          ++ lib.optional cfg.execution.enable "maxops-executor";
         Restart = "on-failure";
         RestartSec = "10s";
         TimeoutStopSec = "15s";

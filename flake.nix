@@ -1,5 +1,5 @@
 {
-  description = "Read-only fleet operations with explicit identity and host scope";
+  description = "Durable fleet operations with explicit identity and host scope";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs =
@@ -43,7 +43,7 @@
           '';
           __darwinAllowLocalNetworking = true;
           meta = {
-            description = "Read-only fleet hub, Linux agent and CLI";
+            description = "Fleet hub, Linux executor and CLI";
             license = nixpkgs.lib.licenses.mit;
             platforms = systems;
             mainProgram = "maxopsctl";
@@ -75,10 +75,12 @@
       );
       nixosModules = {
         agent = import ./nix/modules/agent.nix self;
+        executor = import ./nix/modules/executor.nix self;
         hub = import ./nix/modules/hub.nix self;
         default = {
           imports = [
             self.nixosModules.agent
+            self.nixosModules.executor
             self.nixosModules.hub
           ];
         };

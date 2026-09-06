@@ -13,15 +13,18 @@ let
     site = host.site;
     agent_url = host.agentUrl;
     agent_token_file = "${credentialDir}/agent-${toString i}";
+    execution_token_file =
+      if host.executionTokenFile == null then null else "${credentialDir}/execution-${toString i}";
     readable_units = host.readableUnits;
   }) cfg.hosts;
   clients = lib.imap0 (i: client: {
     name = client.name;
     token_file = "${credentialDir}/client-${toString i}";
-    inherit (client) hosts capabilities;
+    inherit (client) hosts capabilities access;
   }) cfg.clients;
   secretFiles =
     map (host: host.tokenFile) cfg.hosts
+    ++ lib.filter (path: path != null) (map (host: host.executionTokenFile) cfg.hosts)
     ++ map (client: client.tokenFile) cfg.clients
     ++ lib.optional cfg.alertIngress.enable cfg.alertIngress.tokenFile
     ++ lib.optional (
@@ -29,6 +32,7 @@ let
     ) cfg.alertIngress.sinkTokenFile;
   configFile = (pkgs.formats.json { }).generate "maxops-hub.json" {
     listen = "${cfg.listenAddress}:${toString cfg.port}";
+    state_file = "/var/lib/maxops-hub/state.db";
     inherit hosts clients;
     prometheus_url = cfg.prometheusUrl;
     alertmanager_url = cfg.alertmanagerUrl;
@@ -95,6 +99,11 @@ in
               type = lib.types.str;
               description = "Runtime agent credential path.";
             };
+            executionTokenFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Optional dedicated credential for the agent management endpoint.";
+            };
             readableUnits = lib.mkOption {
               type = lib.types.listOf lib.types.str;
               default = [ ];
@@ -132,10 +141,21 @@ in
                   "units:read"
                   "logs:read"
                   "alerts:read"
+                  "exec:run"
+                  "jobs:read"
+                  "jobs:cancel"
                 ]
               );
               default = [ ];
-              description = "Explicit read capabilities.";
+              description = "Explicit operation capabilities.";
+            };
+            access = lib.mkOption {
+              type = lib.types.enum [
+                "observe"
+                "manage"
+              ];
+              default = "observe";
+              description = "Credential class; manage is required for every job operation.";
             };
           };
         }
@@ -197,6 +217,14 @@ in
         DynamicUser = true;
         LoadCredential =
           (lib.imap0 (i: host: "agent-${toString i}:${host.tokenFile}") cfg.hosts)
+          ++ (lib.concatLists (
+            lib.imap0 (
+              i: host:
+              lib.optional (
+                host.executionTokenFile != null
+              ) "execution-${toString i}:${host.executionTokenFile}"
+            ) cfg.hosts
+          ))
           ++ (lib.imap0 (i: client: "client-${toString i}:${client.tokenFile}") cfg.clients)
           ++ lib.optional cfg.alertIngress.enable "alert-ingress:${cfg.alertIngress.tokenFile}"
           ++ lib.optional (
@@ -222,6 +250,8 @@ in
         CapabilityBoundingSet = "";
         LockPersonality = true;
         UMask = "0077";
+        StateDirectory = "maxops-hub";
+        StateDirectoryMode = "0700";
       };
     };
   };

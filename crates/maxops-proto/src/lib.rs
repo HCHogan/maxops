@@ -73,7 +73,7 @@ impl LogParams {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Observation,
@@ -81,7 +81,7 @@ pub enum OperationKind {
     JobControl,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdempotencyRequirement {
     None,
@@ -125,7 +125,10 @@ macro_rules! operations {
                 capability: $cap,
                 kind: $kind,
                 read_only: $read_only,
-                minimum_protocol_version: 1,
+                minimum_protocol_version: match $kind {
+                    OperationKind::Observation => 1,
+                    OperationKind::JobSubmission | OperationKind::JobControl => 2,
+                },
                 idempotency: $idempotency,
                 params_schema: schema_for!($params),
                 response_schema: schema_for!($response),
@@ -144,6 +147,11 @@ operations! {
     UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one explicitly readable service";
     UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
     AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
+    ExecRun(ExecRunParams) -> JobHandle, "exec.run", "exec:run", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run a bounded command using a configured target profile";
+    JobsList(JobsListParams) -> JobsListResponse, "jobs.list", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "List durable jobs owned by the authenticated principal";
+    JobsStatus(JobIdParams) -> JobRecord, "jobs.status", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one durable job and its current target-confirmed state";
+    JobsLogs(JobLogsParams) -> JobLogsResponse, "jobs.logs", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read bounded command output using byte offsets";
+    JobsCancel(JobCancelParams) -> JobRecord, "jobs.cancel", "jobs:cancel", OperationKind::JobControl, false, IdempotencyRequirement::None, "Request cancellation of a non-terminal job";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -179,6 +187,13 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Request>(value).is_err());
         }
+        for value in [
+            r#""../../state.db""#,
+            r#""00000000-0000-0000-0000-00000000000/""#,
+            r#""000000000000000000000000000000000000""#,
+        ] {
+            assert!(serde_json::from_str::<JobId>(value).is_err());
+        }
     }
     #[test]
     fn log_limits_and_unit_syntax() {
@@ -206,8 +221,8 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 9);
-        assert!(operations.iter().all(|operation| {
+        assert_eq!(operations.len(), 14);
+        assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only
                 && operation.minimum_protocol_version == 1
@@ -216,5 +231,13 @@ mod tests {
         let value = serde_json::to_value(&operations).unwrap();
         assert!(value[0]["params_schema"].is_object());
         assert!(value[0]["response_schema"].is_object());
+        let execute = operations
+            .iter()
+            .find(|operation| operation.name == "exec.run")
+            .unwrap();
+        assert_eq!(execute.kind, OperationKind::JobSubmission);
+        assert_eq!(execute.minimum_protocol_version, 2);
+        assert_eq!(execute.idempotency, IdempotencyRequirement::Required);
+        assert!(!execute.read_only);
     }
 }

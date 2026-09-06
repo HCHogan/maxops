@@ -129,8 +129,120 @@ impl Store {
         })
     }
 
+    /// Accept a job with an upstream-assigned ID. Executors use this to make
+    /// repeated dispatch safe without minting a second target identity.
+    pub async fn accept_job(&self, id: &JobId, new: &NewJob) -> Result<SubmitResult> {
+        validate_new_job("upstream-job-id", new)?;
+        let spec = canonical_json(&new.spec);
+        let spec_json = serde_json::to_string(&spec)?;
+        let spec_hash = job_spec_hash(new)?;
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(row) = sqlx::query("SELECT spec_hash FROM jobs WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await?
+        {
+            ensure!(
+                row.try_get::<String, _>("spec_hash")? == spec_hash,
+                "job ID was already used with a different specification"
+            );
+            transaction.commit().await?;
+            return Ok(SubmitResult {
+                job: self.get_job(id).await?,
+                created: false,
+            });
+        }
+        let at = maxops_proto::now().to_string();
+        sqlx::query(
+            "INSERT INTO jobs (
+                id, principal, host, operation, spec_version, spec_json, spec_hash,
+                state, revision, policy_version, created_at, updated_at, deadline
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?, ?, ?)",
+        )
+        .bind(id.as_str())
+        .bind(&new.principal)
+        .bind(&new.host)
+        .bind(&new.operation)
+        .bind(i64::from(new.spec_version))
+        .bind(spec_json)
+        .bind(spec_hash)
+        .bind(&new.policy_version)
+        .bind(&at)
+        .bind(&at)
+        .bind(new.deadline.map(|value| value.to_string()))
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO job_events (job_id, kind, state, occurred_at, payload_json)
+             VALUES (?, 'submitted', 'queued', ?, '{}')",
+        )
+        .bind(id.as_str())
+        .bind(&at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(SubmitResult {
+            job: self.get_job(id).await?,
+            created: true,
+        })
+    }
+
     pub async fn get_job(&self, id: &JobId) -> Result<JobRecord> {
         self.get_job_by_text(id.as_str()).await
+    }
+
+    pub async fn get_owned_job(&self, principal: &str, id: &JobId) -> Result<JobRecord> {
+        let job = self.get_job(id).await?;
+        ensure!(job.principal == principal, "job not found");
+        Ok(job)
+    }
+
+    pub async fn list_jobs(
+        &self,
+        principal: Option<&str>,
+        host: Option<&str>,
+        states: &[JobState],
+        limit: u16,
+    ) -> Result<Vec<JobRecord>> {
+        ensure!((1..=200).contains(&limit), "job list limit must be 1..200");
+        let rows = sqlx::query(
+            "SELECT id, principal, host, operation, spec_version, spec_json, spec_hash,
+                    state, revision, policy_version, created_at, updated_at, deadline,
+                    cancel_requested, result_json
+             FROM jobs
+             WHERE (? IS NULL OR principal = ?) AND (? IS NULL OR host = ?)
+             ORDER BY created_at DESC LIMIT 1000",
+        )
+        .bind(principal)
+        .bind(principal)
+        .bind(host)
+        .bind(host)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(row_to_job)
+            .filter(|result| match result {
+                Ok(job) => states.is_empty() || states.contains(&job.handle.state),
+                Err(_) => true,
+            })
+            .take(usize::from(limit))
+            .collect()
+    }
+
+    pub async fn nonterminal_jobs(&self) -> Result<Vec<JobRecord>> {
+        let terminal = [
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Cancelled,
+            JobState::TimedOut,
+            JobState::OutcomeUnknown,
+        ];
+        self.list_jobs(None, None, &[], 200).await.map(|jobs| {
+            jobs.into_iter()
+                .filter(|job| !terminal.contains(&job.handle.state))
+                .collect()
+        })
     }
 
     pub async fn transition_job(
@@ -412,7 +524,6 @@ pub fn job_spec_hash(new: &NewJob) -> Result<String> {
         "operation": new.operation,
         "spec_version": new.spec_version,
         "spec": new.spec,
-        "deadline": new.deadline,
     }));
     let fingerprint_json = serde_json::to_vec(&request_fingerprint)?;
     Ok(blake3::hash(&fingerprint_json).to_hex().to_string())

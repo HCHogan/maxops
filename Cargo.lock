@@ -1558,6 +1558,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxops-executor"
+version = "0.2.1"
+dependencies = [
+ "base64",
+ "clap",
+ "color-eyre",
+ "jiff",
+ "maxops-proto",
+ "maxops-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "maxops-hub"
 version = "0.2.1"
 dependencies = [
@@ -1567,9 +1585,11 @@ dependencies = [
  "futures",
  "http-body-util",
  "maxops-proto",
+ "maxops-store",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
@@ -1614,9 +1634,11 @@ dependencies = [
 name = "maxopsctl"
 version = "0.2.1"
 dependencies = [
+ "base64",
  "clap",
  "color-eyre",
  "maxops-proto",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",

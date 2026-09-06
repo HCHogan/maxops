@@ -6,8 +6,8 @@ use axum::{
 };
 use clap::Parser;
 use maxops_proto::{
-    Facts, LogEntry, LogParams, Snapshot, UnitDetails, UnitObservation, UnitParams, UnitStatus,
-    now,
+    ExecutorRequest, ExecutorResponse, Facts, LogEntry, LogParams, Snapshot, UnitDetails,
+    UnitObservation, UnitParams, UnitStatus, now,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -34,6 +34,10 @@ struct Config {
     listen: SocketAddr,
     token_file: PathBuf,
     #[serde(default)]
+    execution_token_file: Option<PathBuf>,
+    #[serde(default)]
+    executor_socket: Option<PathBuf>,
+    #[serde(default)]
     readable_units: BTreeSet<String>,
     #[serde(default)]
     allow_logs: bool,
@@ -47,6 +51,7 @@ fn journalctl() -> PathBuf {
 struct App {
     config: Config,
     token: Token,
+    execution_token: Option<Token>,
     bus: zbus::Connection,
     slots: Semaphore,
 }
@@ -93,10 +98,26 @@ async fn main() -> color_eyre::eyre::Result<()> {
         "readable_units must contain exact service names"
     );
     let token = Token::read(&config.token_file)?;
+    color_eyre::eyre::ensure!(
+        config.execution_token_file.is_some() == config.executor_socket.is_some(),
+        "execution_token_file and executor_socket must be configured together"
+    );
+    let execution_token = config
+        .execution_token_file
+        .as_deref()
+        .map(Token::read)
+        .transpose()?;
+    if let Some(execution_token) = &execution_token {
+        color_eyre::eyre::ensure!(
+            !execution_token.same_as(&token),
+            "observation and execution credentials must differ"
+        );
+    }
     let listen = config.listen;
     let app = Arc::new(App {
         config,
         token,
+        execution_token,
         bus: zbus::Connection::system().await?,
         slots: Semaphore::new(8),
     });
@@ -105,7 +126,8 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/unit", post(unit_status))
         .route("/v1/logs", post(logs))
-        .layer(DefaultBodyLimit::max(4096))
+        .route("/v1/manage", post(manage))
+        .layer(DefaultBodyLimit::max(128 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "agent listening");
@@ -113,6 +135,42 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .with_graceful_shutdown(transport::shutdown())
         .await?;
     Ok(())
+}
+
+async fn manage(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(request): Json<ExecutorRequest>,
+) -> ApiResult<ExecutorResponse> {
+    let token = app.execution_token.as_ref().ok_or(ApiError(
+        StatusCode::NOT_FOUND,
+        "management endpoint disabled",
+    ))?;
+    if !token.matches(&headers) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if let ExecutorRequest::Submit { job, .. } = &request
+        && job.host != app.config.host
+    {
+        return Err(ApiError(StatusCode::FORBIDDEN, "job targets another host"));
+    }
+    let socket = app
+        .config
+        .executor_socket
+        .as_ref()
+        .expect("validated socket");
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        transport::executor_request(socket, &request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Ok(Json(response)),
+        _ => Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "executor unavailable",
+        )),
+    }
 }
 
 fn authorize(app: &App, headers: &HeaderMap) -> Result<(), ApiError> {

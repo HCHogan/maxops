@@ -1,10 +1,16 @@
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use maxops_proto::{
-    PROTOCOL_VERSION, Request, operations,
+    IdempotencyRequirement, JobHandle, JobId, JobIdParams, JobLogsParams, JobLogsResponse,
+    JobRecord, JobState, OperationKind, PROTOCOL_VERSION, Request, operations,
     transport::{self, Token},
 };
 use serde_json::{Value, json};
-use std::{io::Read, path::Path};
+use std::{
+    io::{Read, Write},
+    path::Path,
+    time::Duration,
+};
 
 const MAX_PARAMS_BYTES: u64 = 1024 * 1024;
 
@@ -47,12 +53,37 @@ fn cli() -> Command {
                     .action(ArgAction::SetTrue)
                     .help("Read the complete params JSON object from stdin"),
             );
+        if operation.kind == OperationKind::JobSubmission {
+            subcommand = subcommand
+                .arg(
+                    Arg::new("idempotency-key")
+                        .long("idempotency-key")
+                        .required(true)
+                        .help("Stable retry key for this logical job submission"),
+                )
+                .arg(
+                    Arg::new("wait")
+                        .long("wait")
+                        .action(ArgAction::SetTrue)
+                        .help("Wait for a terminal job state"),
+                )
+                .arg(
+                    Arg::new("follow")
+                        .long("follow")
+                        .requires("wait")
+                        .action(ArgAction::SetTrue)
+                        .help("Stream decoded stdout and stderr while waiting"),
+                );
+        }
         let schema = serde_json::to_value(operation.params_schema).expect("serializable schema");
         if let Some(properties) = schema["properties"].as_object() {
             for (name, property) in properties {
                 let required = schema["required"]
                     .as_array()
                     .is_some_and(|items| items.iter().any(|item| item == name));
+                if !matches!(property["type"].as_str(), Some("string" | "integer")) {
+                    continue;
+                }
                 let mut arg = Arg::new(name.clone())
                     .long(name.replace('_', "-"))
                     .conflicts_with_all(["params-file", "params-stdin"]);
@@ -94,21 +125,135 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .trim_end_matches('/');
     transport::validate_url(url)?;
     let client = transport::client()?;
-    let request = if operation == "operations" {
-        token.apply(client.get(format!("{url}/v1/operations")))
-    } else {
-        let params = operation_params(operation, args)?;
-        let request: Request = serde_json::from_value(json!({"op": operation, "params": params}))?;
-        if let Request::UnitsLogs(params) = &request {
+    if operation == "operations" {
+        let response: Value =
+            transport::read_json(token.apply(client.get(format!("{url}/v1/operations")))).await?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    let definition = operations()
+        .into_iter()
+        .find(|definition| definition.name == operation)
+        .expect("registered operation");
+    let params = operation_params(operation, args)?;
+    let request: Request = serde_json::from_value(json!({"op": operation, "params": params}))?;
+    match &request {
+        Request::UnitsLogs(params) => {
             params.validate().map_err(color_eyre::eyre::Report::msg)?;
         }
+        Request::ExecRun(params) => {
+            params.validate().map_err(color_eyre::eyre::Report::msg)?;
+        }
+        _ => {}
+    }
+    let mut outbound = token
+        .apply(client.post(format!("{url}/v1/execute")))
+        .json(&request);
+    if definition.idempotency == IdempotencyRequirement::Required {
+        outbound = outbound.header(
+            "idempotency-key",
+            args.get_one::<String>("idempotency-key")
+                .expect("required idempotency key"),
+        );
+    }
+    let response: Value = transport::read_json(outbound).await?;
+    if definition.kind == OperationKind::JobSubmission && args.get_flag("wait") {
+        let handle: JobHandle = serde_json::from_value(response)?;
+        let follow = args.get_flag("follow");
+        let terminal = wait_for_job(&client, &token, url, handle.job_id, follow).await?;
+        if follow {
+            eprintln!("{}", serde_json::to_string(&terminal)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&terminal)?);
+        }
+        match terminal.handle.state {
+            JobState::Succeeded => {}
+            JobState::Failed => std::process::exit(10),
+            JobState::OutcomeUnknown => std::process::exit(11),
+            JobState::Cancelled => std::process::exit(12),
+            JobState::TimedOut => std::process::exit(13),
+            _ => unreachable!("wait returned a non-terminal job"),
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    }
+    Ok(())
+}
+
+async fn wait_for_job(
+    client: &reqwest::Client,
+    token: &Token,
+    url: &str,
+    job_id: JobId,
+    follow: bool,
+) -> color_eyre::eyre::Result<JobRecord> {
+    let mut stdout_offset = 0;
+    let mut stderr_offset = 0;
+    loop {
+        if follow {
+            let logs = fetch_logs(
+                client,
+                token,
+                url,
+                JobLogsParams {
+                    job_id: job_id.clone(),
+                    stdout_offset,
+                    stderr_offset,
+                    limit: 64 * 1024,
+                },
+            )
+            .await?;
+            std::io::stdout().write_all(&BASE64.decode(logs.stdout_base64)?)?;
+            std::io::stdout().flush()?;
+            std::io::stderr().write_all(&BASE64.decode(logs.stderr_base64)?)?;
+            std::io::stderr().flush()?;
+            stdout_offset = logs.next_stdout_offset;
+            stderr_offset = logs.next_stderr_offset;
+        }
+        let request = Request::JobsStatus(JobIdParams {
+            job_id: job_id.clone(),
+        });
+        let job: JobRecord = transport::read_json(
+            token
+                .apply(client.post(format!("{url}/v1/execute")))
+                .json(&request),
+        )
+        .await?;
+        if job.handle.state.is_terminal() {
+            if follow {
+                let logs = fetch_logs(
+                    client,
+                    token,
+                    url,
+                    JobLogsParams {
+                        job_id: job_id.clone(),
+                        stdout_offset,
+                        stderr_offset,
+                        limit: 64 * 1024,
+                    },
+                )
+                .await?;
+                std::io::stdout().write_all(&BASE64.decode(logs.stdout_base64)?)?;
+                std::io::stderr().write_all(&BASE64.decode(logs.stderr_base64)?)?;
+            }
+            return Ok(job);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn fetch_logs(
+    client: &reqwest::Client,
+    token: &Token,
+    url: &str,
+    params: JobLogsParams,
+) -> color_eyre::eyre::Result<JobLogsResponse> {
+    transport::read_json(
         token
             .apply(client.post(format!("{url}/v1/execute")))
-            .json(&request)
-    };
-    let response: Value = transport::read_json(request).await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
-    Ok(())
+            .json(&Request::JobsLogs(params)),
+    )
+    .await
 }
 
 fn operation_params(operation: &str, args: &ArgMatches) -> color_eyre::eyre::Result<Value> {

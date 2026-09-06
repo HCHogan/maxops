@@ -17,7 +17,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = serde_json::from_slice(&std::fs::read(Args::parse().config)?)?;
-    let (listen, router) = maxops_hub::build(config)?;
+    let (listen, router) = maxops_hub::build(config).await?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "hub listening");
     axum::serve(listener, router)
