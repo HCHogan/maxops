@@ -938,6 +938,76 @@ async fn catalog_serves_shared_protocol_metadata() {
 }
 
 #[tokio::test]
+async fn mixed_execution_inventory_keeps_read_only_hosts_available() {
+    let (alpha_url, alpha_task) =
+        stub(Router::new().route("/v1/snapshot", get(|| async { Json(snapshot("alpha")) }))).await;
+    let (beta_url, beta_task) =
+        stub(Router::new().route("/v1/snapshot", get(|| async { Json(snapshot("beta")) }))).await;
+    let directory = tempfile::tempdir().unwrap();
+    let alpha_token = directory.path().join("alpha-token");
+    let beta_token = directory.path().join("beta-token");
+    let beta_execution_token = directory.path().join("beta-execution-token");
+    let client_token = directory.path().join("client-token");
+    std::fs::write(&alpha_token, AGENT_TOKEN).unwrap();
+    std::fs::write(&beta_token, "agent-token-eeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+    std::fs::write(&beta_execution_token, EXECUTION_TOKEN).unwrap();
+    std::fs::write(&client_token, USER_TOKEN).unwrap();
+    let config: Config = serde_json::from_value(json!({
+        "listen":"127.0.0.1:0",
+        "state_file":directory.path().join("hub.db"),
+        "hosts":[
+            {
+                "name":"alpha",
+                "agent_url":alpha_url,
+                "agent_token_file":alpha_token,
+                "readable_units":["demo.service"],
+                "manageable_units":["demo.service"]
+            },
+            {
+                "name":"beta",
+                "agent_url":beta_url,
+                "agent_token_file":beta_token,
+                "execution_token_file":beta_execution_token,
+                "readable_units":["demo.service"],
+                "manageable_units":["demo.service"]
+            }
+        ],
+        "clients":[{
+            "name":"manager",
+            "token_file":client_token,
+            "hosts":["alpha","beta"],
+            "capabilities":["host:read","units:manage","jobs:read"],
+            "access":"manage"
+        }]
+    }))
+    .unwrap();
+    let (_, router) = build(config).await.unwrap();
+
+    let (status, facts) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"host.facts","params":{"host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(facts["host"], "alpha");
+
+    let (status, error) = call_with_idempotency(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("mixed-version-restart"),
+        json!({"op":"units.restart","params":{"host":"alpha","unit":"demo.service"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error["error"], "host execution disabled");
+    alpha_task.abort();
+    beta_task.abort();
+}
+
+#[tokio::test]
 async fn expanded_operations_preserve_scope_and_unknown_deployment_time() {
     let (url, task) = stub(Router::new()
         .route("/v1/snapshot", get(|| async { Json(snapshot("alpha")) }))

@@ -81,16 +81,16 @@ fn cli() -> Command {
                 let required = schema["required"]
                     .as_array()
                     .is_some_and(|items| items.iter().any(|item| item == name));
-                if !matches!(property["type"].as_str(), Some("string" | "integer")) {
+                let Some(kind) = scalar_type(property) else {
                     continue;
-                }
+                };
                 let mut arg = Arg::new(name.clone())
                     .long(name.replace('_', "-"))
                     .conflicts_with_all(["params-file", "params-stdin"]);
                 if required {
                     arg = arg.required_unless_present_any(["params-file", "params-stdin"]);
                 }
-                if property["type"] == "integer" {
+                if kind == "integer" {
                     arg = arg.value_parser(clap::value_parser!(u64));
                 }
                 subcommand = subcommand.arg(arg);
@@ -213,12 +213,20 @@ async fn wait_for_job(
         let request = Request::JobsStatus(JobIdParams {
             job_id: job_id.clone(),
         });
-        let job: JobRecord = transport::read_json(
+        let job: JobRecord = match transport::read_json(
             token
                 .apply(client.post(format!("{url}/v1/execute")))
                 .json(&request),
         )
-        .await?;
+        .await
+        {
+            Ok(job) => job,
+            Err(error) if retryable_wait_error(&error) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if job.handle.state.is_terminal() {
             if follow {
                 let logs = fetch_logs(
@@ -240,6 +248,10 @@ async fn wait_for_job(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn retryable_wait_error(error: &color_eyre::Report) -> bool {
+    transport::upstream_status(error) == Some(reqwest::StatusCode::CONFLICT)
 }
 
 async fn fetch_logs(
@@ -274,16 +286,35 @@ fn operation_params(operation: &str, args: &ArgMatches) -> color_eyre::eyre::Res
     let mut params = serde_json::Map::new();
     if let Some(properties) = schema["properties"].as_object() {
         for (name, property) in properties {
-            if property["type"] == "integer" {
-                if let Some(value) = args.get_one::<u64>(name) {
-                    params.insert(name.clone(), json!(value));
+            match scalar_type(property) {
+                Some("integer") => {
+                    if let Some(value) = args.get_one::<u64>(name) {
+                        params.insert(name.clone(), json!(value));
+                    }
                 }
-            } else if let Some(value) = args.get_one::<String>(name) {
-                params.insert(name.clone(), json!(value));
+                Some("string") => {
+                    if let Some(value) = args.get_one::<String>(name) {
+                        params.insert(name.clone(), json!(value));
+                    }
+                }
+                _ => {}
             }
         }
     }
     Ok(Value::Object(params))
+}
+
+fn scalar_type(property: &Value) -> Option<&str> {
+    match property.get("type")? {
+        Value::String(kind) if matches!(kind.as_str(), "string" | "integer") => Some(kind),
+        Value::Array(kinds) if kinds.len() == 2 && kinds.iter().any(|kind| kind == "null") => {
+            kinds.iter().find_map(|kind| match kind.as_str() {
+                Some(kind @ ("string" | "integer")) => Some(kind),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn read_params(reader: impl Read) -> color_eyre::eyre::Result<Vec<u8>> {
@@ -357,6 +388,18 @@ mod tests {
     }
 
     #[test]
+    fn optional_schema_unions_do_not_become_invalid_short_flags() {
+        let matches = cli()
+            .try_get_matches_from(["maxopsctl", "units.failed", "--host", "alpha"])
+            .unwrap();
+        let (operation, args) = matches.subcommand().unwrap();
+        assert_eq!(
+            operation_params(operation, args).unwrap(),
+            json!({"host":"alpha"})
+        );
+    }
+
+    #[test]
     fn params_file_supports_nested_values_and_replaces_short_flags() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("params.json");
@@ -376,5 +419,19 @@ mod tests {
             serde_json::from_value::<Request>(json!({"op":operation,"params":params})).is_err(),
             "the protocol type still rejects fields not in the selected operation"
         );
+    }
+
+    #[test]
+    fn wait_only_retries_projection_conflicts() {
+        use maxops_proto::transport::UpstreamHttpError;
+
+        fn report(status: reqwest::StatusCode) -> color_eyre::Report {
+            UpstreamHttpError::new(status).into()
+        }
+
+        assert!(retryable_wait_error(&report(reqwest::StatusCode::CONFLICT)));
+        assert!(!retryable_wait_error(&report(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        )));
     }
 }

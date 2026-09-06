@@ -19,7 +19,7 @@
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "maxops";
-          version = "0.2.1";
+          version = "0.3.0";
           src = nixpkgs.lib.fileset.toSource {
             root = ./.;
             fileset = nixpkgs.lib.fileset.unions [
@@ -43,7 +43,7 @@
           '';
           __darwinAllowLocalNetworking = true;
           meta = {
-            description = "Fleet hub, Linux executor and CLI";
+            description = "Fleet hub, Linux executor, CLI and MCP adapter";
             license = nixpkgs.lib.licenses.mit;
             platforms = systems;
             mainProgram = "maxopsctl";

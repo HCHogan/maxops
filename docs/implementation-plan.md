@@ -2,9 +2,10 @@
 
 日期：2026-09-06。基线：0.2.1 / `f7a2f73`。
 
-状态：实施中。P0 协议与存储、P1 异步命令、P2 服务操作、P3 配置工作区、
-P4 构建部署和 P5 事件与诊断已完成并通过本地门禁；P5 的 Linux KVM 门禁正在
-执行。P6 客户端适配和升级推广尚未完成。
+状态：已完成。P0 协议与存储、P1 异步命令、P2 服务操作、P3 配置工作区、
+P4 构建部署、P5 事件诊断与修复协调、P6 通用客户端与升级路径均已实现。
+最终源码快照通过 macOS devenv 门禁、Linux Nix 构建内 62 个 nextest 测试，
+以及 b650 上由 KVM 执行的完整 NixOS VM 验收。
 
 ## 1. 已确定的产品边界
 
@@ -527,7 +528,7 @@ P0/P1 先用一个 fixture host 完成：CLI 提交一个有延迟、会输出�
 | Git | 用户 dirty tree、并发 patch、移动 ref、冲突恢复、凭据隔离 | 临时 bare remote + 多个 worktree |
 | Nix 部署 | 冻结产物、不同架构构建、system/home 分离、断网与业务失败恢复 | fixture NixOS VM，之后单机预授权试点 |
 | 外部修改者 | 人工 push、独立 rebuild/回滚、验收期间切换、旧恢复计时器与外部新 generation 竞争 | 独立 Git 客户端及绕过 maxops API 的 VM 操作 |
-| 任意客户端 | CLI 与普通 HTTP 程序执行同一修复；MCP 后续复用 | 不启动 Max 的集成环境 |
+| 任意客户端 | CLI、普通 HTTP 程序与 MCP 复用同一 registry、身份和作业 | 不启动 Max 的集成环境 |
 
 多个修改入口的固定验收场景：
 

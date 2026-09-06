@@ -90,7 +90,59 @@ with tempfile.TemporaryDirectory(prefix="maxops-smoke-") as directory:
         assert ctl("units.failed")["hosts"][0]["units"][0]["unit"] == "demo.service"
         assert ctl("units.list", "--host", "fixture")["units"][0]["unit"] == "demo.service"
         assert ctl("deploy.status")["hosts"][0]["activated_at"] is None
-        assert len(ctl("operations")["operations"]) == 6
+        catalog = ctl("operations")
+        assert len(catalog["operations"]) == 6
+
+        client_env = os.environ.copy()
+        client_env.update({"MAXOPS_URL": base, "MAXOPS_TOKEN_FILE": str(temp / "client")})
+        http_catalog = json.loads(subprocess.check_output([
+            "python3", str(root / "examples/http-client.py"), "operations"
+        ], text=True, env=client_env))
+        assert http_catalog == catalog
+        http_facts = json.loads(subprocess.check_output([
+            "python3", str(root / "examples/http-client.py"), "call", "host.facts",
+            json.dumps({"host": "fixture"})
+        ], text=True, env=client_env))
+        assert http_facts["facts"]["kernel"] == "synthetic"
+
+        mcp = subprocess.Popen(
+            [str(bin_dir / "maxops-mcp")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=client_env,
+        )
+        assert mcp.stdin is not None and mcp.stdout is not None
+
+        def mcp_request(message):
+            mcp.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            mcp.stdin.flush()
+            return json.loads(mcp.stdout.readline())
+
+        initialized = mcp_request({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "smoke", "version": "1"}},
+        })
+        assert initialized["result"]["protocolVersion"] == "2025-06-18"
+        mcp.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }) + "\n")
+        mcp.stdin.flush()
+        mcp_tools = mcp_request({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        })["result"]["tools"]
+        assert {tool["name"] for tool in mcp_tools} == {
+            operation["name"] for operation in catalog["operations"]
+        }
+        mcp_facts = mcp_request({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "host.facts", "arguments": {"host": "fixture"}},
+        })
+        assert mcp_facts["result"]["structuredContent"]["facts"]["kernel"] == "synthetic"
+        mcp.stdin.close()
+        assert mcp.wait(timeout=5) == 0
         with urlopen(Request(base + "/v1/openapi.json", headers={"Authorization": f"Bearer {user_token}"})) as response:
             assert "paths" in json.load(response)
         try:
@@ -98,7 +150,7 @@ with tempfile.TemporaryDirectory(prefix="maxops-smoke-") as directory:
             raise AssertionError("unauthenticated catalog was accepted")
         except HTTPError as error:
             assert error.code == 401
-        print("PASS: real hub + CLI round trips, scoped catalog, OpenAPI, unauthenticated rejection (synthetic agent)")
+        print("PASS: real Hub, CLI, HTTP example and MCP share one scoped catalog and identity")
     finally:
         hub.terminate()
         try:

@@ -58,6 +58,10 @@ pub struct UpstreamHttpError {
 }
 
 impl UpstreamHttpError {
+    pub fn new(status: StatusCode) -> Self {
+        Self { status }
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -135,10 +139,7 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
 ) -> color_eyre::eyre::Result<T> {
     let mut response = request.send().await?;
     if !response.status().is_success() {
-        return Err(UpstreamHttpError {
-            status: response.status(),
-        }
-        .into());
+        return Err(UpstreamHttpError::new(response.status()).into());
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {

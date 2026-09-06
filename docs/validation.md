@@ -6,16 +6,14 @@ Validated locally on aarch64-darwin using the devenv toolchain (Rust 1.95.0).
 | --- | --- |
 | `cargo fmt --all --check` | Passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
-| `cargo nextest run --workspace --locked` | 48 passed, none skipped |
+| `cargo nextest run --workspace --locked` | 62 passed, none skipped |
 | `cargo test --workspace --doc --locked` | Passed; no doctest examples yet |
 | `cargo build --workspace --locked` | All workspace targets built |
-| `python3 scripts/smoke.py` | Real hub and CLI passed against a synthetic loopback agent |
-| Criterion protocol benchmarks | Both benchmarks executed successfully |
+| `python3 scripts/smoke.py` | Real Hub, CLI, HTTP example and MCP adapter used one scoped catalog and identity |
+| Criterion protocol benchmarks | All four benchmarks executed successfully |
 | `scripts/check-pins.py <nix-config>/flake.lock` | All three complete nixpkgs lock records match |
 | `nix flake check --all-systems --no-build` | Packages and both Linux VM test derivations evaluated |
-| `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 48 nextest tests in the Nix build sandbox |
-| Smoke test with Nix-packaged binaries | Passed against the synthetic loopback agent |
-| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 48 nextest tests in the Nix build sandbox |
+| `nix build .#checks.x86_64-linux.agent-vm --no-link -L` on b650 | Passed under KVM; the package sandbox ran all 62 tests before the 128-second VM script |
 
 The Linux build initially failed when reqwest's platform verifier found no CA
 store inside the Nix sandbox. The package now supplies nixpkgs' CA bundle through
@@ -34,11 +32,14 @@ their own service messages remain plain text.
 
 The HTTP tests cover identity/capability/host scope, service filtering, stale and
 oversized agent responses, agent identity mismatch, notification failure and
-acknowledgement, active-alert scope, Prometheus scrape freshness, and OpenAPI
-operation names. The CLI tests check generated required and numeric parameters.
+acknowledgement, active-alert scope, durable event replay, diagnostics and
+remediation budgets, mixed read-only/execution inventories, Prometheus scrape
+freshness, and OpenAPI operation names. The CLI tests check generated parameters
+and retry the transient projection conflict that can occur while waiting for a
+newly dispatched job.
 
-Criterion was initially run with ten samples, one second warmup and one second
-measurement per benchmark. This verifies the harness and provides a preliminary
+Criterion covered log decoding, bearer authentication, event serialization and
+canonical job-spec hashing. This verifies the harness and provides a preliminary
 local baseline, not a fleet performance result. Run `just bench` for the normal
 sampling configuration.
 
@@ -190,3 +191,50 @@ depended on ambient paths, and rollback checks that incorrectly required a
 restored closure to reuse an old Nix profile generation number. The durable
 host lock coordinates maxops service and deployment mutations only; direct Git,
 `systemctl`, profile and activation operations remain valid external writes.
+
+## Events, diagnostics and remediation coordination
+
+On 2026-09-07, P5 added durable alert episodes, ordered event cursors, staged
+webhook delivery, diagnostic jobs and serialized remediation claims with attempt
+budgets and cooldowns. Readiness, self-status and metrics expose storage,
+delivery and job health without command strings, token material or unbounded
+identity labels.
+
+The final KVM VM verified the complete alert-to-remediation path: an Alertmanager
+event was persisted and replayed, a diagnostic collected snapshot, unit-log and
+explicit probe evidence, one remediation claim restarted a managed service, the
+confirmed result emitted delivery events, and a second claim exhausted the
+configured episode budget. Authentication, host scope, agent account privilege,
+service inventory and webhook acknowledgement boundaries remained enforced.
+
+The first Linux Nix attempt misleadingly reported three missing-table failures.
+That flake build had started before the new migration was added to Git, so Nix's
+Git source snapshot omitted `0003_events_diagnostics.sql`. Rebuilding from the
+complete tracked source included all three migrations and passed. This is why a
+successful local workspace test does not prove that an untracked migration is
+present in a Git flake build.
+
+## Generic clients and upgrade path
+
+On 2026-09-07, P6 added the stdio MCP adapter and a dependency-free Python HTTP
+example. Both fetch the server's principal-scoped operation catalog and use the
+same bearer identity and `/v1/execute` protocol as `maxopsctl`; MCP job tools
+require an explicit idempotency key. The real smoke test starts Hub and Agent,
+then confirms CLI, HTTP and MCP expose the same scoped catalog and return the
+same host identity.
+
+The Hub test suite also verifies that an inventory may mix observation-only and
+execution-enabled hosts: reads continue on the former, while a mutation fails
+closed when that host has no execution channel. The upgrade guide requires a
+fresh remote and live-state observation before each change, documents a
+consistent SQLite backup, and preserves a read-only fallback by removing the
+execution credential rather than assuming maxops owns all fleet writes.
+
+The first full VM run under TCG exposed a fast dispatch/projection race:
+`maxopsctl --wait` could terminate on a transient HTTP 409 from `jobs.status`.
+The client now retries only that conflict and still surfaces other HTTP errors.
+The 62-test workspace gate and strict clippy passed after the fix; the tracked
+source archive then passed the Linux package tests and complete KVM VM script
+on b650. The VM independently exercised external Git commits, a manual
+service restart and an external profile activation, proving stale plans stop and
+superseded deployments do not roll back another writer's running generation.

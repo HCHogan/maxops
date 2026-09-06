@@ -5,18 +5,19 @@ versioned configuration workspaces and guarded Nix deployment. Nix owns policy
 and inventory; Prometheus owns metrics. No host or user from a private fleet is
 built in.
 
-Version 0.2 extends the initial single-host pilot with fleet observations.
+Version 0.3 extends the initial single-host pilot with durable execution,
+configuration deployment, event-driven diagnostics and generic clients.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
-The [implementation plan](docs/implementation-plan.md) covers the remaining
-client-adapter stage. Every API is usable by people and arbitrary automation
-clients. The design supports concurrent manual and external changes to
-repositories and hosts.
+The [implementation plan](docs/implementation-plan.md) records the completed
+delivery stages. Every API is usable by people and arbitrary automation clients.
+The design supports concurrent manual and external changes to repositories and
+hosts.
 
 ## Implemented
 
-- Six Rust crates: `maxops-proto`, `maxops-store`, `maxops-executor`,
-  `maxops-agent`, `maxops-hub`, `maxopsctl`.
+- Seven Rust crates: `maxops-proto`, `maxops-store`, `maxops-executor`,
+  `maxops-agent`, `maxops-hub`, `maxopsctl`, `maxops-mcp`.
 - A shared operation registry generates request decoding, capability names,
   operation kind, idempotency requirement, parameter/response JSON Schemas and
   CLI subcommands. Utoipa derives OpenAPI from the same request types.
@@ -72,10 +73,15 @@ repositories and hosts.
   Max, another bot, a script and a person all use the same API.
 - Public readiness plus authenticated status and Prometheus metrics expose
   bounded queue, outcome, duration, recovery, storage and heartbeat state.
+- `maxops-mcp` exposes the Hub's principal-scoped operation catalog over MCP
+  stdio. It forwards the same bearer identity and HTTP requests as the CLI;
+  there is no second authorization or job implementation.
+- A Python standard-library HTTP example demonstrates catalog discovery,
+  generic operation calls and durable job polling without Max or any bot SDK.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: MCP, QQ impersonation/delegation, reboot, arbitrary PromQL, or
+Not implemented: QQ impersonation/delegation, reboot, arbitrary PromQL, or
 trustworthy activation timestamps. Persistent profile generation is distinct
 from the running closure; filesystem ctime is never called deployment time.
 
@@ -93,6 +99,7 @@ devenv shell
 check                                  # fmt, clippy, nextest, doctests
 cargo build --workspace --locked
 python3 scripts/smoke.py                # real hub + CLI, synthetic loopback agent
+python3 examples/http-client.py --help  # dependency-free generic HTTP client
 bench                                  # Criterion, results in target/criterion
 python3 scripts/check-pins.py
 ```
@@ -179,6 +186,26 @@ Nested command input uses a JSON object through `--params-file` or
 `--wait` polls until the job is terminal. `--follow` also streams decoded binary
 stdout and stderr. The CLI uses distinct exit codes for failed, unknown,
 cancelled and timed-out jobs.
+
+The ordinary HTTP example reads the same environment variables and accepts
+either inline parameters or `@path`:
+
+```sh
+python3 examples/http-client.py operations
+python3 examples/http-client.py call diagnostics.collect @diagnostic.json \
+  --idempotency-key incident-123-diagnostic --wait
+python3 examples/http-client.py wait 00000000-0000-0000-0000-000000000000
+```
+
+For an MCP client, launch `maxops-mcp` as a stdio server with `MAXOPS_URL` and
+`MAXOPS_TOKEN_FILE` in its environment. `tools/list` fetches `/v1/operations`
+for that credential every time, so an observation token cannot discover or call
+management tools. Job tools add a required `_maxops_idempotency_key` input and
+translate it to the existing `Idempotency-Key` HTTP header. Tool results include
+both text and structured JSON. The adapter follows the
+[MCP 2025-06-18 lifecycle](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle),
+[stdio transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
+and [tools protocol](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
 
 Service names must be explicit canonical `.service` names. Patterns, paths and
 shell expressions are rejected. Status covers the intersection of hub and agent
@@ -320,7 +347,8 @@ or system rebuild is needed just to install `maxopsctl` in a user's home.
 ## Boundaries and delivery semantics
 
 Read [docs/architecture.md](docs/architecture.md) before enabling logs or
-notifications. In particular:
+notifications, and [docs/upgrade.md](docs/upgrade.md) before a rolling upgrade.
+In particular:
 
 - Use a protected network such as Tailscale, or a correctly configured TLS
   proxy. An explicit listen address is not a substitute for network ACLs.

@@ -20,8 +20,10 @@ user and writes bounded output plus an atomically renamed completion record.
 
 `maxops-hub` authenticates clients, applies host and capability grants, stores
 its view of jobs, and queries agents or existing monitoring services.
-`maxopsctl` is a thin HTTP client. Inventory, execution profiles, credentials
-and principals belong to the consuming Nix repo.
+`maxopsctl` is a thin HTTP client. `maxops-mcp` is a thin stdio-to-HTTP adapter:
+it obtains its tool schemas from the Hub's credential-filtered registry and
+uses the same identity and durable operations. Inventory, execution profiles,
+credentials and principals belong to the consuming Nix repo.
 
 ## Authentication and limits
 
@@ -278,7 +280,7 @@ References: [reqwest](https://docs.rs/reqwest/latest/reqwest/),
 
 ## Mutation boundary
 
-Version 0.2 includes preauthorized command, service and Nix deployment execution with
+Version 0.3 includes preauthorized command, service and Nix deployment execution with
 observation credentials kept separate. It does not require per-command human
 confirmation within the configured scope. Immutable job specifications,
 execution-time checks, idempotency, durable records and reconciliation of
@@ -290,6 +292,7 @@ distinct from maxops's own operation history; internal locks do not exclude thos
 writers. Plans must revalidate their baselines, and recovery must stop when a
 later external deployment has superseded the operation.
 
-The [implementation plan](implementation-plan.md) defines the event and client
-stages that follow deployment. Reboot and data recovery have separate
-implementation and verification requirements.
+The [implementation plan](implementation-plan.md) records the completed event,
+diagnostic and client stages. Reboot and data recovery have separate
+implementation and verification requirements. Rolling procedures and the
+read-only fallback are in [upgrade.md](upgrade.md).
