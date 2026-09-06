@@ -1,7 +1,8 @@
 { pkgs, self }:
 pkgs.testers.runNixOSTest {
   name = "maxops-read-only";
-  nodes.machine = { pkgs, ... }:
+  nodes.machine =
+    { pkgs, ... }:
     let
       deploymentBaseline = pkgs.runCommand "maxops-deployment-baseline" { } ''
         mkdir -p $out/bin
@@ -58,242 +59,306 @@ pkgs.testers.runNixOSTest {
         }
       '';
     in
-  {
-    imports = [ self.nixosModules.default ];
-    networking.hostName = "fixture";
-    # The classic initrd avoids case-colliding terminfo directories when this
-    # cross-platform VM test is built from a macOS Nix store.
-    boot.initrd.systemd.enable = false;
-    environment.systemPackages = [
-      self.packages.${pkgs.stdenv.hostPlatform.system}.default
-      pkgs.curl
-      pkgs.git
-      pkgs.jq
-    ];
-    systemd.tmpfiles.rules = [
-      "f /run/agent-token 0400 root root - agent-test-token-aaaaaaaaaaaaaaaaaaaaaa"
-      "f /run/client-token 0400 root root - client-test-token-bbbbbbbbbbbbbbbbbbbbb"
-      "f /run/execution-token 0400 root root - execution-test-token-cccccccccccccccccc"
-      "f /run/manager-token 0400 root root - manager-test-token-dddddddddddddddddddd"
-      "f /run/manager2-token 0400 root root - manager2-test-token-eeeeeeeeeeeeeeeeeeeee"
-      "f /run/job-credential 0400 root root - fixture-credential-value"
-      "d /var/lib/maxops-fixture-deploy 0755 root root - -"
-      "L+ /var/lib/maxops-fixture-deploy/profile - - - - ${deploymentBaseline}"
-      "L+ /run/maxops-fixture-current - - - - ${deploymentBaseline}"
-      "L+ /run/maxops-fixture-external - - - - ${deploymentExternal}"
-    ];
-    services.maxops-executor = {
-      enable = true;
-      manageableUnits = [
-        "maxops-managed.service"
-        "maxops-no-reload.service"
+    {
+      imports = [ self.nixosModules.default ];
+      networking.hostName = "fixture";
+      # The classic initrd avoids case-colliding terminfo directories when this
+      # cross-platform VM test is built from a macOS Nix store.
+      boot.initrd.systemd.enable = false;
+      environment.systemPackages = [
+        self.packages.${pkgs.stdenv.hostPlatform.system}.default
+        pkgs.curl
+        pkgs.git
+        pkgs.jq
+        pkgs.python3
       ];
-      credentialSources.fixture = "/run/job-credential";
-      profiles.diagnostic = {
-        timeoutSeconds = 600;
-        outputLimitBytes = 64;
-        tasksMax = 32;
-        memoryMaxBytes = 268435456;
-        allowedCredentials = [ "fixture" ];
-      };
-      profiles.activation = {
-        user = "root";
-        privileged = true;
-        timeoutSeconds = 300;
-        outputLimitBytes = 65536;
-      };
-      profiles.deployment = {
-        timeoutSeconds = 600;
-        outputLimitBytes = 65536;
-        tasksMax = 32;
-        memoryMaxBytes = 268435456;
-      };
-      repositories.fixture = {
-        url = "/var/lib/maxops-executor/fixture-remote.git";
-        publishRefs = [ "refs/heads/main" ];
-        checks = {
-          content = [
-            "${pkgs.bash}/bin/bash"
-            "-c"
-            ''test "$(cat config.txt)" = changed-again && test -z "''${CREDENTIALS_DIRECTORY+x}"''
-          ];
-          frozen = [
-            "${pkgs.bash}/bin/bash"
-            "-c"
-            ''first=$(cat config.txt); sleep 6; test "$first" = changed && test "$(cat config.txt)" = changed && test -z "''${CREDENTIALS_DIRECTORY+x}"''
+      systemd.tmpfiles.rules = [
+        "f /run/agent-token 0400 root root - agent-test-token-aaaaaaaaaaaaaaaaaaaaaa"
+        "f /run/client-token 0400 root root - client-test-token-bbbbbbbbbbbbbbbbbbbbb"
+        "f /run/execution-token 0400 root root - execution-test-token-cccccccccccccccccc"
+        "f /run/manager-token 0400 root root - manager-test-token-dddddddddddddddddddd"
+        "f /run/manager2-token 0400 root root - manager2-test-token-eeeeeeeeeeeeeeeeeeeee"
+        "f /run/alert-token 0400 root root - alert-test-token-ffffffffffffffffffffff"
+        "f /run/job-credential 0400 root root - fixture-credential-value"
+        "d /var/lib/maxops-fixture-deploy 0755 root root - -"
+        "L+ /var/lib/maxops-fixture-deploy/profile - - - - ${deploymentBaseline}"
+        "L+ /run/maxops-fixture-current - - - - ${deploymentBaseline}"
+        "L+ /run/maxops-fixture-external - - - - ${deploymentExternal}"
+      ];
+      services.maxops-executor = {
+        enable = true;
+        manageableUnits = [
+          "maxops-managed.service"
+          "maxops-no-reload.service"
+        ];
+        credentialSources.fixture = "/run/job-credential";
+        profiles.diagnostic = {
+          timeoutSeconds = 600;
+          outputLimitBytes = 64;
+          tasksMax = 32;
+          memoryMaxBytes = 268435456;
+          allowedCredentials = [ "fixture" ];
+        };
+        profiles.activation = {
+          user = "root";
+          privileged = true;
+          timeoutSeconds = 300;
+          outputLimitBytes = 65536;
+        };
+        profiles.deployment = {
+          timeoutSeconds = 600;
+          outputLimitBytes = 65536;
+          tasksMax = 32;
+          memoryMaxBytes = 268435456;
+        };
+        repositories.fixture = {
+          url = "/var/lib/maxops-executor/fixture-remote.git";
+          publishRefs = [ "refs/heads/main" ];
+          checks = {
+            content = [
+              "${pkgs.bash}/bin/bash"
+              "-c"
+              ''test "$(cat config.txt)" = changed-again && test -z "''${CREDENTIALS_DIRECTORY+x}"''
+            ];
+            frozen = [
+              "${pkgs.bash}/bin/bash"
+              "-c"
+              ''first=$(cat config.txt); sleep 6; test "$first" = changed && test "$(cat config.txt)" = changed && test -z "''${CREDENTIALS_DIRECTORY+x}"''
+            ];
+          };
+        };
+        deploymentProfiles.fixture-system = {
+          repository = "fixture";
+          targetHost = "fixture";
+          flakeAttribute = "packages.x86_64-linux.default";
+          buildProfile = "deployment";
+          activateProfile = "activation";
+          verifyProfile = "deployment";
+          profilePath = "/var/lib/maxops-fixture-deploy/profile";
+          runningLink = "/run/maxops-fixture-current";
+          verifyCommands = [
+            [
+              "${pkgs.bash}/bin/bash"
+              "-c"
+              ''test "$(${pkgs.coreutils}/bin/readlink /run/maxops-fixture-current)" = "$(${pkgs.coreutils}/bin/readlink -f /var/lib/maxops-fixture-deploy/profile)" && ${pkgs.gnugrep}/bin/grep -qx published /run/maxops-fixture-mode''
+            ]
           ];
         };
       };
-      deploymentProfiles.fixture-system = {
-        repository = "fixture";
-        targetHost = "fixture";
-        flakeAttribute = "packages.x86_64-linux.default";
-        buildProfile = "deployment";
-        activateProfile = "activation";
-        verifyProfile = "deployment";
-        profilePath = "/var/lib/maxops-fixture-deploy/profile";
-        runningLink = "/run/maxops-fixture-current";
-        verifyCommands = [
-          [
-            "${pkgs.bash}/bin/bash"
-            "-c"
-            ''test "$(${pkgs.coreutils}/bin/readlink /run/maxops-fixture-current)" = "$(${pkgs.coreutils}/bin/readlink -f /var/lib/maxops-fixture-deploy/profile)" && ${pkgs.gnugrep}/bin/grep -qx published /run/maxops-fixture-mode''
-          ]
-        ];
-      };
-    };
-    services.maxops-agent = {
-      enable = true;
-      tokenFile = "/run/agent-token";
-      readableUnits = [
-        "maxops-fixture.service"
-        "maxops-managed.service"
-        "maxops-no-reload.service"
-      ];
-      manageableUnits = [
-        "maxops-managed.service"
-        "maxops-no-reload.service"
-      ];
-      allowLogs = true;
-      execution = {
+      services.maxops-agent = {
         enable = true;
-        tokenFile = "/run/execution-token";
+        tokenFile = "/run/agent-token";
+        readableUnits = [
+          "maxops-fixture.service"
+          "maxops-managed.service"
+          "maxops-no-reload.service"
+        ];
+        manageableUnits = [
+          "maxops-managed.service"
+          "maxops-no-reload.service"
+        ];
+        allowLogs = true;
+        execution = {
+          enable = true;
+          tokenFile = "/run/execution-token";
+        };
+      };
+      services.maxops-hub = {
+        enable = true;
+        repositories = [
+          {
+            name = "fixture";
+            executorHost = "fixture";
+          }
+        ];
+        deployments = [
+          {
+            name = "fixture-system";
+            repository = "fixture";
+            builderHost = "fixture";
+            targetHost = "fixture";
+            flakeAttribute = "packages.x86_64-linux.default";
+          }
+        ];
+        hosts = [
+          {
+            name = "fixture";
+            agentUrl = "http://127.0.0.1:9720";
+            tokenFile = "/run/agent-token";
+            executionTokenFile = "/run/execution-token";
+            readableUnits = [
+              "maxops-fixture.service"
+              "maxops-managed.service"
+              "maxops-no-reload.service"
+            ];
+            manageableUnits = [
+              "maxops-managed.service"
+              "maxops-no-reload.service"
+            ];
+            diagnosticProfile = "diagnostic";
+            diagnosticProbes.identity = [
+              "${pkgs.coreutils}/bin/id"
+              "-u"
+            ];
+          }
+        ];
+        clients = [
+          {
+            name = "test";
+            tokenFile = "/run/client-token";
+            hosts = [ "fixture" ];
+            capabilities = [
+              "fleet:read"
+              "units:read"
+              "host:read"
+              "logs:read"
+              "events:read"
+              "self:read"
+            ];
+          }
+          {
+            name = "manager";
+            tokenFile = "/run/manager-token";
+            hosts = [ "fixture" ];
+            access = "manage";
+            capabilities = [
+              "exec:run"
+              "units:manage"
+              "jobs:read"
+              "jobs:cancel"
+              "workspace:read"
+              "workspace:write"
+              "workspace:publish"
+              "deploy:manage"
+              "changes:read"
+              "diagnostics:collect"
+              "remediations:manage"
+              "events:read"
+              "self:read"
+            ];
+            repositories = [ "fixture" ];
+            deployments = [ "fixture-system" ];
+          }
+          {
+            name = "manager2";
+            tokenFile = "/run/manager2-token";
+            hosts = [ "fixture" ];
+            access = "manage";
+            capabilities = [
+              "units:manage"
+              "jobs:read"
+              "jobs:cancel"
+            ];
+          }
+        ];
+        alertIngress = {
+          enable = true;
+          tokenFile = "/run/alert-token";
+          sinkUrl = "http://127.0.0.1:9730/legacy";
+        };
+        eventSinks = [
+          {
+            id = "fixture-automation";
+            url = "http://127.0.0.1:9730/events";
+            hosts = [ "fixture" ];
+            retrySeconds = 1;
+          }
+        ];
+        remediationPolicy = {
+          maxAttemptsPerEpisode = 1;
+          cooldownSeconds = 0;
+        };
+      };
+      systemd.services.maxops-executor.preStart = ''
+        if ! ${pkgs.git}/bin/git --git-dir=/var/lib/maxops-executor/fixture-remote.git rev-parse --verify refs/heads/main >/dev/null 2>&1; then
+          rm -rf /var/lib/maxops-executor/fixture-remote.git /var/lib/maxops-executor/fixture-seed
+          ${pkgs.git}/bin/git init --bare --initial-branch=main /var/lib/maxops-executor/fixture-remote.git
+          ${pkgs.git}/bin/git init --initial-branch=main /var/lib/maxops-executor/fixture-seed
+          printf 'initial\n' > /var/lib/maxops-executor/fixture-seed/config.txt
+          cp ${pkgs.pkgsStatic.busybox}/bin/busybox /var/lib/maxops-executor/fixture-seed/busybox
+          chmod +x /var/lib/maxops-executor/fixture-seed/busybox
+          cp ${deploymentFlake} /var/lib/maxops-executor/fixture-seed/flake.nix
+          cp ${deploymentLock} /var/lib/maxops-executor/fixture-seed/flake.lock
+          ln -s /etc/shadow /var/lib/maxops-executor/fixture-seed/escape
+          ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed add config.txt busybox flake.nix flake.lock escape
+          ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed \
+            -c user.name=Fixture -c user.email=fixture@example.invalid commit -m initial
+          ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed remote add origin /var/lib/maxops-executor/fixture-remote.git
+          ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed push origin refs/heads/main
+          rm -rf /var/lib/maxops-executor/fixture-seed
+        fi
+      '';
+      systemd.services.maxops-fixture = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.Type = "oneshot";
+        script = ''
+          echo maxops-journal-fixture
+          exit 1
+        '';
+      };
+      systemd.services.maxops-managed = {
+        wantedBy = [ "multi-user.target" ];
+        script = ''
+          echo "$INVOCATION_ID" >> /var/lib/maxops-managed-invocations
+          trap 'echo reload >> /var/lib/maxops-managed-reloads' HUP
+          while true; do sleep 1; done
+        '';
+        reload = ''
+          if test -e /run/maxops-fail-reload; then
+            exit 1
+          fi
+          kill -HUP "$MAINPID"
+        '';
+        preStop = ''
+          sleep 4
+        '';
+      };
+      systemd.services.maxops-no-reload = {
+        wantedBy = [ "multi-user.target" ];
+        script = ''
+          while true; do sleep 1; done
+        '';
+      };
+      systemd.services.maxops-webhook-fixture = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          DynamicUser = true;
+          StateDirectory = "maxops-webhook-fixture";
+        };
+        script = ''
+          ${pkgs.python3}/bin/python3 - <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from pathlib import Path
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                  target = Path("/var/lib/maxops-webhook-fixture/events.jsonl")
+                  with target.open("ab") as stream:
+                      stream.write(body + b"\n")
+                  if self.path == "/events":
+                      self.send_response(202)
+                      self.send_header("content-type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(b'{"stage":"accepted"}')
+                  else:
+                      self.send_response(200)
+                      self.end_headers()
+
+              def log_message(self, format, *args):
+                  pass
+
+          HTTPServer(("127.0.0.1", 9730), Handler).serve_forever()
+          PY
+        '';
       };
     };
-    services.maxops-hub = {
-      enable = true;
-      repositories = [
-        {
-          name = "fixture";
-          executorHost = "fixture";
-        }
-      ];
-      deployments = [
-        {
-          name = "fixture-system";
-          repository = "fixture";
-          builderHost = "fixture";
-          targetHost = "fixture";
-          flakeAttribute = "packages.x86_64-linux.default";
-        }
-      ];
-      hosts = [
-        {
-          name = "fixture";
-          agentUrl = "http://127.0.0.1:9720";
-          tokenFile = "/run/agent-token";
-          executionTokenFile = "/run/execution-token";
-          readableUnits = [
-            "maxops-fixture.service"
-            "maxops-managed.service"
-            "maxops-no-reload.service"
-          ];
-          manageableUnits = [
-            "maxops-managed.service"
-            "maxops-no-reload.service"
-          ];
-        }
-      ];
-      clients = [
-        {
-          name = "test";
-          tokenFile = "/run/client-token";
-          hosts = [ "fixture" ];
-          capabilities = [
-            "fleet:read"
-            "units:read"
-            "host:read"
-            "logs:read"
-          ];
-        }
-        {
-          name = "manager";
-          tokenFile = "/run/manager-token";
-          hosts = [ "fixture" ];
-          access = "manage";
-          capabilities = [
-            "exec:run"
-            "units:manage"
-            "jobs:read"
-            "jobs:cancel"
-            "workspace:read"
-            "workspace:write"
-            "workspace:publish"
-            "deploy:manage"
-            "changes:read"
-          ];
-          repositories = [ "fixture" ];
-          deployments = [ "fixture-system" ];
-        }
-        {
-          name = "manager2";
-          tokenFile = "/run/manager2-token";
-          hosts = [ "fixture" ];
-          access = "manage";
-          capabilities = [
-            "units:manage"
-            "jobs:read"
-            "jobs:cancel"
-          ];
-        }
-      ];
-    };
-    systemd.services.maxops-executor.preStart = ''
-      if ! ${pkgs.git}/bin/git --git-dir=/var/lib/maxops-executor/fixture-remote.git rev-parse --verify refs/heads/main >/dev/null 2>&1; then
-        rm -rf /var/lib/maxops-executor/fixture-remote.git /var/lib/maxops-executor/fixture-seed
-        ${pkgs.git}/bin/git init --bare --initial-branch=main /var/lib/maxops-executor/fixture-remote.git
-        ${pkgs.git}/bin/git init --initial-branch=main /var/lib/maxops-executor/fixture-seed
-        printf 'initial\n' > /var/lib/maxops-executor/fixture-seed/config.txt
-        cp ${pkgs.pkgsStatic.busybox}/bin/busybox /var/lib/maxops-executor/fixture-seed/busybox
-        chmod +x /var/lib/maxops-executor/fixture-seed/busybox
-        cp ${deploymentFlake} /var/lib/maxops-executor/fixture-seed/flake.nix
-        cp ${deploymentLock} /var/lib/maxops-executor/fixture-seed/flake.lock
-        ln -s /etc/shadow /var/lib/maxops-executor/fixture-seed/escape
-        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed add config.txt busybox flake.nix flake.lock escape
-        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed \
-          -c user.name=Fixture -c user.email=fixture@example.invalid commit -m initial
-        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed remote add origin /var/lib/maxops-executor/fixture-remote.git
-        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed push origin refs/heads/main
-        rm -rf /var/lib/maxops-executor/fixture-seed
-      fi
-    '';
-    systemd.services.maxops-fixture = {
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig.Type = "oneshot";
-      script = ''
-        echo maxops-journal-fixture
-        exit 1
-      '';
-    };
-    systemd.services.maxops-managed = {
-      wantedBy = [ "multi-user.target" ];
-      script = ''
-        echo "$INVOCATION_ID" >> /var/lib/maxops-managed-invocations
-        trap 'echo reload >> /var/lib/maxops-managed-reloads' HUP
-        while true; do sleep 1; done
-      '';
-      reload = ''
-        if test -e /run/maxops-fail-reload; then
-          exit 1
-        fi
-        kill -HUP "$MAINPID"
-      '';
-      preStop = ''
-        sleep 4
-      '';
-    };
-    systemd.services.maxops-no-reload = {
-      wantedBy = [ "multi-user.target" ];
-      script = ''
-        while true; do sleep 1; done
-      '';
-    };
-  };
   testScript = ''
     start_all()
     machine.wait_for_unit("maxops-agent.service")
     machine.wait_for_unit("maxops-executor.service")
     machine.wait_for_unit("maxops-hub.service")
+    machine.wait_for_unit("maxops-webhook-fixture.service")
     machine.wait_for_open_port(9721)
     baseline = machine.succeed("readlink /run/maxops-fixture-current").strip()
     external_deployment = machine.succeed("readlink /run/maxops-fixture-external").strip()
@@ -310,6 +375,30 @@ pkgs.testers.runNixOSTest {
     machine.fail("runuser -u maxops-agent -- systemctl --no-ask-password restart maxops-fixture.service")
 
     manager = "timeout 60 maxopsctl --token-file /run/manager-token "
+    machine.succeed("curl -fsS http://127.0.0.1:9721/readyz | jq -e '.ready == true and .components.storage == \"ready\"'")
+    machine.fail("curl -fsS http://127.0.0.1:9721/metrics")
+    machine.succeed("curl -fsS -H 'Authorization: Bearer manager-test-token-dddddddddddddddddddd' http://127.0.0.1:9721/metrics | grep -q '^maxops_jobs_nonterminal '")
+
+    # Any HTTP client can turn an Alertmanager event into evidence and a
+    # budgeted repair; no Max/chat process participates in this flow.
+    machine.succeed("cat > /tmp/alert.json <<'EOF'\n{\"version\":\"4\",\"status\":\"firing\",\"alerts\":[{\"status\":\"firing\",\"fingerprint\":\"fixture-managed-down\",\"startsAt\":\"2026-09-06T00:00:00Z\",\"labels\":{\"instance\":\"fixture\",\"alertname\":\"ManagedServiceDown\"}}]}\nEOF")
+    machine.succeed("curl -fsS -H 'Authorization: Bearer alert-test-token-ffffffffffffffffffffff' -H 'Content-Type: application/json' --data-binary @/tmp/alert.json http://127.0.0.1:9721/v1/alerts | jq -e '.events_persisted == 1'")
+    alert_event = machine.succeed(manager + "events.list | jq -r '.events[] | select(.kind == \"alert_firing\") | .event_id'").strip()
+    machine.succeed(f"cat > /tmp/diagnostic-request.json <<'EOF'\n{{\"host\":\"fixture\",\"event_id\":\"{alert_event}\",\"unit\":\"maxops-managed.service\",\"probes\":[\"identity\"]}}\nEOF")
+    diagnostic_job = machine.succeed(manager + "diagnostics.collect --params-file /tmp/diagnostic-request.json --idempotency-key fixture-diagnostic | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {diagnostic_job} | jq -e '.handle.state == \"succeeded\" and .result.diagnostic.host == \"fixture\" and (.result.diagnostic.evidence | length) == 3'", timeout=30)
+    machine.succeed(f"cat > /tmp/remediation-begin.json <<'EOF'\n{{\"event_id\":\"{alert_event}\",\"host\":\"fixture\"}}\nEOF")
+    claim_job = machine.succeed(manager + "remediations.begin --params-file /tmp/remediation-begin.json --idempotency-key fixture-remediation | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {claim_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
+    remediation = machine.succeed(manager + f"jobs.status --job-id {claim_job} | jq -r .result.remediation.remediation_id").strip()
+    repair_job = machine.succeed(manager + "units.restart --host fixture --unit maxops-managed.service --idempotency-key fixture-auto-repair | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {repair_job} | jq -e '.handle.state == \"succeeded\"'", timeout=30)
+    machine.succeed(f"cat > /tmp/remediation-finish.json <<'EOF'\n{{\"remediation_id\":\"{remediation}\",\"expected_revision\":1,\"outcome\":\"succeeded\",\"related_job_id\":\"{repair_job}\",\"summary\":\"service restarted and target state verified\"}}\nEOF")
+    machine.succeed(manager + "remediations.finish --params-file /tmp/remediation-finish.json | jq -e '.state == \"succeeded\"'")
+    machine.wait_until_succeeds("test $(wc -l < /var/lib/maxops-webhook-fixture/events.jsonl) -ge 5", timeout=20)
+    second_claim = machine.succeed(manager + "remediations.begin --params-file /tmp/remediation-begin.json --idempotency-key fixture-remediation-again | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {second_claim} | jq -e '.handle.state == \"failed\" and .result.error == \"remediation_budget_exhausted\"'", timeout=20)
+
     machine.succeed("echo '{\"host\":\"fixture\",\"profile\":\"diagnostic\",\"command\":{\"argv\":[\"${pkgs.bash}/bin/bash\",\"-c\",\"printf first; sleep 12; printf second\"]},\"timeout_seconds\":30}' > /tmp/long-job.json")
     machine.fail(ctl + "exec.run --params-file /tmp/long-job.json --idempotency-key observer-cannot-run")
     job = machine.succeed(manager + "exec.run --params-file /tmp/long-job.json --idempotency-key restart-survival | jq -r .job_id").strip()

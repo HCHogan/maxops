@@ -9,7 +9,7 @@ Version 0.2 extends the initial single-host pilot with fleet observations.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
 The [implementation plan](docs/implementation-plan.md) covers the remaining
-event and client stages. Every API is usable by people and arbitrary automation
+client-adapter stage. Every API is usable by people and arbitrary automation
 clients. The design supports concurrent manual and external changes to
 repositories and hosts.
 
@@ -59,14 +59,25 @@ repositories and hosts.
   host-scoped Alertmanager queries. Unreachable or stale observations remain
   unknown; they are not labelled as a host failure.
 - Optional authenticated Alertmanager v4 forwarding to one generic webhook.
-  The hub acknowledges only after the destination returns success.
+  The hub also records host-scoped alerts as durable events with replay cursors
+  and episode identity, while preserving the synchronous receiver's response.
+- Ordered generic event subscriptions persist delivery intent before HTTP,
+  retry after receiver outages and preserve `queued`, `accepted` and
+  `confirmed` acknowledgement stages. Receivers deduplicate by event ID.
+- `diagnostics.collect` creates a durable evidence bundle from current agent
+  facts, bounded logs and fixed Nix-configured probes. Rule conclusions cite
+  evidence and missing inputs remain explicit.
+- `remediations.begin/finish` associate repairs with an event episode, serialize
+  active work per host, and enforce configured attempt and cooldown budgets.
+  Max, another bot, a script and a person all use the same API.
+- Public readiness plus authenticated status and Prometheus metrics expose
+  bounded queue, outcome, duration, recovery, storage and heartbeat state.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: durable event subscriptions, MCP, QQ impersonation/delegation,
-reboot, arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
-generation is distinct from the running closure; filesystem ctime is never
-called deployment time.
+Not implemented: MCP, QQ impersonation/delegation, reboot, arbitrary PromQL, or
+trustworthy activation timestamps. Persistent profile generation is distinct
+from the running closure; filesystem ctime is never called deployment time.
 
 ## Develop
 
@@ -119,6 +130,12 @@ maxopsctl units.restart --host example --unit nginx.service \
   --expected-invocation-id "$CURRENT_INVOCATION_ID" \
   --idempotency-key incident-123-restart --wait
 maxopsctl alerts.active
+maxopsctl events.list
+maxopsctl self.status
+maxopsctl diagnostics.collect --params-file ./diagnostic.json \
+  --idempotency-key incident-123-diagnostic --wait
+maxopsctl remediations.begin --params-file ./remediation.json \
+  --idempotency-key incident-123-claim --wait
 maxopsctl exec.run --params-file ./job.json --idempotency-key incident-123 --wait --follow
 maxopsctl workspace.create --repository nix-config --idempotency-key change-123 --wait
 maxopsctl workspace.read --repository nix-config --workspace-id "$WORKSPACE" \
@@ -172,10 +189,12 @@ HTTP endpoints:
 | Endpoint | Authentication | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | None | Process liveness and version; no readiness guarantee |
+| `GET /readyz` | None | Hub/storage readiness; an individual unavailable agent does not fail the Hub |
+| `GET /metrics` | Client token with `self:read` | Bounded Prometheus metrics for the permitted scope |
 | `GET /v1/operations` | Client token | Allowed operation catalog |
 | `GET /v1/openapi.json` | Client token | OpenAPI for the query API |
 | `POST /v1/execute` | Client token | `{"op":"host.facts","params":{"host":"example"}}` |
-| `POST /v1/alerts` | Separate ingress token | Forward an Alertmanager v4 webhook |
+| `POST /v1/alerts` | Separate ingress token | Persist host events and forward the Alertmanager v4 envelope |
 | Agent `GET /v1/snapshot` | Agent token | Collect current permitted host observations |
 | Agent `POST /v1/unit` | Agent token | Detailed properties for one allowlisted service |
 | Agent `POST /v1/logs` | Agent token | Bounded log query with explicit host and unit |
@@ -248,12 +267,18 @@ services.maxops-hub = {
     executionTokenFile = "/run/secrets/example-agent-execution";
     readableUnits = [ "nginx.service" ];
     manageableUnits = [ "nginx.service" ];
+    diagnosticProfile = "diagnostic";
+    diagnosticProbes.service-check = [
+      "${pkgs.systemd}/bin/systemctl"
+      "is-failed"
+      "nginx.service"
+    ];
   }];
   clients = [{
     name = "operator";
     tokenFile = "/run/secrets/maxops-operator";
     hosts = [ "example" ];
-    capabilities = [ "fleet:read" "host:read" "units:read" ];
+    capabilities = [ "fleet:read" "host:read" "units:read" "events:read" "self:read" ];
   }];
   repositories = [{ name = "nix-config"; executorHost = "example"; }];
   deployments = [{
@@ -265,12 +290,19 @@ services.maxops-hub = {
   }];
   prometheusUrl = "http://127.0.0.1:9009";
   alertmanagerUrl = "http://127.0.0.1:9093";
+  eventSinks = [{
+    id = "automation";
+    url = "http://127.0.0.1:8080/events";
+    tokenFile = "/run/secrets/maxops-event-sink";
+    hosts = [ "example" ];
+  }];
 };
 ```
 
 Add a separate client with `access = "manage"` and the `units:manage`, `exec:run`,
 `jobs:read`, `jobs:cancel`, `workspace:read`, `workspace:write`,
-`workspace:publish`, `deploy:manage` and `changes:read`
+`workspace:publish`, `deploy:manage`, `changes:read`, `diagnostics:collect` and
+`remediations:manage`
 capabilities needed by that client. Grant its exact `repositories` and
 `deployments` as well.
 Observation clients remain read-only. A unit must appear in the Hub, Agent and
@@ -294,8 +326,9 @@ notifications. In particular:
   proxy. An explicit listen address is not a substitute for network ACLs.
 - Enabling logs gives the agent process the `systemd-journal` group. Its API
   limits output, but a compromised process could read other journal files.
-- Notifications are synchronous and may be delivered more than once. Preserve
-  an independent Alertmanager receiver so a stopped hub cannot silence alerts.
+- The legacy notification receiver is synchronous. Durable event subscriptions
+  are at least once and ordered per subscription. Preserve an independent
+  Alertmanager receiver so a stopped hub cannot silence alerts.
 - `alerts.active` includes only alerts whose `labels.instance` exactly matches
   an allowed inventory host. Fleet-wide and unlabelled alerts are omitted.
 - Prometheus must expose node-exporter series as `up{job="node",instance="<host>"}`.

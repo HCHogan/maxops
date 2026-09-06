@@ -90,13 +90,43 @@ Alert ingress accepts the Alertmanager v4 envelope and forwards it to one generi
 webhook. It uses a separate optional sink token and never forwards the ingress
 Authorization header. There is no chat-specific behavior and no LLM in delivery.
 
-The hub returns success only after the sink returns 2xx. A timeout, connection
-failure or non-2xx yields 503 so Alertmanager can retry. A crash after delivery
-but before acknowledgement can cause duplicates. There is no durable queue or
-exactly-once promise; downstream receivers must tolerate duplicate alerts.
-Keep a basic direct Alertmanager receiver independent of the hub. A future
-queue/sink abstraction should be justified by delivery needs, not added before
-the first real receiver exists.
+The original synchronous receiver still returns success only after its sink
+returns 2xx. A timeout, connection failure or non-2xx yields 503 so Alertmanager
+can retry. In parallel, alerts whose `instance` is an exact inventory host are
+written to SQLite before forwarding. An Alertmanager fingerprint plus source
+and host identifies an active episode; repeated firing notifications reuse it,
+resolution closes it, and a later firing creates a new episode.
+
+Each generic event subscription has a durable cursor. Delivery intent is saved
+before HTTP and a receiver outage leaves it queued for retry. HTTP 202 without a
+body means accepted, while another successful response means confirmed; an
+explicit `queued`, `accepted` or `confirmed` response is retained. Advancing a
+cursor and its acknowledgement is one SQLite transaction. Delivery is at least
+once, so receivers deduplicate by immutable event ID. Keep a basic direct
+Alertmanager receiver independent of the hub.
+
+## Diagnostics and remediation coordination
+
+`diagnostics.collect` is a Hub-owned durable job. It records the current agent
+snapshot, bounded unit logs and only named argv probes declared for that host.
+Probe commands run through the existing hardened executor profile under stable
+child job IDs, so restart recovery queries the same target jobs. Evidence is
+marked as fact, hypothesis or missing; rule results carry stable IDs and cite
+their evidence. The bundle and a `diagnostic_collected` event retain the parent
+episode when collection starts from an event.
+
+`remediations.begin` atomically claims one attempt for an episode and host.
+SQLite permits one active remediation per episode and per host, then applies the
+configured attempt count and cooldown. `remediations.finish` uses revision CAS,
+can link the verified job or change, and emits a result event. This is
+coordination for arbitrary clients; maxops does not embed an LLM or depend on a
+bot database.
+
+`/readyz` checks the Hub's durable store while treating individual agents as
+independent components. `self.status` and authenticated `/metrics` expose fixed
+queue, terminal-duration, reconciliation, delivery, remediation, database,
+filesystem and agent/executor heartbeat fields. Metric labels are limited to
+configured host names and contain no job IDs, command text or credentials.
 
 ## Durable command jobs
 

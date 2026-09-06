@@ -1584,10 +1584,12 @@ name = "maxops-hub"
 version = "0.2.1"
 dependencies = [
  "axum",
+ "blake3",
  "clap",
  "color-eyre",
  "futures",
  "http-body-util",
+ "jiff",
  "maxops-proto",
  "maxops-store",
  "reqwest",
@@ -1628,6 +1630,7 @@ dependencies = [
  "criterion",
  "jiff",
  "maxops-proto",
+ "rustix",
  "serde_json",
  "sqlx",
  "tempfile",

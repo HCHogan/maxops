@@ -10,6 +10,7 @@ blake3.workspace = true
 color-eyre.workspace = true
 jiff.workspace = true
 maxops-proto.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

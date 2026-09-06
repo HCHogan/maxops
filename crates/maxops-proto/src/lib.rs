@@ -175,6 +175,8 @@ operations! {
     UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one explicitly readable service";
     UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
     AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
+    EventsList(EventsListParams) -> EventsListResponse, "events.list", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Replay durable fleet events after a scoped cursor";
+    SelfStatus(Empty) -> serde_json::Value, "self.status", "self:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Hub readiness, component state and bounded queue counters";
     ExecRun(ExecRunParams) -> JobHandle, "exec.run", "exec:run", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run a bounded command using a configured target profile";
     UnitsStart(UnitActionParams) -> JobHandle, "units.start", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Start one explicitly manageable systemd service";
     UnitsStop(UnitActionParams) -> JobHandle, "units.stop", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Stop one explicitly manageable systemd service";
@@ -199,6 +201,9 @@ operations! {
     DeployRollback(DeployChangeParams) -> JobHandle, "deploy.rollback", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Conditionally restore the plan baseline only while this change still owns runtime state";
     ChangesStatus(ChangeStatusParams) -> ChangeRecord, "changes.status", "changes:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a durable change plan and reconcile its current stage job";
     ChangesHistory(ChangeHistoryParams) -> ChangeHistoryResponse, "changes.history", "changes:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "List durable changes owned by the authenticated principal";
+    DiagnosticsCollect(DiagnosticCollectParams) -> JobHandle, "diagnostics.collect", "diagnostics:collect", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Collect bounded target evidence and configured probes into a durable bundle";
+    RemediationsBegin(RemediationBeginParams) -> JobHandle, "remediations.begin", "remediations:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Claim one budgeted remediation attempt for an event episode";
+    RemediationsFinish(RemediationFinishParams) -> RemediationRecord, "remediations.finish", "remediations:manage", OperationKind::JobControl, false, IdempotencyRequirement::None, "Record a remediation outcome and related job or change";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -268,7 +273,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 33);
+        assert_eq!(operations.len(), 38);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only

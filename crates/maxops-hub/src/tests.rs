@@ -26,6 +26,8 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         execution_token_file: None,
                         readable_units: BTreeSet::from(["demo.service".into()]),
                         manageable_units: BTreeSet::new(),
+                        diagnostic_profile: None,
+                        diagnostic_probes: BTreeMap::new(),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                     execution_token: None,
@@ -42,6 +44,8 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         execution_token_file: None,
                         readable_units: BTreeSet::new(),
                         manageable_units: BTreeSet::new(),
+                        diagnostic_profile: None,
+                        diagnostic_probes: BTreeMap::new(),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                     execution_token: None,
@@ -61,10 +65,20 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
         prometheus_url: None,
         alertmanager_url: None,
         alert_ingress: None,
+        event_sinks: Vec::new(),
+        remediation_policy: RemediationPolicyConfig::default(),
         slots: Semaphore::new(16),
         store: None,
         repositories: BTreeMap::new(),
         deployments: BTreeMap::new(),
+        started_at: now(),
+        agent_heartbeats: Mutex::new(BTreeMap::new()),
+        executor_heartbeats: Mutex::new(BTreeMap::new()),
+        local_workers: Mutex::new(HashSet::new()),
+        requests_total: AtomicU64::new(0),
+        events_ingested_total: AtomicU64::new(0),
+        delivery_attempts_total: AtomicU64::new(0),
+        delivery_failures_total: AtomicU64::new(0),
     }
 }
 
@@ -367,6 +381,8 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
                     execution_token_file: None,
                     readable_units: BTreeSet::new(),
                     manageable_units: BTreeSet::from(["demo.service".into()]),
+                    diagnostic_profile: None,
+                    diagnostic_probes: BTreeMap::new(),
                 },
                 token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                 execution_token: Some(Token::parse(EXECUTION_TOKEN.into()).unwrap()),
@@ -390,10 +406,20 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
         prometheus_url: None,
         alertmanager_url: None,
         alert_ingress: None,
+        event_sinks: Vec::new(),
+        remediation_policy: RemediationPolicyConfig::default(),
         slots: Semaphore::new(16),
         store: Some(Store::open(state_file).await.unwrap()),
         repositories: BTreeMap::new(),
         deployments: BTreeMap::new(),
+        started_at: now(),
+        agent_heartbeats: Mutex::new(BTreeMap::new()),
+        executor_heartbeats: Mutex::new(BTreeMap::new()),
+        local_workers: Mutex::new(HashSet::new()),
+        requests_total: AtomicU64::new(0),
+        events_ingested_total: AtomicU64::new(0),
+        delivery_attempts_total: AtomicU64::new(0),
+        delivery_failures_total: AtomicU64::new(0),
     }
 }
 
@@ -1310,6 +1336,322 @@ fn openapi_contains_all_registry_operations() {
         assert!(schema.contains(op.name), "missing {} in {}", op.name, value);
     }
     assert!(value["components"]["securitySchemes"]["bearer"].is_object());
+}
+
+#[tokio::test]
+async fn alert_events_keep_episode_identity_and_are_replayable() {
+    let (sink_url, sink_task) = stub(Router::new().route(
+        "/hook",
+        post(|| async { (StatusCode::OK, Json(json!({"accepted":true}))) }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("hub.db")).await.unwrap();
+    let mut state = app("http://127.0.0.1:1", &["events:read", "self:read"]);
+    state.store = Some(store);
+    state.alert_ingress = Some(AlertIngress {
+        token: Token::parse(ALERT_TOKEN.into()).unwrap(),
+        sink_url: format!("{sink_url}/hook"),
+        sink_token: None,
+    });
+    let router = router(Arc::new(state));
+    let mut payload = json!({
+        "version":"4",
+        "status":"firing",
+        "alerts":[{
+            "status":"firing",
+            "fingerprint":"same-alert",
+            "startsAt":now(),
+            "labels":{"instance":"alpha","alertname":"FixtureDown"}
+        }]
+    });
+    for _ in 0..2 {
+        assert_eq!(
+            call(
+                router.clone(),
+                "/v1/alerts",
+                Some(ALERT_TOKEN),
+                payload.clone()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    payload["status"] = json!("resolved");
+    payload["alerts"][0]["status"] = json!("resolved");
+    payload["alerts"][0]["endsAt"] = json!(now());
+    assert_eq!(
+        call(
+            router.clone(),
+            "/v1/alerts",
+            Some(ALERT_TOKEN),
+            payload.clone()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    payload["status"] = json!("firing");
+    payload["alerts"][0]["status"] = json!("firing");
+    assert_eq!(
+        call(router.clone(), "/v1/alerts", Some(ALERT_TOKEN), payload)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, events) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"events.list","params":{}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = events["events"].as_array().unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0]["episode_id"], events[1]["episode_id"]);
+    assert_eq!(events[1]["episode_id"], events[2]["episode_id"]);
+    assert_ne!(events[2]["episode_id"], events[3]["episode_id"]);
+    assert_eq!(events[2]["kind"], "alert_resolved");
+    assert_eq!(events[3]["kind"], "alert_firing");
+    assert_eq!(get_json(router, "/readyz", None).await.0, StatusCode::OK);
+    sink_task.abort();
+}
+
+#[tokio::test]
+async fn event_delivery_retries_and_preserves_http_202_as_accepted() {
+    let attempts = StdArc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let (sink_url, sink_task) = stub(Router::new().route(
+        "/events",
+        post(move |Json(_event): Json<Value>| {
+            let handler_attempts = handler_attempts.clone();
+            async move {
+                if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"retry":true})))
+                } else {
+                    (StatusCode::ACCEPTED, Json(json!({"received":true})))
+                }
+            }
+        }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("hub.db")).await.unwrap();
+    store
+        .ensure_subscription("automation", &json!({}), &json!({}), None)
+        .await
+        .unwrap();
+    let event = store
+        .ingest_alert(AlertEventInput {
+            source: "alertmanager".into(),
+            fingerprint: "delivery".into(),
+            host: "alpha".into(),
+            firing: true,
+            occurred_at: now(),
+            payload: json!({"status":"firing"}),
+        })
+        .await
+        .unwrap();
+    let mut state = app("http://127.0.0.1:1", &[]);
+    state.store = Some(store.clone());
+    state.event_sinks.push(EventSink {
+        config: EventSinkConfig {
+            id: "automation".into(),
+            url: format!("{sink_url}/events"),
+            token_file: None,
+            hosts: BTreeSet::new(),
+            kinds: BTreeSet::new(),
+            retry_seconds: 1,
+        },
+        token: None,
+    });
+    let state = Arc::new(state);
+    spawn_event_delivery(state.clone());
+    for _ in 0..40 {
+        if store
+            .subscription_cursor("automation")
+            .await
+            .unwrap()
+            .cursor
+            == event.sequence
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        store
+            .subscription_cursor("automation")
+            .await
+            .unwrap()
+            .cursor,
+        event.sequence
+    );
+    let delivery = store
+        .delivery_record("automation", event.sequence)
+        .await
+        .unwrap();
+    assert_eq!(delivery.stage, DeliveryStage::Accepted);
+    assert_eq!(delivery.attempts, 2);
+    assert_eq!(state.delivery_attempts_total.load(Ordering::Relaxed), 2);
+    sink_task.abort();
+}
+
+#[tokio::test]
+async fn diagnostics_and_remediation_form_a_scoped_budgeted_flow() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_store = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, target_task) = stub(
+        Router::new()
+            .route("/v1/manage", post(successful_executor))
+            .route("/v1/snapshot", get(|| async { Json(snapshot("alpha")) }))
+            .route(
+                "/v1/logs",
+                post(|| async {
+                    Json(json!({"host":"alpha","observed_at":now(),"entries":[{"message":"fixture failure"}]}))
+                }),
+            )
+            .with_state(target_store),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let mut state = management_app(&url, &hub_directory.path().join("hub.db")).await;
+    state.clients[0].capabilities.extend([
+        "diagnostics:collect".into(),
+        "remediations:manage".into(),
+        "events:read".into(),
+        "self:read".into(),
+    ]);
+    state.hosts.get_mut("alpha").unwrap().config.readable_units =
+        BTreeSet::from(["demo.service".into()]);
+    state
+        .hosts
+        .get_mut("alpha")
+        .unwrap()
+        .config
+        .diagnostic_profile = Some("diagnostic".into());
+    state
+        .hosts
+        .get_mut("alpha")
+        .unwrap()
+        .config
+        .diagnostic_probes = BTreeMap::from([("identity".into(), vec!["/bin/true".into()])]);
+    state.remediation_policy = RemediationPolicyConfig {
+        max_attempts_per_episode: 1,
+        cooldown_seconds: 0,
+    };
+    let store = state.store.as_ref().unwrap().clone();
+    let alert = store
+        .ingest_alert(AlertEventInput {
+            source: "alertmanager".into(),
+            fingerprint: "diagnose".into(),
+            host: "alpha".into(),
+            firing: true,
+            occurred_at: now(),
+            payload: json!({"status":"firing"}),
+        })
+        .await
+        .unwrap();
+    let router = router(Arc::new(state));
+    let (status, submitted) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("diagnostic-flow"),
+        json!({"op":"diagnostics.collect","params":{
+            "host":"alpha","event_id":alert.event_id,"unit":"demo.service","probes":["identity"]
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let diagnostic_id = JobId::parse(submitted["job_id"].as_str().unwrap()).unwrap();
+    let diagnostic = loop {
+        let job = store.get_job(&diagnostic_id).await.unwrap();
+        if job.handle.state.is_terminal() {
+            break job;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(diagnostic.handle.state, JobState::Succeeded);
+    assert_eq!(
+        diagnostic.result.as_ref().unwrap()["diagnostic"]["host"],
+        "alpha"
+    );
+    assert_eq!(
+        diagnostic.result.as_ref().unwrap()["diagnostic"]["rules"][0]["conclusion"],
+        "selected unit is failed"
+    );
+    let (_, events) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"events.list","params":{"kinds":["diagnostic_collected"]}}),
+    )
+    .await;
+    assert_eq!(
+        events["events"][0]["episode_id"],
+        alert.episode_id.to_string()
+    );
+
+    let (status, claim) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("remediation-1"),
+        json!({"op":"remediations.begin","params":{"event_id":alert.event_id,"host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let claim_id = JobId::parse(claim["job_id"].as_str().unwrap()).unwrap();
+    let claim = loop {
+        let job = store.get_job(&claim_id).await.unwrap();
+        if job.handle.state.is_terminal() {
+            break job;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(claim.handle.state, JobState::Succeeded);
+    let remediation = &claim.result.as_ref().unwrap()["remediation"];
+    let remediation_id = remediation["remediation_id"].as_str().unwrap();
+    let (status, finished) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"remediations.finish","params":{
+            "remediation_id":remediation_id,"expected_revision":1,"outcome":"succeeded",
+            "related_job_id":diagnostic_id,"summary":"evidence collected and repair verified"
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(finished["state"], "succeeded");
+
+    let (_, second) = call_with_idempotency(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("remediation-2"),
+        json!({"op":"remediations.begin","params":{"event_id":alert.event_id,"host":"alpha"}}),
+    )
+    .await;
+    let second_id = JobId::parse(second["job_id"].as_str().unwrap()).unwrap();
+    let second = loop {
+        let job = store.get_job(&second_id).await.unwrap();
+        if job.handle.state.is_terminal() {
+            break job;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(second.handle.state, JobState::Failed);
+    assert_eq!(
+        second.result.unwrap()["error"],
+        "remediation_budget_exhausted"
+    );
+    target_task.abort();
 }
 
 #[tokio::test]

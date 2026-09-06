@@ -8,8 +8,10 @@ license.workspace = true
 [dependencies]
 color-eyre.workspace = true
 axum.workspace = true
+blake3.workspace = true
 clap.workspace = true
 futures.workspace = true
+jiff.workspace = true
 maxops-proto.workspace = true
 maxops-store.workspace = true
 reqwest.workspace = true

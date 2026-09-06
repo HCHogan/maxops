@@ -1,30 +1,39 @@
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Response, StatusCode, header},
     routing::{get, post},
 };
 use futures::future::join_all;
 use maxops_proto::{
-    ChangeHistoryResponse, ChangeId, ChangePlan, ChangeRecord, ChangeState, DeployChangeParams,
-    DeployPrepareParams, DeploymentAction, DeploymentArtifact, DeploymentJobSpec, DeploymentKind,
-    DeploymentReport, DeploymentReportStatus, ExecutorRequest, ExecutorResponse,
-    IdempotencyRequirement, JobCancelParams, JobId, JobIdParams, JobRecord, JobState,
-    JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, RepositoryHeadRequest,
-    RepositoryHeadResponse, Request, RuntimeBaseline, RuntimeStateRequest, RuntimeStateResponse,
-    Snapshot, SourceBaseline, UnitActionParams, WorkspaceStatusParams, WorkspaceTargetRequest,
-    WorkspaceTargetResponse, now, operations,
+    ChangeHistoryResponse, ChangeId, ChangePlan, ChangeRecord, ChangeState, CommandSpec,
+    DeliveryStage, DeployChangeParams, DeployPrepareParams, DeploymentAction, DeploymentArtifact,
+    DeploymentJobSpec, DeploymentKind, DeploymentReport, DeploymentReportStatus, DiagnosticBundle,
+    DiagnosticCollectParams, DiagnosticEvidence, DiagnosticRuleResult, EpisodeId, EventKind,
+    EvidenceAssessment, ExecRunParams, ExecutorRequest, ExecutorResponse, IdempotencyRequirement,
+    JobCancelParams, JobId, JobIdParams, JobLogsParams, JobRecord, JobState, JobsListResponse,
+    LogParams, NewJob, OperationKind, PROTOCOL_VERSION, RemediationBeginParams,
+    RepositoryHeadRequest, RepositoryHeadResponse, Request, RuntimeBaseline, RuntimeStateRequest,
+    RuntimeStateResponse, Snapshot, SourceBaseline, UnitActionParams, WorkspaceStatusParams,
+    WorkspaceTargetRequest, WorkspaceTargetResponse, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
-use maxops_store::{ChangeTransition, Store};
+use maxops_store::{
+    AlertEventInput, ChangeTransition, NewFleetEvent, RemediationCompletion, Store,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 use tokio::sync::Semaphore;
 use utoipa::OpenApi;
@@ -75,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     alert_ingress: Option<AlertIngressConfig>,
     #[serde(default)]
+    event_sinks: Vec<EventSinkConfig>,
+    #[serde(default)]
+    remediation_policy: RemediationPolicyConfig,
+    #[serde(default)]
     state_file: Option<PathBuf>,
 }
 
@@ -92,6 +105,10 @@ struct HostConfig {
     readable_units: BTreeSet<String>,
     #[serde(default)]
     manageable_units: BTreeSet<String>,
+    #[serde(default)]
+    diagnostic_profile: Option<String>,
+    #[serde(default)]
+    diagnostic_probes: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +167,41 @@ struct AlertIngressConfig {
     sink_token_file: Option<PathBuf>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventSinkConfig {
+    id: String,
+    url: String,
+    #[serde(default)]
+    token_file: Option<PathBuf>,
+    #[serde(default)]
+    hosts: BTreeSet<String>,
+    #[serde(default)]
+    kinds: BTreeSet<EventKind>,
+    #[serde(default = "default_delivery_retry")]
+    retry_seconds: u32,
+}
+
+fn default_delivery_retry() -> u32 {
+    5
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RemediationPolicyConfig {
+    max_attempts_per_episode: u16,
+    cooldown_seconds: u32,
+}
+
+impl Default for RemediationPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts_per_episode: 2,
+            cooldown_seconds: 300,
+        }
+    }
+}
+
 struct Host {
     config: HostConfig,
     token: Token,
@@ -169,6 +221,10 @@ struct AlertIngress {
     sink_url: String,
     sink_token: Option<Token>,
 }
+struct EventSink {
+    config: EventSinkConfig,
+    token: Option<Token>,
+}
 struct App {
     hosts: BTreeMap<String, Host>,
     clients: Vec<Principal>,
@@ -176,10 +232,20 @@ struct App {
     prometheus_url: Option<String>,
     alertmanager_url: Option<String>,
     alert_ingress: Option<AlertIngress>,
+    event_sinks: Vec<EventSink>,
+    remediation_policy: RemediationPolicyConfig,
     slots: Semaphore,
     store: Option<Store>,
     repositories: BTreeMap<String, String>,
     deployments: BTreeMap<String, DeploymentConfig>,
+    started_at: jiff::Timestamp,
+    agent_heartbeats: Mutex<BTreeMap<String, jiff::Timestamp>>,
+    executor_heartbeats: Mutex<BTreeMap<String, jiff::Timestamp>>,
+    local_workers: Mutex<HashSet<JobId>>,
+    requests_total: AtomicU64,
+    events_ingested_total: AtomicU64,
+    delivery_attempts_total: AtomicU64,
+    delivery_failures_total: AtomicU64,
 }
 
 pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
@@ -202,6 +268,20 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
                 .iter()
                 .all(|unit| valid_unit(unit) && host.readable_units.contains(unit)),
             "manageable services must be valid readable service names"
+        );
+        color_eyre::eyre::ensure!(
+            host.diagnostic_probes.is_empty() || host.diagnostic_profile.is_some(),
+            "diagnostic probes require an execution profile"
+        );
+        color_eyre::eyre::ensure!(
+            host.diagnostic_probes.iter().all(|(name, argv)| {
+                maxops_proto::valid_check_id(name)
+                    && !argv.is_empty()
+                    && argv.len() <= 256
+                    && argv.first().is_some_and(|program| program.starts_with('/'))
+                    && argv.iter().all(|argument| argument.len() <= 8192)
+            }),
+            "invalid diagnostic probe"
         );
         transport::validate_url(&host.agent_url)?;
         let token = Token::read(&host.agent_token_file)?;
@@ -384,22 +464,6 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         !management_enabled || config.state_file.is_some(),
         "management clients require a durable hub state_file"
     );
-    if management_enabled {
-        for principal in clients
-            .iter()
-            .filter(|client| client.access == Access::Manage)
-        {
-            color_eyre::eyre::ensure!(
-                principal.hosts.iter().all(|name| {
-                    hosts
-                        .get(name)
-                        .and_then(|host| host.execution_token.as_ref())
-                        .is_some()
-                }),
-                "management client references a host without execution credentials"
-            );
-        }
-    }
     let store = match config.state_file.as_deref() {
         Some(path) => Some(Store::open(path).await?),
         None => None,
@@ -446,6 +510,72 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             })
         })
         .transpose()?;
+    color_eyre::eyre::ensure!(
+        config.event_sinks.is_empty() || store.is_some(),
+        "event sinks require durable hub storage"
+    );
+    color_eyre::eyre::ensure!(
+        config.remediation_policy.max_attempts_per_episode > 0,
+        "remediation attempt budget must be positive"
+    );
+    let mut event_sinks = Vec::new();
+    for sink in config.event_sinks {
+        color_eyre::eyre::ensure!(
+            !sink.id.is_empty()
+                && sink.id.len() <= 128
+                && sink.retry_seconds > 0
+                && sink.hosts.iter().all(|host| hosts.contains_key(host)),
+            "invalid event sink"
+        );
+        transport::validate_url(&sink.url)?;
+        let token = sink.token_file.as_deref().map(Token::read).transpose()?;
+        if let Some(token) = &token {
+            color_eyre::eyre::ensure!(
+                !clients.iter().any(|client| client.token.same_as(token))
+                    && !hosts.values().any(|host| {
+                        host.token.same_as(token)
+                            || host
+                                .execution_token
+                                .as_ref()
+                                .is_some_and(|execution| execution.same_as(token))
+                    })
+                    && !event_sinks.iter().any(|other: &EventSink| {
+                        other
+                            .token
+                            .as_ref()
+                            .is_some_and(|existing| existing.same_as(token))
+                    })
+                    && !alert_ingress.as_ref().is_some_and(|ingress| {
+                        ingress.token.same_as(token)
+                            || ingress
+                                .sink_token
+                                .as_ref()
+                                .is_some_and(|existing| existing.same_as(token))
+                    }),
+                "event sink requires a dedicated token"
+            );
+        }
+        color_eyre::eyre::ensure!(
+            !event_sinks
+                .iter()
+                .any(|other: &EventSink| other.config.id == sink.id),
+            "duplicate event sink"
+        );
+        if let Some(store) = &store {
+            store
+                .ensure_subscription(
+                    &sink.id,
+                    &json!({"hosts":sink.hosts,"kinds":sink.kinds}),
+                    &json!({"url":sink.url}),
+                    sink.token_file.as_ref().map(|_| sink.id.as_str()),
+                )
+                .await?;
+        }
+        event_sinks.push(EventSink {
+            config: sink,
+            token,
+        });
+    }
     let app = Arc::new(App {
         hosts,
         clients,
@@ -453,15 +583,32 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         prometheus_url: config.prometheus_url,
         alertmanager_url: config.alertmanager_url,
         alert_ingress,
+        event_sinks,
+        remediation_policy: config.remediation_policy,
         slots: Semaphore::new(16),
         store,
         repositories,
         deployments,
+        started_at: now(),
+        agent_heartbeats: Mutex::new(BTreeMap::new()),
+        executor_heartbeats: Mutex::new(BTreeMap::new()),
+        local_workers: Mutex::new(HashSet::new()),
+        requests_total: AtomicU64::new(0),
+        events_ingested_total: AtomicU64::new(0),
+        delivery_attempts_total: AtomicU64::new(0),
+        delivery_failures_total: AtomicU64::new(0),
     });
     if let Some(store) = &app.store {
         for job in store.nonterminal_jobs().await? {
-            spawn_dispatch(app.clone(), job.handle.job_id);
+            match job.handle.operation.as_str() {
+                "diagnostics.collect" => spawn_diagnostics(app.clone(), job),
+                "remediations.begin" => spawn_remediation_begin(app.clone(), job),
+                _ => spawn_dispatch(app.clone(), job.handle.job_id),
+            }
         }
+    }
+    if !app.event_sinks.is_empty() {
+        spawn_event_delivery(app.clone());
     }
     Ok((config.listen, router(app)))
 }
@@ -469,6 +616,8 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
 fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(transport::health))
+        .route("/readyz", get(readiness))
+        .route("/metrics", get(self_metrics))
         .route("/v1/operations", get(catalog))
         .route("/v1/openapi.json", get(openapi))
         .route(
@@ -478,6 +627,126 @@ fn router(app: Arc<App>) -> Router {
         .route("/v1/alerts", post(alerts))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app)
+}
+
+async fn readiness(State(app): State<Arc<App>>) -> (StatusCode, Json<Value>) {
+    let storage = match &app.store {
+        Some(store) => match store.stats().await {
+            Ok(_) => "ready",
+            Err(_) => "unavailable",
+        },
+        None => "disabled",
+    };
+    let ready = storage != "unavailable";
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "ready": ready,
+            "components": {
+                "storage": storage,
+                "agents": "independent",
+            }
+        })),
+    )
+}
+
+async fn self_metrics(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let principal = authenticate(&app, &headers)?;
+    if !principal.capabilities.contains("self:read") {
+        return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
+    }
+    let stats = match &app.store {
+        Some(store) => Some(store.stats().await.map_err(map_store_error)?),
+        None => None,
+    };
+    let mut body = format!(
+        concat!(
+            "# TYPE maxops_requests_total counter\n",
+            "maxops_requests_total {}\n",
+            "# TYPE maxops_events_ingested_total counter\n",
+            "maxops_events_ingested_total {}\n",
+            "# TYPE maxops_event_delivery_attempts_total counter\n",
+            "maxops_event_delivery_attempts_total {}\n",
+            "# TYPE maxops_event_delivery_failures_total counter\n",
+            "maxops_event_delivery_failures_total {}\n",
+            "# TYPE maxops_jobs_nonterminal gauge\n",
+            "maxops_jobs_nonterminal {}\n",
+            "# TYPE maxops_jobs_queued gauge\n",
+            "maxops_jobs_queued {}\n",
+            "# TYPE maxops_jobs_outcome_unknown gauge\n",
+            "maxops_jobs_outcome_unknown {}\n",
+            "# TYPE maxops_jobs_completed_total counter\n",
+            "maxops_jobs_completed_total {}\n",
+            "# TYPE maxops_job_duration_seconds_sum counter\n",
+            "maxops_job_duration_seconds_sum {}\n",
+            "# TYPE maxops_reconciliations_total counter\n",
+            "maxops_reconciliations_total {}\n",
+            "# TYPE maxops_event_deliveries_pending gauge\n",
+            "maxops_event_deliveries_pending {}\n",
+            "# TYPE maxops_remediations_active gauge\n",
+            "maxops_remediations_active {}\n",
+            "# TYPE maxops_store_database_bytes gauge\n",
+            "maxops_store_database_bytes {}\n",
+            "# TYPE maxops_store_available_bytes gauge\n",
+            "maxops_store_available_bytes {}\n",
+        ),
+        app.requests_total.load(Ordering::Relaxed),
+        app.events_ingested_total.load(Ordering::Relaxed),
+        app.delivery_attempts_total.load(Ordering::Relaxed),
+        app.delivery_failures_total.load(Ordering::Relaxed),
+        stats.as_ref().map_or(0, |stats| stats.jobs_nonterminal),
+        stats.as_ref().map_or(0, |stats| stats.jobs_queued),
+        stats.as_ref().map_or(0, |stats| stats.jobs_outcome_unknown),
+        stats.as_ref().map_or(0, |stats| stats.jobs_completed_total),
+        stats
+            .as_ref()
+            .map_or(0.0, |stats| stats.job_duration_seconds_sum),
+        stats
+            .as_ref()
+            .map_or(0, |stats| stats.reconciliations_total),
+        stats.as_ref().map_or(0, |stats| stats.deliveries_pending),
+        stats.as_ref().map_or(0, |stats| stats.remediations_active),
+        stats.as_ref().map_or(0, |stats| stats.database_size_bytes),
+        stats
+            .as_ref()
+            .map_or(0, |stats| stats.storage_available_bytes),
+    );
+    body.push_str("# TYPE maxops_agent_heartbeat_age_seconds gauge\n");
+    body.push_str("# TYPE maxops_executor_heartbeat_age_seconds gauge\n");
+    let agent_heartbeats = app
+        .agent_heartbeats
+        .lock()
+        .expect("agent heartbeat lock poisoned");
+    let executor_heartbeats = app
+        .executor_heartbeats
+        .lock()
+        .expect("executor heartbeat lock poisoned");
+    for host in &principal.hosts {
+        let agent_age = agent_heartbeats
+            .get(host)
+            .map(|at| now().as_second().saturating_sub(at.as_second()))
+            .unwrap_or(-1);
+        let executor_age = executor_heartbeats
+            .get(host)
+            .map(|at| now().as_second().saturating_sub(at.as_second()))
+            .unwrap_or(-1);
+        body.push_str(&format!(
+            "maxops_agent_heartbeat_age_seconds{{host=\"{host}\"}} {agent_age}\n\
+             maxops_executor_heartbeat_age_seconds{{host=\"{host}\"}} {executor_age}\n"
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
 fn authenticate<'a>(app: &'a App, headers: &HeaderMap) -> Result<&'a Principal, ApiError> {
@@ -655,6 +924,10 @@ async fn observe(app: &App, host: &Host) -> color_eyre::eyre::Result<Snapshot> {
     snapshot
         .units
         .retain(|unit| host.config.readable_units.contains(&unit.unit));
+    app.agent_heartbeats
+        .lock()
+        .expect("agent heartbeat lock poisoned")
+        .insert(host.config.name.clone(), snapshot.observed_at);
     Ok(snapshot)
 }
 
@@ -912,6 +1185,85 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             }).collect::<Vec<_>>()}),
             )
         }
+        Request::EventsList(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            if let Some(host) = &params.host {
+                host_for(app, principal, host)?;
+            }
+            let events = durable_store(app)?
+                .list_events(&principal.hosts, &params)
+                .await
+                .map_err(map_store_error)?;
+            serde_json::to_value(events)
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "event encoding failed"))
+        }
+        Request::SelfStatus(_) => {
+            let stats = match &app.store {
+                Some(store) => Some(store.stats().await.map_err(map_store_error)?),
+                None => None,
+            };
+            let agent_heartbeats = app
+                .agent_heartbeats
+                .lock()
+                .expect("agent heartbeat lock poisoned");
+            let executor_heartbeats = app
+                .executor_heartbeats
+                .lock()
+                .expect("executor heartbeat lock poisoned");
+            let agents: BTreeMap<_, _> = principal
+                .hosts
+                .iter()
+                .map(|host| {
+                    let observed_at = agent_heartbeats.get(host).copied();
+                    let state = observed_at
+                        .filter(|at| now().as_second() - at.as_second() <= 90)
+                        .map_or("unobserved", |_| "observed");
+                    (
+                        host.clone(),
+                        json!({"state":state,"observed_at":observed_at}),
+                    )
+                })
+                .collect();
+            let executors: BTreeMap<_, _> = principal
+                .hosts
+                .iter()
+                .map(|host| {
+                    let observed_at = executor_heartbeats.get(host).copied();
+                    let state = observed_at
+                        .filter(|at| now().as_second() - at.as_second() <= 90)
+                        .map_or("unobserved", |_| "observed");
+                    (
+                        host.clone(),
+                        json!({"state":state,"observed_at":observed_at}),
+                    )
+                })
+                .collect();
+            Ok(json!({
+                "started_at": app.started_at,
+                "storage": if app.store.is_some() { "ready" } else { "disabled" },
+                "agents": agents,
+                "executors": executors,
+                "counters": {
+                    "requests_total": app.requests_total.load(Ordering::Relaxed),
+                    "events_ingested_total": app.events_ingested_total.load(Ordering::Relaxed),
+                    "event_delivery_attempts_total": app.delivery_attempts_total.load(Ordering::Relaxed),
+                    "event_delivery_failures_total": app.delivery_failures_total.load(Ordering::Relaxed),
+                    "jobs_nonterminal": stats.as_ref().map_or(0, |value| value.jobs_nonterminal),
+                    "jobs_queued": stats.as_ref().map_or(0, |value| value.jobs_queued),
+                    "jobs_outcome_unknown": stats.as_ref().map_or(0, |value| value.jobs_outcome_unknown),
+                    "jobs_completed_total": stats.as_ref().map_or(0, |value| value.jobs_completed_total),
+                    "job_duration_seconds_sum": stats.as_ref().map_or(0.0, |value| value.job_duration_seconds_sum),
+                    "reconciliations_total": stats.as_ref().map_or(0, |value| value.reconciliations_total),
+                    "events_total": stats.as_ref().map_or(0, |value| value.events_total),
+                    "deliveries_pending": stats.as_ref().map_or(0, |value| value.deliveries_pending),
+                    "remediations_active": stats.as_ref().map_or(0, |value| value.remediations_active),
+                    "database_size_bytes": stats.as_ref().map_or(0, |value| value.database_size_bytes),
+                    "storage_available_bytes": stats.as_ref().map_or(0, |value| value.storage_available_bytes),
+                }
+            }))
+        }
         Request::ExecRun(_)
         | Request::UnitsStart(_)
         | Request::UnitsStop(_)
@@ -935,7 +1287,10 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         | Request::DeployVerify(_)
         | Request::DeployRollback(_)
         | Request::ChangesStatus(_)
-        | Request::ChangesHistory(_) => Err(ApiError(
+        | Request::ChangesHistory(_)
+        | Request::DiagnosticsCollect(_)
+        | Request::RemediationsBegin(_)
+        | Request::RemediationsFinish(_) => Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job operation routed as observation",
         )),
@@ -968,7 +1323,15 @@ fn durable_store(app: &App) -> Result<&Store, ApiError> {
 
 fn map_store_error(error: color_eyre::eyre::Report) -> ApiError {
     let message = error.to_string();
-    if message.contains("idempotency key") || message.contains("revision changed") {
+    if message.contains("event cursor expired") {
+        ApiError(StatusCode::GONE, "event cursor expired")
+    } else if message.contains("remediation already active")
+        || message.contains("remediation attempt budget exhausted")
+        || message.contains("remediation cooldown active")
+        || message.contains("remediation is terminal")
+    {
+        ApiError(StatusCode::CONFLICT, "remediation policy conflict")
+    } else if message.contains("idempotency key") || message.contains("revision changed") {
         ApiError(
             StatusCode::CONFLICT,
             "job request conflicts with current state",
@@ -977,6 +1340,10 @@ fn map_store_error(error: color_eyre::eyre::Report) -> ApiError {
         ApiError(StatusCode::NOT_FOUND, "change not found")
     } else if message.contains("workspace not found") {
         ApiError(StatusCode::NOT_FOUND, "workspace not found")
+    } else if message.contains("event not found") {
+        ApiError(StatusCode::NOT_FOUND, "event not found")
+    } else if message.contains("remediation not found") {
+        ApiError(StatusCode::NOT_FOUND, "remediation not found")
     } else if message.contains("not found") {
         ApiError(StatusCode::NOT_FOUND, "job not found")
     } else {
@@ -1264,6 +1631,142 @@ async fn run_job_operation(
             Ok((
                 StatusCode::OK,
                 serde_json::to_value(record).expect("serializable workspace"),
+            ))
+        }
+        Request::DiagnosticsCollect(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let host = host_for(app, principal, &params.host)?;
+            if let Some(unit) = &params.unit {
+                unit_allowed(host, unit)?;
+            }
+            if params
+                .probes
+                .iter()
+                .any(|probe| !host.config.diagnostic_probes.contains_key(probe))
+            {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "diagnostic probe not permitted",
+                ));
+            }
+            if !params.probes.is_empty() && host.execution_token.is_none() {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host execution disabled",
+                ));
+            }
+            if let Some(event_id) = &params.event_id {
+                store
+                    .event_for_host(event_id, &params.host)
+                    .await
+                    .map_err(map_store_error)?;
+            }
+            let key = idempotency_key(headers)?;
+            let deadline = now()
+                .checked_add(Duration::from_secs(300))
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?;
+            let job = NewJob {
+                principal: principal.name.clone(),
+                host: params.host.clone(),
+                operation: "diagnostics.collect".into(),
+                spec_version: 1,
+                spec: serde_json::to_value(params).expect("serializable diagnostic request"),
+                policy_version: "hub-config-v1".into(),
+                deadline: Some(deadline),
+            };
+            let submitted = store.submit_job(key, &job).await.map_err(map_store_error)?;
+            if submitted.created || submitted.job.handle.state == JobState::Queued {
+                spawn_diagnostics(app.clone(), submitted.job.clone());
+            }
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+            ))
+        }
+        Request::RemediationsBegin(params) => {
+            let host = host_for(app, principal, &params.host)?;
+            if host.execution_token.is_none() {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "host execution disabled",
+                ));
+            }
+            store
+                .event_for_host(&params.event_id, &params.host)
+                .await
+                .map_err(map_store_error)?;
+            let key = idempotency_key(headers)?;
+            let deadline = now()
+                .checked_add(Duration::from_secs(60))
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?;
+            let job = NewJob {
+                principal: principal.name.clone(),
+                host: params.host.clone(),
+                operation: "remediations.begin".into(),
+                spec_version: 1,
+                spec: serde_json::to_value(params).expect("serializable remediation claim"),
+                policy_version: "hub-config-v1".into(),
+                deadline: Some(deadline),
+            };
+            let submitted = store.submit_job(key, &job).await.map_err(map_store_error)?;
+            if submitted.created || submitted.job.handle.state == JobState::Queued {
+                spawn_remediation_begin(app.clone(), submitted.job.clone());
+            }
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+            ))
+        }
+        Request::RemediationsFinish(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let remediation = store
+                .get_remediation(&params.remediation_id, &principal.name)
+                .await
+                .map_err(map_store_error)?;
+            host_for(app, principal, &remediation.host)?;
+            if let Some(job_id) = &params.related_job_id {
+                let related = store
+                    .get_owned_job(&principal.name, job_id)
+                    .await
+                    .map_err(map_store_error)?;
+                if related.handle.host != remediation.host {
+                    return Err(ApiError(StatusCode::FORBIDDEN, "related job not permitted"));
+                }
+            }
+            if let Some(change_id) = &params.related_change_id {
+                let related = store
+                    .get_owned_change(&principal.name, change_id)
+                    .await
+                    .map_err(map_store_error)?;
+                if related.plan.target_host != remediation.host {
+                    return Err(ApiError(
+                        StatusCode::FORBIDDEN,
+                        "related change not permitted",
+                    ));
+                }
+            }
+            let updated = store
+                .finish_remediation(
+                    &params.remediation_id,
+                    &principal.name,
+                    RemediationCompletion {
+                        expected_revision: params.expected_revision,
+                        outcome: params.outcome,
+                        related_job_id: params.related_job_id.as_ref(),
+                        related_change_id: params.related_change_id.as_ref(),
+                        summary: &params.summary,
+                    },
+                )
+                .await
+                .map_err(map_store_error)?;
+            app.events_ingested_total.fetch_add(1, Ordering::Relaxed);
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(updated).expect("serializable remediation"),
             ))
         }
         Request::JobsList(params) => {
@@ -2093,7 +2596,7 @@ async fn agent_request(
         .execution_token
         .as_ref()
         .ok_or_else(|| color_eyre::eyre::eyre!("execution disabled"))?;
-    transport::read_json(
+    let response = transport::read_json(
         token
             .apply(app.client.post(format!(
                 "{}/v1/manage",
@@ -2101,7 +2604,12 @@ async fn agent_request(
             )))
             .json(request),
     )
-    .await
+    .await?;
+    app.executor_heartbeats
+        .lock()
+        .expect("executor heartbeat lock poisoned")
+        .insert(host_name.to_owned(), now());
+    Ok(response)
 }
 
 async fn project_target_job(
@@ -2158,6 +2666,421 @@ fn spawn_dispatch(app: Arc<App>, id: JobId) {
             tracing::warn!(job_id = %id, %error, "job dispatch or reconciliation stopped");
         }
     });
+}
+
+fn spawn_diagnostics(app: Arc<App>, job: JobRecord) {
+    let id = job.handle.job_id.clone();
+    if !app
+        .local_workers
+        .lock()
+        .expect("local worker lock poisoned")
+        .insert(id.clone())
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = run_diagnostics(app.clone(), job).await {
+            fail_local_job(&app, &id, "diagnostic_failed").await;
+            tracing::warn!(job_id = %id, %error, "diagnostic collection failed");
+        }
+        app.local_workers
+            .lock()
+            .expect("local worker lock poisoned")
+            .remove(&id);
+    });
+}
+
+fn spawn_remediation_begin(app: Arc<App>, job: JobRecord) {
+    let id = job.handle.job_id.clone();
+    if !app
+        .local_workers
+        .lock()
+        .expect("local worker lock poisoned")
+        .insert(id.clone())
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = run_remediation_begin(app.clone(), job).await {
+            let code = if error.to_string().contains("attempt budget") {
+                "remediation_budget_exhausted"
+            } else if error.to_string().contains("cooldown") {
+                "remediation_cooldown_active"
+            } else if error.to_string().contains("already active") {
+                "remediation_already_active"
+            } else {
+                "remediation_claim_failed"
+            };
+            fail_local_job(&app, &id, code).await;
+            tracing::warn!(job_id = %id, %error, "remediation claim failed");
+        }
+        app.local_workers
+            .lock()
+            .expect("local worker lock poisoned")
+            .remove(&id);
+    });
+}
+
+async fn enter_local_job(store: &Store, mut job: JobRecord) -> color_eyre::eyre::Result<JobRecord> {
+    if job.handle.state == JobState::Queued {
+        job = store
+            .transition_job(
+                &job.handle.job_id,
+                job.handle.revision,
+                JobState::Dispatching,
+                &json!({"executor":"hub"}),
+                None,
+            )
+            .await?;
+    }
+    if job.handle.state == JobState::Dispatching {
+        job = store
+            .transition_job(
+                &job.handle.job_id,
+                job.handle.revision,
+                JobState::Running,
+                &json!({"executor":"hub"}),
+                None,
+            )
+            .await?;
+    }
+    color_eyre::eyre::ensure!(
+        job.handle.state == JobState::Running,
+        "local job is not runnable"
+    );
+    Ok(job)
+}
+
+async fn fail_local_job(app: &App, id: &JobId, code: &'static str) {
+    let Some(store) = &app.store else {
+        return;
+    };
+    let Ok(job) = store.get_job(id).await else {
+        return;
+    };
+    if !job.handle.state.is_terminal() && job.handle.state.can_transition_to(JobState::Failed) {
+        let _ = store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::Failed,
+                &json!({"code":code}),
+                Some(&json!({"error":code})),
+            )
+            .await;
+    }
+}
+
+fn stable_child_job_id(parent: &JobId, key: &str) -> JobId {
+    let digest = blake3::hash(format!("{}\0{key}", parent.as_str()).as_bytes())
+        .to_hex()
+        .to_string();
+    JobId::parse(format!(
+        "{}-{}-{}-{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32]
+    ))
+    .expect("digest produces a valid job ID")
+}
+
+async fn diagnostic_probe(
+    app: &App,
+    parent: &JobRecord,
+    probe: &str,
+    argv: &[String],
+    profile: &str,
+) -> DiagnosticEvidence {
+    let child_id = stable_child_job_id(&parent.handle.job_id, probe);
+    let child = NewJob {
+        principal: parent.principal.clone(),
+        host: parent.handle.host.clone(),
+        operation: "exec.run".into(),
+        spec_version: 1,
+        spec: serde_json::to_value(ExecRunParams {
+            host: parent.handle.host.clone(),
+            profile: profile.to_owned(),
+            command: CommandSpec::Argv(argv.to_vec()),
+            cwd: None,
+            env: BTreeMap::new(),
+            credential_refs: Vec::new(),
+            timeout_seconds: Some(60),
+        })
+        .expect("serializable diagnostic probe"),
+        policy_version: "hub-config-v1:diagnostic".into(),
+        deadline: parent.deadline,
+    };
+    let mut response = agent_request(
+        app,
+        &parent.handle.host,
+        &ExecutorRequest::Submit {
+            job_id: child_id.clone(),
+            job: child,
+        },
+    )
+    .await;
+    for _ in 0..600 {
+        if response
+            .as_ref()
+            .ok()
+            .and_then(|response| match response {
+                ExecutorResponse::Job(job) => Some(job.handle.state.is_terminal()),
+                _ => None,
+            })
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        response = agent_request(
+            app,
+            &parent.handle.host,
+            &ExecutorRequest::Status(JobIdParams {
+                job_id: child_id.clone(),
+            }),
+        )
+        .await;
+    }
+    let Ok(ExecutorResponse::Job(job)) = response else {
+        return DiagnosticEvidence {
+            evidence_id: format!("probe:{probe}"),
+            source: "configured_probe".into(),
+            assessment: EvidenceAssessment::Missing,
+            value: json!({"reason":"executor_unavailable"}),
+        };
+    };
+    if !job.handle.state.is_terminal() {
+        return DiagnosticEvidence {
+            evidence_id: format!("probe:{probe}"),
+            source: "configured_probe".into(),
+            assessment: EvidenceAssessment::Missing,
+            value: json!({"reason":"probe_timeout","job_id":child_id}),
+        };
+    }
+    let logs = agent_request(
+        app,
+        &parent.handle.host,
+        &ExecutorRequest::Logs(JobLogsParams {
+            job_id: child_id.clone(),
+            stdout_offset: 0,
+            stderr_offset: 0,
+            limit: 64 * 1024,
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|response| match response {
+        ExecutorResponse::Logs(logs) => Some(logs),
+        _ => None,
+    });
+    DiagnosticEvidence {
+        evidence_id: format!("probe:{probe}"),
+        source: "configured_probe".into(),
+        assessment: EvidenceAssessment::Fact,
+        value: json!({
+            "job_id": child_id,
+            "state": job.handle.state,
+            "result": job.result,
+            "output": logs,
+        }),
+    }
+}
+
+async fn run_diagnostics(app: Arc<App>, job: JobRecord) -> color_eyre::eyre::Result<()> {
+    color_eyre::eyre::ensure!(dispatch_authorized(&app, &job), "authorization removed");
+    let store = app
+        .store
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
+    let job = enter_local_job(store, job).await?;
+    let params: DiagnosticCollectParams = serde_json::from_value(job.spec.clone())?;
+    let host = app
+        .hosts
+        .get(&params.host)
+        .ok_or_else(|| color_eyre::eyre::eyre!("host missing"))?;
+    color_eyre::eyre::ensure!(
+        params
+            .probes
+            .iter()
+            .all(|probe| host.config.diagnostic_probes.contains_key(probe)),
+        "diagnostic probe authorization removed"
+    );
+    let mut evidence = Vec::new();
+    let mut selected_unit_state = None;
+    match observe(&app, host).await {
+        Ok(snapshot) => {
+            if let Some(unit) = &params.unit {
+                selected_unit_state = snapshot
+                    .units
+                    .iter()
+                    .find(|candidate| &candidate.unit == unit)
+                    .map(|candidate| candidate.active_state.clone());
+            }
+            evidence.push(DiagnosticEvidence {
+                evidence_id: "snapshot".into(),
+                source: "agent.snapshot".into(),
+                assessment: EvidenceAssessment::Fact,
+                value: serde_json::to_value(snapshot)?,
+            });
+        }
+        Err(_) => evidence.push(DiagnosticEvidence {
+            evidence_id: "snapshot".into(),
+            source: "agent.snapshot".into(),
+            assessment: EvidenceAssessment::Missing,
+            value: json!({"reason":"agent_unavailable"}),
+        }),
+    }
+    if let Some(unit) = &params.unit {
+        let logs = transport::read_json::<Value>(
+            host.token
+                .apply(app.client.post(format!(
+                    "{}/v1/logs",
+                    host.config.agent_url.trim_end_matches('/')
+                )))
+                .json(&LogParams {
+                    host: params.host.clone(),
+                    unit: unit.clone(),
+                    lines: params.lines,
+                    since_seconds: params.since_seconds,
+                }),
+        )
+        .await;
+        evidence.push(match logs {
+            Ok(value) => DiagnosticEvidence {
+                evidence_id: "unit_logs".into(),
+                source: "agent.journal".into(),
+                assessment: EvidenceAssessment::Fact,
+                value,
+            },
+            Err(_) => DiagnosticEvidence {
+                evidence_id: "unit_logs".into(),
+                source: "agent.journal".into(),
+                assessment: EvidenceAssessment::Missing,
+                value: json!({"reason":"logs_unavailable"}),
+            },
+        });
+    }
+    if !params.probes.is_empty() {
+        let profile = host
+            .config
+            .diagnostic_profile
+            .as_deref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("diagnostic profile missing"))?;
+        for probe in &params.probes {
+            evidence.push(
+                diagnostic_probe(
+                    &app,
+                    &job,
+                    probe,
+                    &host.config.diagnostic_probes[probe],
+                    profile,
+                )
+                .await,
+            );
+        }
+    }
+    let mut rules = Vec::new();
+    if let Some(state) = selected_unit_state {
+        rules.push(DiagnosticRuleResult {
+            rule_id: "systemd.unit-state".into(),
+            confidence: "high".into(),
+            evidence_ids: vec!["snapshot".into()],
+            conclusion: if state == "failed" {
+                "selected unit is failed".into()
+            } else {
+                format!("selected unit active_state is {state}")
+            },
+        });
+    } else if params.unit.is_some() {
+        rules.push(DiagnosticRuleResult {
+            rule_id: "systemd.unit-state".into(),
+            confidence: "unknown".into(),
+            evidence_ids: vec!["snapshot".into()],
+            conclusion: "selected unit state is unavailable".into(),
+        });
+    }
+    let bundle = DiagnosticBundle {
+        artifact_id: stable_child_job_id(&job.handle.job_id, "diagnostic-artifact").to_string(),
+        host: params.host.clone(),
+        unit: params.unit.clone(),
+        collected_at: now(),
+        evidence,
+        rules,
+    };
+    if store
+        .event_for_job_kind(&job.handle.job_id, EventKind::DiagnosticCollected)
+        .await?
+        .is_none()
+    {
+        let (episode_id, fingerprint) = match &params.event_id {
+            Some(event_id) => {
+                let event = store.event_for_host(event_id, &params.host).await?;
+                (event.episode_id, event.fingerprint)
+            }
+            None => (
+                EpisodeId::parse(uuid::Uuid::now_v7().to_string())
+                    .map_err(|message| color_eyre::eyre::eyre!(message))?,
+                format!("diagnostic:{}", job.handle.job_id),
+            ),
+        };
+        store
+            .append_fleet_event(NewFleetEvent {
+                source: "maxops.diagnostics".into(),
+                fingerprint,
+                episode_id,
+                kind: EventKind::DiagnosticCollected,
+                host: params.host,
+                occurred_at: bundle.collected_at,
+                related_job_id: Some(job.handle.job_id.clone()),
+                related_change_id: None,
+                payload: serde_json::to_value(&bundle)?,
+            })
+            .await?;
+        app.events_ingested_total.fetch_add(1, Ordering::Relaxed);
+    }
+    store
+        .transition_job(
+            &job.handle.job_id,
+            job.handle.revision,
+            JobState::Succeeded,
+            &json!({"artifact_id":bundle.artifact_id}),
+            Some(&json!({"diagnostic":bundle})),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn run_remediation_begin(app: Arc<App>, job: JobRecord) -> color_eyre::eyre::Result<()> {
+    color_eyre::eyre::ensure!(dispatch_authorized(&app, &job), "authorization removed");
+    let store = app
+        .store
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
+    let job = enter_local_job(store, job).await?;
+    let params: RemediationBeginParams = serde_json::from_value(job.spec.clone())?;
+    let remediation = store
+        .begin_remediation(
+            &params.event_id,
+            &params.host,
+            &job.principal,
+            &job.handle.job_id,
+            app.remediation_policy.max_attempts_per_episode,
+            app.remediation_policy.cooldown_seconds,
+        )
+        .await?;
+    app.events_ingested_total.fetch_add(1, Ordering::Relaxed);
+    store
+        .transition_job(
+            &job.handle.job_id,
+            job.handle.revision,
+            JobState::Succeeded,
+            &json!({"remediation_id":remediation.remediation_id}),
+            Some(&json!({"remediation":remediation})),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn dispatch(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()> {
@@ -2299,7 +3222,7 @@ fn dispatch_authorized(app: &App, job: &JobRecord) -> bool {
         let target_still_allowed = if job.handle.operation.starts_with("units.") {
             serde_json::from_value::<UnitActionParams>(job.spec.clone())
                 .ok()
-                .and_then(|params| app.hosts.get(&job.handle.host).map(|host| (params, host)))
+                .zip(app.hosts.get(&job.handle.host))
                 .is_some_and(|(params, host)| host.config.manageable_units.contains(&params.unit))
         } else {
             true
@@ -2384,6 +3307,7 @@ async fn execute(
     headers: HeaderMap,
     Json(request): Json<Request>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    app.requests_total.fetch_add(1, Ordering::Relaxed);
     let principal = authenticate(&app, &headers)?;
     if !principal.capabilities.contains(request.capability()) {
         return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
@@ -2421,6 +3345,143 @@ async fn execute(
     result.map(|(status, value)| (status, Json(value)))
 }
 
+fn spawn_event_delivery(app: Arc<App>) {
+    tokio::spawn(async move {
+        loop {
+            for sink in &app.event_sinks {
+                if let Err(error) = deliver_next_event(&app, sink).await {
+                    app.delivery_failures_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(subscription = %sink.config.id, %error, "event delivery failed");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
+async fn deliver_next_event(app: &App, sink: &EventSink) -> color_eyre::eyre::Result<()> {
+    let store = app
+        .store
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
+    let cursor = store.subscription_cursor(&sink.config.id).await?;
+    let Some(event) = store.next_event(cursor.cursor).await? else {
+        return Ok(());
+    };
+    let host_matches = sink.config.hosts.is_empty() || sink.config.hosts.contains(&event.host);
+    let kind_matches = sink.config.kinds.is_empty() || sink.config.kinds.contains(&event.kind);
+    if !host_matches || !kind_matches {
+        store
+            .skip_subscription_event(&sink.config.id, event.sequence)
+            .await?;
+        return Ok(());
+    }
+    if store
+        .begin_delivery(&sink.config.id, event.sequence, sink.config.retry_seconds)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    app.delivery_attempts_total.fetch_add(1, Ordering::Relaxed);
+    let mut request = app.client.post(&sink.config.url).json(&event);
+    if let Some(token) = &sink.token {
+        request = token.apply(request);
+    }
+    let mut response = request.send().await?;
+    let status = response.status();
+    color_eyre::eyre::ensure!(status.is_success(), "event sink rejected delivery");
+    let mut response_body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        color_eyre::eyre::ensure!(
+            response_body.len() + chunk.len() <= 4096,
+            "event sink response too large"
+        );
+        response_body.extend_from_slice(&chunk);
+    }
+    let explicit_stage = serde_json::from_slice::<Value>(&response_body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("stage")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .and_then(|stage| DeliveryStage::parse(&stage).ok());
+    let stage = explicit_stage.unwrap_or_else(|| {
+        if status == StatusCode::ACCEPTED {
+            DeliveryStage::Accepted
+        } else {
+            DeliveryStage::Confirmed
+        }
+    });
+    if stage != DeliveryStage::Queued {
+        store
+            .acknowledge_delivery(
+                &sink.config.id,
+                event.sequence,
+                stage,
+                Some(status.as_u16()),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn alert_time(alert: &Value, firing: bool) -> jiff::Timestamp {
+    let field = if firing { "startsAt" } else { "endsAt" };
+    alert
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+        .unwrap_or_else(now)
+}
+
+async fn persist_alert_events(app: &App, payload: &Value) -> Result<usize, ApiError> {
+    let Some(store) = &app.store else {
+        return Ok(0);
+    };
+    let envelope_firing = payload["status"] == "firing";
+    let alerts = payload["alerts"].as_array().ok_or(ApiError(
+        StatusCode::BAD_REQUEST,
+        "expected Alertmanager webhook v4",
+    ))?;
+    let mut persisted = 0;
+    for alert in alerts {
+        let Some(host) = alert["labels"]["instance"].as_str() else {
+            continue;
+        };
+        if !app.hosts.contains_key(host) {
+            continue;
+        }
+        let firing = alert["status"]
+            .as_str()
+            .map_or(envelope_firing, |status| status == "firing");
+        let supplied = alert["fingerprint"].as_str().unwrap_or_default();
+        let fingerprint = if supplied.is_empty() || supplied.len() > 512 {
+            blake3::hash(alert.to_string().as_bytes())
+                .to_hex()
+                .to_string()
+        } else {
+            supplied.to_owned()
+        };
+        store
+            .ingest_alert(AlertEventInput {
+                source: "alertmanager".into(),
+                fingerprint,
+                host: host.to_owned(),
+                firing,
+                occurred_at: alert_time(alert, firing),
+                payload: alert.clone(),
+            })
+            .await
+            .map_err(map_store_error)?;
+        persisted += 1;
+        app.events_ingested_total.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(persisted)
+}
+
 async fn alerts(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
@@ -2448,15 +3509,18 @@ async fn alerts(
             "hub busy; retry notification",
         )
     })?;
+    let persisted = persist_alert_events(&app, &payload).await?;
     let request = app.client.post(&ingress.sink_url).json(&payload);
     let request = match &ingress.sink_token {
         Some(token) => token.apply(request),
         None => request,
     };
     match request.send().await {
-        Ok(response) if response.status().is_success() => Ok(Json(
-            json!({"accepted": true, "stage": "sink_acknowledged"}),
-        )),
+        Ok(response) if response.status().is_success() => Ok(Json(json!({
+            "accepted": true,
+            "stage": "sink_acknowledged",
+            "events_persisted": persisted,
+        }))),
         _ => Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "notification not acknowledged; retry",

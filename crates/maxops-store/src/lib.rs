@@ -5,17 +5,24 @@
 
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_proto::{
-    ChangeId, ChangeJobs, ChangePlan, ChangeRecord, ChangeState, DeploymentArtifact, JobEvent,
-    JobEventKind, JobHandle, JobId, JobRecord, JobState, NewJob, ResourceObservation, WorkspaceId,
-    WorkspaceRecord, WorkspaceState,
+    ChangeId, ChangeJobs, ChangePlan, ChangeRecord, ChangeState, DeliveryStage, DeploymentArtifact,
+    EpisodeId, EventId, EventKind, EventRecord, EventsListParams, EventsListResponse, JobEvent,
+    JobEventKind, JobHandle, JobId, JobRecord, JobState, NewJob, RemediationId, RemediationRecord,
+    RemediationState, ResourceObservation, WorkspaceId, WorkspaceRecord, WorkspaceState,
 };
 use serde_json::Value;
 use sqlx::{
-    Row, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqlitePool,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::Mutex;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
@@ -25,6 +32,7 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub struct Store {
     pool: SqlitePool,
     writer: Arc<Mutex<()>>,
+    path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -40,6 +48,62 @@ pub struct ChangeTransition<'a> {
     pub artifact: Option<&'a DeploymentArtifact>,
     pub jobs: &'a ChangeJobs,
     pub recovery_state: Option<&'a str>,
+}
+
+pub struct AlertEventInput {
+    pub source: String,
+    pub fingerprint: String,
+    pub host: String,
+    pub firing: bool,
+    pub occurred_at: jiff::Timestamp,
+    pub payload: Value,
+}
+
+pub struct NewFleetEvent {
+    pub source: String,
+    pub fingerprint: String,
+    pub episode_id: EpisodeId,
+    pub kind: EventKind,
+    pub host: String,
+    pub occurred_at: jiff::Timestamp,
+    pub related_job_id: Option<JobId>,
+    pub related_change_id: Option<ChangeId>,
+    pub payload: Value,
+}
+
+pub struct RemediationCompletion<'a> {
+    pub expected_revision: u64,
+    pub outcome: RemediationState,
+    pub related_job_id: Option<&'a JobId>,
+    pub related_change_id: Option<&'a ChangeId>,
+    pub summary: &'a str,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubscriptionCursor {
+    pub id: String,
+    pub cursor: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliveryRecord {
+    pub stage: DeliveryStage,
+    pub attempts: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoreStats {
+    pub jobs_queued: u64,
+    pub jobs_nonterminal: u64,
+    pub jobs_outcome_unknown: u64,
+    pub jobs_completed_total: u64,
+    pub job_duration_seconds_sum: f64,
+    pub reconciliations_total: u64,
+    pub events_total: u64,
+    pub deliveries_pending: u64,
+    pub remediations_active: u64,
+    pub database_size_bytes: u64,
+    pub storage_available_bytes: u64,
 }
 
 impl Store {
@@ -61,6 +125,7 @@ impl Store {
         Ok(Self {
             pool,
             writer: Arc::new(Mutex::new(())),
+            path: path.to_owned(),
         })
     }
 
@@ -898,6 +963,715 @@ impl Store {
         .transpose()
     }
 
+    pub async fn ingest_alert(&self, input: AlertEventInput) -> Result<EventRecord> {
+        validate_event_identity(&input.source, &input.fingerprint, &input.host)?;
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT episode_id, active FROM fleet_event_episodes
+             WHERE source = ? AND fingerprint = ? AND host = ?",
+        )
+        .bind(&input.source)
+        .bind(&input.fingerprint)
+        .bind(&input.host)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let episode_id = match existing.as_ref() {
+            Some(row) if input.firing && row.try_get::<i64, _>("active")? != 0 => {
+                EpisodeId::parse(row.try_get::<String, _>("episode_id")?)
+                    .map_err(|message| eyre!(message))?
+            }
+            Some(row) if !input.firing => EpisodeId::parse(row.try_get::<String, _>("episode_id")?)
+                .map_err(|message| eyre!(message))?,
+            _ => EpisodeId::parse(uuid::Uuid::now_v7().to_string())
+                .map_err(|message| eyre!(message))?,
+        };
+        let received_at = maxops_proto::now();
+        sqlx::query(
+            "INSERT INTO fleet_event_episodes
+             (source, fingerprint, host, episode_id, active, last_received_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source, fingerprint, host) DO UPDATE SET
+                 episode_id = excluded.episode_id,
+                 active = excluded.active,
+                 last_received_at = excluded.last_received_at",
+        )
+        .bind(&input.source)
+        .bind(&input.fingerprint)
+        .bind(&input.host)
+        .bind(episode_id.as_str())
+        .bind(i64::from(input.firing))
+        .bind(received_at.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let event_id =
+            EventId::parse(uuid::Uuid::now_v7().to_string()).map_err(|message| eyre!(message))?;
+        let kind = if input.firing {
+            EventKind::AlertFiring
+        } else {
+            EventKind::AlertResolved
+        };
+        insert_fleet_event(
+            &mut transaction,
+            &event_id,
+            &NewFleetEvent {
+                source: input.source,
+                fingerprint: input.fingerprint,
+                episode_id,
+                kind,
+                host: input.host,
+                occurred_at: input.occurred_at,
+                related_job_id: None,
+                related_change_id: None,
+                payload: input.payload,
+            },
+            received_at,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.get_event(&event_id).await
+    }
+
+    pub async fn append_fleet_event(&self, input: NewFleetEvent) -> Result<EventRecord> {
+        validate_event_identity(&input.source, &input.fingerprint, &input.host)?;
+        let event_id =
+            EventId::parse(uuid::Uuid::now_v7().to_string()).map_err(|message| eyre!(message))?;
+        let received_at = maxops_proto::now();
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        insert_fleet_event(&mut transaction, &event_id, &input, received_at).await?;
+        transaction.commit().await?;
+        self.get_event(&event_id).await
+    }
+
+    pub async fn get_event(&self, id: &EventId) -> Result<EventRecord> {
+        let row = sqlx::query(
+            "SELECT sequence, id, source, fingerprint, episode_id, kind, host,
+                    occurred_at, received_at, related_job_id, related_change_id, payload_json
+             FROM fleet_events WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| eyre!("event not found"))?;
+        row_to_event(&row)
+    }
+
+    pub async fn event_for_host(&self, id: &EventId, host: &str) -> Result<EventRecord> {
+        let event = self.get_event(id).await?;
+        ensure!(event.host == host, "event not found");
+        Ok(event)
+    }
+
+    pub async fn event_for_job_kind(
+        &self,
+        job_id: &JobId,
+        kind: EventKind,
+    ) -> Result<Option<EventRecord>> {
+        let row = sqlx::query(
+            "SELECT sequence, id, source, fingerprint, episode_id, kind, host,
+                    occurred_at, received_at, related_job_id, related_change_id, payload_json
+             FROM fleet_events WHERE related_job_id = ? AND kind = ?
+             ORDER BY sequence LIMIT 1",
+        )
+        .bind(job_id.as_str())
+        .bind(kind.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_event).transpose()
+    }
+
+    pub async fn list_events(
+        &self,
+        allowed_hosts: &BTreeSet<String>,
+        params: &EventsListParams,
+    ) -> Result<EventsListResponse> {
+        params.validate().map_err(|message| eyre!(message))?;
+        ensure!(!allowed_hosts.is_empty(), "event host scope is empty");
+        if let Some(host) = &params.host {
+            ensure!(allowed_hosts.contains(host), "host not permitted");
+        }
+        let hosts: Vec<&String> = params
+            .host
+            .as_ref()
+            .map(|host| vec![host])
+            .unwrap_or_else(|| allowed_hosts.iter().collect());
+
+        let mut minimum = QueryBuilder::<Sqlite>::new(
+            "SELECT MIN(sequence) AS sequence FROM fleet_events WHERE host IN (",
+        );
+        {
+            let mut separated = minimum.separated(", ");
+            for host in &hosts {
+                separated.push_bind(*host);
+            }
+        }
+        minimum.push(")");
+        let first: Option<i64> = minimum.build_query_scalar().fetch_one(&self.pool).await?;
+        let earliest_cursor = match first {
+            Some(sequence) => to_u64(sequence, "event sequence")?.saturating_sub(1),
+            None => {
+                let latest: Option<i64> = sqlx::query_scalar(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'fleet_events'",
+                )
+                .fetch_optional(&self.pool)
+                .await?;
+                latest
+                    .map(|sequence| to_u64(sequence, "event sequence"))
+                    .transpose()?
+                    .unwrap_or(0)
+            }
+        };
+        let cursor = params.cursor.unwrap_or(earliest_cursor);
+        ensure!(
+            params.cursor.is_none() || cursor >= earliest_cursor,
+            "event cursor expired; resync from {earliest_cursor}"
+        );
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT sequence, id, source, fingerprint, episode_id, kind, host,
+                    occurred_at, received_at, related_job_id, related_change_id, payload_json
+             FROM fleet_events WHERE sequence > ",
+        );
+        query.push_bind(to_i64(cursor, "event cursor")?);
+        query.push(" AND host IN (");
+        {
+            let mut separated = query.separated(", ");
+            for host in &hosts {
+                separated.push_bind(*host);
+            }
+        }
+        query.push(")");
+        if !params.kinds.is_empty() {
+            query.push(" AND kind IN (");
+            {
+                let mut separated = query.separated(", ");
+                for kind in &params.kinds {
+                    separated.push_bind(kind.as_str());
+                }
+            }
+            query.push(")");
+        }
+        query.push(" ORDER BY sequence LIMIT ");
+        query.push_bind(i64::from(params.limit));
+        let events: Vec<EventRecord> = query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_event)
+            .collect::<Result<_>>()?;
+        let next_cursor = if events.len() == usize::from(params.limit) {
+            events.last().map(|event| event.sequence).unwrap_or(cursor)
+        } else {
+            let mut maximum = QueryBuilder::<Sqlite>::new(
+                "SELECT MAX(sequence) FROM fleet_events WHERE host IN (",
+            );
+            {
+                let mut separated = maximum.separated(", ");
+                for host in &hosts {
+                    separated.push_bind(*host);
+                }
+            }
+            maximum.push(")");
+            let last: Option<i64> = maximum.build_query_scalar().fetch_one(&self.pool).await?;
+            last.map(|sequence| to_u64(sequence, "event sequence"))
+                .transpose()?
+                .unwrap_or(cursor)
+                .max(cursor)
+        };
+        Ok(EventsListResponse {
+            events,
+            next_cursor,
+            earliest_cursor,
+        })
+    }
+
+    pub async fn prune_events_through(&self, sequence: u64) -> Result<u64> {
+        let _writer = self.writer.lock().await;
+        let result = sqlx::query("DELETE FROM fleet_events WHERE sequence <= ?")
+            .bind(to_i64(sequence, "event sequence")?)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn ensure_subscription(
+        &self,
+        id: &str,
+        filter: &Value,
+        target: &Value,
+        credential_ref: Option<&str>,
+    ) -> Result<SubscriptionCursor> {
+        ensure!(!id.is_empty() && id.len() <= 128, "invalid subscription ID");
+        let _writer = self.writer.lock().await;
+        sqlx::query(
+            "INSERT INTO subscriptions
+             (id, principal, filter_json, target_json, credential_ref, cursor, created_at)
+             VALUES (?, 'system', ?, ?, ?, 0, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 filter_json = excluded.filter_json,
+                 target_json = excluded.target_json,
+                 credential_ref = excluded.credential_ref",
+        )
+        .bind(id)
+        .bind(serde_json::to_string(&canonical_json(filter))?)
+        .bind(serde_json::to_string(&canonical_json(target))?)
+        .bind(credential_ref)
+        .bind(maxops_proto::now().to_string())
+        .execute(&self.pool)
+        .await?;
+        self.subscription_cursor(id).await
+    }
+
+    pub async fn subscription_cursor(&self, id: &str) -> Result<SubscriptionCursor> {
+        let row = sqlx::query("SELECT id, cursor FROM subscriptions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| eyre!("subscription not found"))?;
+        Ok(SubscriptionCursor {
+            id: row.try_get("id")?,
+            cursor: to_u64(row.try_get("cursor")?, "subscription cursor")?,
+        })
+    }
+
+    pub async fn next_event(&self, after: u64) -> Result<Option<EventRecord>> {
+        let row = sqlx::query(
+            "SELECT sequence, id, source, fingerprint, episode_id, kind, host,
+                    occurred_at, received_at, related_job_id, related_change_id, payload_json
+             FROM fleet_events WHERE sequence > ? ORDER BY sequence LIMIT 1",
+        )
+        .bind(to_i64(after, "event cursor")?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_event).transpose()
+    }
+
+    pub async fn begin_delivery(
+        &self,
+        subscription_id: &str,
+        event_sequence: u64,
+        retry_after_seconds: u32,
+    ) -> Result<Option<DeliveryRecord>> {
+        let now = maxops_proto::now();
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(row) = sqlx::query(
+            "SELECT stage, attempts, retry_at FROM event_deliveries
+             WHERE subscription_id = ? AND event_sequence = ?",
+        )
+        .bind(subscription_id)
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let stage = DeliveryStage::parse(row.try_get::<&str, _>("stage")?)
+                .map_err(|message| eyre!(message))?;
+            if stage != DeliveryStage::Queued {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+            if row
+                .try_get::<Option<String>, _>("retry_at")?
+                .map(parse_timestamp)
+                .transpose()?
+                .is_some_and(|retry_at| retry_at > now)
+            {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+        }
+        let retry_at = now
+            .checked_add(Duration::from_secs(u64::from(retry_after_seconds)))
+            .map_err(|_| eyre!("delivery retry deadline overflow"))?;
+        sqlx::query(
+            "INSERT INTO event_deliveries
+             (subscription_id, event_sequence, stage, attempts, retry_at, updated_at)
+             VALUES (?, ?, 'queued', 1, ?, ?)
+             ON CONFLICT(subscription_id, event_sequence) DO UPDATE SET
+                 attempts = attempts + 1,
+                 retry_at = excluded.retry_at,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(subscription_id)
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .bind(retry_at.to_string())
+        .bind(now.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT attempts FROM event_deliveries
+             WHERE subscription_id = ? AND event_sequence = ?",
+        )
+        .bind(subscription_id)
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(DeliveryRecord {
+            stage: DeliveryStage::Queued,
+            attempts: u32::try_from(attempts).map_err(|_| eyre!("invalid delivery attempts"))?,
+        }))
+    }
+
+    pub async fn delivery_record(
+        &self,
+        subscription_id: &str,
+        event_sequence: u64,
+    ) -> Result<DeliveryRecord> {
+        let row = sqlx::query(
+            "SELECT stage, attempts FROM event_deliveries
+             WHERE subscription_id = ? AND event_sequence = ?",
+        )
+        .bind(subscription_id)
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| eyre!("delivery intent not found"))?;
+        Ok(DeliveryRecord {
+            stage: DeliveryStage::parse(row.try_get::<&str, _>("stage")?)
+                .map_err(|message| eyre!(message))?,
+            attempts: u32::try_from(row.try_get::<i64, _>("attempts")?)
+                .map_err(|_| eyre!("invalid delivery attempts"))?,
+        })
+    }
+
+    pub async fn acknowledge_delivery(
+        &self,
+        subscription_id: &str,
+        event_sequence: u64,
+        stage: DeliveryStage,
+        response_status: Option<u16>,
+    ) -> Result<()> {
+        ensure!(
+            stage != DeliveryStage::Queued,
+            "delivery acknowledgement is not final"
+        );
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE event_deliveries
+             SET stage = ?, retry_at = NULL, response_status = ?, updated_at = ?
+             WHERE subscription_id = ? AND event_sequence = ?",
+        )
+        .bind(stage.as_str())
+        .bind(response_status.map(i64::from))
+        .bind(maxops_proto::now().to_string())
+        .bind(subscription_id)
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .execute(&mut *transaction)
+        .await?;
+        ensure!(changed.rows_affected() == 1, "delivery intent not found");
+        sqlx::query(
+            "UPDATE subscriptions SET cursor = MAX(cursor, ?), acknowledged_at = ? WHERE id = ?",
+        )
+        .bind(to_i64(event_sequence, "event sequence")?)
+        .bind(maxops_proto::now().to_string())
+        .bind(subscription_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn skip_subscription_event(
+        &self,
+        subscription_id: &str,
+        event_sequence: u64,
+    ) -> Result<()> {
+        let _writer = self.writer.lock().await;
+        sqlx::query("UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE id = ?")
+            .bind(to_i64(event_sequence, "event sequence")?)
+            .bind(subscription_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn begin_remediation(
+        &self,
+        event_id: &EventId,
+        host: &str,
+        principal: &str,
+        related_job_id: &JobId,
+        max_attempts: u16,
+        cooldown_seconds: u32,
+    ) -> Result<RemediationRecord> {
+        ensure!(max_attempts > 0, "remediation attempts must be positive");
+        let remediation_id = RemediationId::parse(uuid::Uuid::now_v7().to_string())
+            .map_err(|message| eyre!(message))?;
+        let now = maxops_proto::now();
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(existing) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM remediations WHERE related_job_id = ? AND principal = ?",
+        )
+        .bind(related_job_id.as_str())
+        .bind(principal)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let existing = RemediationId::parse(existing).map_err(|message| eyre!(message))?;
+            transaction.commit().await?;
+            return self.get_remediation(&existing, principal).await;
+        }
+        let event =
+            sqlx::query("SELECT episode_id, fingerprint, host FROM fleet_events WHERE id = ?")
+                .bind(event_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| eyre!("event not found"))?;
+        ensure!(event.try_get::<&str, _>("host")? == host, "event not found");
+        let episode_id = EpisodeId::parse(event.try_get::<String, _>("episode_id")?)
+            .map_err(|message| eyre!(message))?;
+        let fingerprint: String = event.try_get("fingerprint")?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM remediations WHERE episode_id = ? AND state = 'active'",
+        )
+        .bind(episode_id.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        ensure!(active == 0, "remediation already active for this episode");
+        let host_active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM remediations WHERE host = ? AND state = 'active'",
+        )
+        .bind(host)
+        .fetch_one(&mut *transaction)
+        .await?;
+        ensure!(host_active == 0, "remediation already active for this host");
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM remediations WHERE episode_id = ?")
+                .bind(episode_id.as_str())
+                .fetch_one(&mut *transaction)
+                .await?;
+        ensure!(
+            attempts < i64::from(max_attempts),
+            "remediation attempt budget exhausted"
+        );
+        let last_started: Option<String> =
+            sqlx::query_scalar("SELECT MAX(started_at) FROM remediations WHERE episode_id = ?")
+                .bind(episode_id.as_str())
+                .fetch_one(&mut *transaction)
+                .await?;
+        if let Some(last_started) = last_started {
+            let last_started = parse_timestamp(last_started)?;
+            ensure!(
+                now.as_second() - last_started.as_second() >= i64::from(cooldown_seconds),
+                "remediation cooldown active"
+            );
+        }
+        let attempt = attempts + 1;
+        sqlx::query(
+            "INSERT INTO remediations
+             (id, event_id, episode_id, host, principal, attempt, revision, state, started_at,
+              related_job_id)
+             VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)",
+        )
+        .bind(remediation_id.as_str())
+        .bind(event_id.as_str())
+        .bind(episode_id.as_str())
+        .bind(host)
+        .bind(principal)
+        .bind(attempt)
+        .bind(now.to_string())
+        .bind(related_job_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        let lifecycle_event =
+            EventId::parse(uuid::Uuid::now_v7().to_string()).map_err(|message| eyre!(message))?;
+        insert_fleet_event(
+            &mut transaction,
+            &lifecycle_event,
+            &NewFleetEvent {
+                source: "maxops.remediation".into(),
+                fingerprint,
+                episode_id,
+                kind: EventKind::RemediationStarted,
+                host: host.to_owned(),
+                occurred_at: now,
+                related_job_id: Some(related_job_id.clone()),
+                related_change_id: None,
+                payload: serde_json::json!({
+                    "remediation_id": remediation_id,
+                    "attempt": attempt,
+                    "principal": principal,
+                }),
+            },
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.get_remediation(&remediation_id, principal).await
+    }
+
+    pub async fn finish_remediation(
+        &self,
+        id: &RemediationId,
+        principal: &str,
+        completion: RemediationCompletion<'_>,
+    ) -> Result<RemediationRecord> {
+        ensure!(
+            completion.outcome != RemediationState::Active,
+            "remediation outcome must be terminal"
+        );
+        ensure!(
+            !completion.summary.is_empty() && completion.summary.len() <= 1024,
+            "invalid remediation summary"
+        );
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT event_id, episode_id, host, revision, state FROM remediations
+             WHERE id = ? AND principal = ?",
+        )
+        .bind(id.as_str())
+        .bind(principal)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| eyre!("remediation not found"))?;
+        let revision = to_u64(row.try_get("revision")?, "remediation revision")?;
+        ensure!(
+            revision == completion.expected_revision,
+            "remediation revision changed"
+        );
+        ensure!(
+            row.try_get::<&str, _>("state")? == "active",
+            "remediation is terminal"
+        );
+        let event_id = EventId::parse(row.try_get::<String, _>("event_id")?)
+            .map_err(|message| eyre!(message))?;
+        let episode_id = EpisodeId::parse(row.try_get::<String, _>("episode_id")?)
+            .map_err(|message| eyre!(message))?;
+        let host: String = row.try_get("host")?;
+        let fingerprint: String =
+            sqlx::query_scalar("SELECT fingerprint FROM fleet_events WHERE id = ?")
+                .bind(event_id.as_str())
+                .fetch_one(&mut *transaction)
+                .await?;
+        let now = maxops_proto::now();
+        sqlx::query(
+            "UPDATE remediations SET state = ?, revision = revision + 1, finished_at = ?,
+                 related_job_id = ?, related_change_id = ?, summary = ?
+             WHERE id = ? AND principal = ? AND revision = ?",
+        )
+        .bind(completion.outcome.as_str())
+        .bind(now.to_string())
+        .bind(completion.related_job_id.map(JobId::as_str))
+        .bind(completion.related_change_id.map(ChangeId::as_str))
+        .bind(completion.summary)
+        .bind(id.as_str())
+        .bind(principal)
+        .bind(to_i64(
+            completion.expected_revision,
+            "remediation revision",
+        )?)
+        .execute(&mut *transaction)
+        .await?;
+        let lifecycle_event =
+            EventId::parse(uuid::Uuid::now_v7().to_string()).map_err(|message| eyre!(message))?;
+        insert_fleet_event(
+            &mut transaction,
+            &lifecycle_event,
+            &NewFleetEvent {
+                source: "maxops.remediation".into(),
+                fingerprint,
+                episode_id,
+                kind: EventKind::RemediationFinished,
+                host,
+                occurred_at: now,
+                related_job_id: completion.related_job_id.cloned(),
+                related_change_id: completion.related_change_id.cloned(),
+                payload: serde_json::json!({
+                    "remediation_id": id,
+                    "outcome": completion.outcome,
+                    "summary": completion.summary,
+                }),
+            },
+            now,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.get_remediation(id, principal).await
+    }
+
+    pub async fn get_remediation(
+        &self,
+        id: &RemediationId,
+        principal: &str,
+    ) -> Result<RemediationRecord> {
+        let row = sqlx::query(
+            "SELECT id, event_id, episode_id, host, principal, attempt, revision, state,
+                    started_at, finished_at, related_job_id, related_change_id, summary
+             FROM remediations WHERE id = ? AND principal = ?",
+        )
+        .bind(id.as_str())
+        .bind(principal)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| eyre!("remediation not found"))?;
+        row_to_remediation(&row)
+    }
+
+    pub async fn stats(&self) -> Result<StoreStats> {
+        let jobs_queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state = 'queued'")
+                .fetch_one(&self.pool)
+                .await?;
+        let jobs_nonterminal: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE state NOT IN
+             ('succeeded', 'failed', 'cancelled', 'timed_out', 'outcome_unknown')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let jobs_outcome_unknown: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state = 'outcome_unknown'")
+                .fetch_one(&self.pool)
+                .await?;
+        let (jobs_completed_total, job_duration_seconds_sum): (i64, f64) = sqlx::query_as(
+            "SELECT count(*), COALESCE(
+                SUM((julianday(updated_at) - julianday(created_at)) * 86400.0), 0.0
+             ) FROM jobs WHERE state IN
+             ('succeeded', 'failed', 'cancelled', 'timed_out', 'outcome_unknown')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let reconciliations_total: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM job_events WHERE kind = 'reconciled'")
+                .fetch_one(&self.pool)
+                .await?;
+        let events_total: i64 = sqlx::query_scalar("SELECT count(*) FROM fleet_events")
+            .fetch_one(&self.pool)
+            .await?;
+        let deliveries_pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM event_deliveries WHERE stage = 'queued'")
+                .fetch_one(&self.pool)
+                .await?;
+        let remediations_active: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM remediations WHERE state = 'active'")
+                .fetch_one(&self.pool)
+                .await?;
+        let filesystem = rustix::fs::statvfs(&self.path)?;
+        let fragment_size = if filesystem.f_frsize == 0 {
+            filesystem.f_bsize
+        } else {
+            filesystem.f_frsize
+        };
+        Ok(StoreStats {
+            jobs_queued: to_u64(jobs_queued, "job count")?,
+            jobs_nonterminal: to_u64(jobs_nonterminal, "job count")?,
+            jobs_outcome_unknown: to_u64(jobs_outcome_unknown, "job count")?,
+            jobs_completed_total: to_u64(jobs_completed_total, "job count")?,
+            job_duration_seconds_sum,
+            reconciliations_total: to_u64(reconciliations_total, "reconciliation count")?,
+            events_total: to_u64(events_total, "event count")?,
+            deliveries_pending: to_u64(deliveries_pending, "delivery count")?,
+            remediations_active: to_u64(remediations_active, "remediation count")?,
+            database_size_bytes: std::fs::metadata(&self.path)?.len(),
+            storage_available_bytes: filesystem.f_bavail.saturating_mul(fragment_size),
+        })
+    }
+
     /// Create a consistent standalone backup. The destination must not exist.
     pub async fn backup_to(&self, destination: &Path) -> Result<()> {
         ensure!(!destination.exists(), "backup destination already exists");
@@ -1068,6 +1842,109 @@ fn row_to_change(row: &sqlx::sqlite::SqliteRow) -> Result<ChangeRecord> {
         jobs: serde_json::from_str(row.try_get("jobs_json")?)?,
         recovery_state: row.try_get("recovery_state")?,
         updated_at: parse_timestamp(row.try_get("updated_at")?)?,
+    })
+}
+
+async fn insert_fleet_event(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    event_id: &EventId,
+    input: &NewFleetEvent,
+    received_at: jiff::Timestamp,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT INTO fleet_events
+         (id, source, fingerprint, episode_id, kind, host, occurred_at, received_at,
+          related_job_id, related_change_id, payload_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(event_id.as_str())
+    .bind(&input.source)
+    .bind(&input.fingerprint)
+    .bind(input.episode_id.as_str())
+    .bind(input.kind.as_str())
+    .bind(&input.host)
+    .bind(input.occurred_at.to_string())
+    .bind(received_at.to_string())
+    .bind(input.related_job_id.as_ref().map(JobId::as_str))
+    .bind(input.related_change_id.as_ref().map(ChangeId::as_str))
+    .bind(serde_json::to_string(&canonical_json(&input.payload))?)
+    .execute(&mut **transaction)
+    .await?;
+    to_u64(result.last_insert_rowid(), "event sequence")
+}
+
+fn validate_event_identity(source: &str, fingerprint: &str, host: &str) -> Result<()> {
+    ensure!(
+        !source.is_empty() && source.len() <= 128,
+        "invalid event source"
+    );
+    ensure!(
+        !fingerprint.is_empty() && fingerprint.len() <= 512,
+        "invalid event fingerprint"
+    );
+    ensure!(maxops_proto::valid_host(host), "invalid event host");
+    Ok(())
+}
+
+fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> Result<EventRecord> {
+    Ok(EventRecord {
+        sequence: to_u64(row.try_get("sequence")?, "event sequence")?,
+        event_id: EventId::parse(row.try_get::<String, _>("id")?)
+            .map_err(|message| eyre!(message))?,
+        source: row.try_get("source")?,
+        fingerprint: row.try_get("fingerprint")?,
+        episode_id: EpisodeId::parse(row.try_get::<String, _>("episode_id")?)
+            .map_err(|message| eyre!(message))?,
+        kind: EventKind::parse(row.try_get::<&str, _>("kind")?)
+            .map_err(|message| eyre!(message))?,
+        host: row.try_get("host")?,
+        occurred_at: parse_timestamp(row.try_get("occurred_at")?)?,
+        received_at: parse_timestamp(row.try_get("received_at")?)?,
+        related_job_id: row
+            .try_get::<Option<String>, _>("related_job_id")?
+            .map(JobId::parse)
+            .transpose()
+            .map_err(|message| eyre!(message))?,
+        related_change_id: row
+            .try_get::<Option<String>, _>("related_change_id")?
+            .map(ChangeId::parse)
+            .transpose()
+            .map_err(|message| eyre!(message))?,
+        payload: serde_json::from_str(row.try_get("payload_json")?)?,
+    })
+}
+
+fn row_to_remediation(row: &sqlx::sqlite::SqliteRow) -> Result<RemediationRecord> {
+    Ok(RemediationRecord {
+        remediation_id: RemediationId::parse(row.try_get::<String, _>("id")?)
+            .map_err(|message| eyre!(message))?,
+        event_id: EventId::parse(row.try_get::<String, _>("event_id")?)
+            .map_err(|message| eyre!(message))?,
+        episode_id: EpisodeId::parse(row.try_get::<String, _>("episode_id")?)
+            .map_err(|message| eyre!(message))?,
+        host: row.try_get("host")?,
+        principal: row.try_get("principal")?,
+        attempt: u16::try_from(row.try_get::<i64, _>("attempt")?)
+            .map_err(|_| eyre!("invalid remediation attempt"))?,
+        revision: to_u64(row.try_get("revision")?, "remediation revision")?,
+        state: RemediationState::parse(row.try_get::<&str, _>("state")?)
+            .map_err(|message| eyre!(message))?,
+        started_at: parse_timestamp(row.try_get("started_at")?)?,
+        finished_at: row
+            .try_get::<Option<String>, _>("finished_at")?
+            .map(parse_timestamp)
+            .transpose()?,
+        related_job_id: row
+            .try_get::<Option<String>, _>("related_job_id")?
+            .map(JobId::parse)
+            .transpose()
+            .map_err(|message| eyre!(message))?,
+        related_change_id: row
+            .try_get::<Option<String>, _>("related_change_id")?
+            .map(ChangeId::parse)
+            .transpose()
+            .map_err(|message| eyre!(message))?,
+        summary: row.try_get("summary")?,
     })
 }
 
@@ -1354,6 +2231,242 @@ mod tests {
                 .job_id,
             submitted.job.handle.job_id
         );
+    }
+
+    #[tokio::test]
+    async fn alert_episodes_and_replay_cursors_track_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("store.db"))
+            .await
+            .unwrap();
+        let alert = |firing| AlertEventInput {
+            source: "alertmanager".into(),
+            fingerprint: "fixture-fingerprint".into(),
+            host: "host-a".into(),
+            firing,
+            occurred_at: maxops_proto::now(),
+            payload: json!({"status": if firing { "firing" } else { "resolved" }}),
+        };
+        let first = store.ingest_alert(alert(true)).await.unwrap();
+        let duplicate = store.ingest_alert(alert(true)).await.unwrap();
+        assert_eq!(first.episode_id, duplicate.episode_id);
+        let resolved = store.ingest_alert(alert(false)).await.unwrap();
+        assert_eq!(first.episode_id, resolved.episode_id);
+        let next = store.ingest_alert(alert(true)).await.unwrap();
+        assert_ne!(first.episode_id, next.episode_id);
+
+        let hosts = BTreeSet::from(["host-a".to_owned()]);
+        let replay = store
+            .list_events(
+                &hosts,
+                &EventsListParams {
+                    cursor: Some(0),
+                    host: None,
+                    kinds: Vec::new(),
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.events.len(), 4);
+        assert_eq!(replay.next_cursor, next.sequence);
+        store.prune_events_through(2).await.unwrap();
+        let error = store
+            .list_events(
+                &hosts,
+                &EventsListParams {
+                    cursor: Some(0),
+                    host: None,
+                    kinds: Vec::new(),
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("event cursor expired"));
+    }
+
+    #[tokio::test]
+    async fn delivery_intent_retries_and_preserves_acknowledgement_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("store.db"))
+            .await
+            .unwrap();
+        store
+            .ensure_subscription(
+                "fixture",
+                &json!({"hosts":["host-a"]}),
+                &json!({"url":"https://example.invalid/events"}),
+                Some("fixture-sink"),
+            )
+            .await
+            .unwrap();
+        let event = store
+            .ingest_alert(AlertEventInput {
+                source: "alertmanager".into(),
+                fingerprint: "delivery".into(),
+                host: "host-a".into(),
+                firing: true,
+                occurred_at: maxops_proto::now(),
+                payload: json!({"status":"firing"}),
+            })
+            .await
+            .unwrap();
+        let first = store
+            .begin_delivery("fixture", event.sequence, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.stage, DeliveryStage::Queued);
+        assert_eq!(first.attempts, 1);
+        assert!(
+            store
+                .begin_delivery("fixture", event.sequence, 60)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .acknowledge_delivery(
+                "fixture",
+                event.sequence,
+                DeliveryStage::Accepted,
+                Some(202),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.subscription_cursor("fixture").await.unwrap().cursor,
+            event.sequence
+        );
+    }
+
+    #[tokio::test]
+    async fn remediation_claims_are_serial_and_budgeted_per_episode() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("store.db"))
+            .await
+            .unwrap();
+        let event = store
+            .ingest_alert(AlertEventInput {
+                source: "alertmanager".into(),
+                fingerprint: "remediation".into(),
+                host: "host-a".into(),
+                firing: true,
+                occurred_at: maxops_proto::now(),
+                payload: json!({"status":"firing"}),
+            })
+            .await
+            .unwrap();
+        let claim_job = store
+            .submit_job("remediation-job", &job(json!({"event_id":event.event_id})))
+            .await
+            .unwrap()
+            .job;
+        let first = store
+            .begin_remediation(
+                &event.event_id,
+                "host-a",
+                "automation-a",
+                &claim_job.handle.job_id,
+                2,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.attempt, 1);
+        let replay = store
+            .begin_remediation(
+                &event.event_id,
+                "host-a",
+                "automation-a",
+                &claim_job.handle.job_id,
+                2,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.remediation_id, first.remediation_id);
+        let second_job = store
+            .submit_job(
+                "remediation-job-2",
+                &job(json!({"event_id":event.event_id})),
+            )
+            .await
+            .unwrap()
+            .job;
+        assert!(
+            store
+                .begin_remediation(
+                    &event.event_id,
+                    "host-a",
+                    "automation-a",
+                    &second_job.handle.job_id,
+                    2,
+                    0,
+                )
+                .await
+                .is_err()
+        );
+        store
+            .finish_remediation(
+                &first.remediation_id,
+                "automation-a",
+                RemediationCompletion {
+                    expected_revision: 1,
+                    outcome: RemediationState::Failed,
+                    related_job_id: Some(&claim_job.handle.job_id),
+                    related_change_id: None,
+                    summary: "first attempt failed",
+                },
+            )
+            .await
+            .unwrap();
+        let second = store
+            .begin_remediation(
+                &event.event_id,
+                "host-a",
+                "automation-a",
+                &second_job.handle.job_id,
+                2,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_remediation(
+                &second.remediation_id,
+                "automation-a",
+                RemediationCompletion {
+                    expected_revision: 1,
+                    outcome: RemediationState::Succeeded,
+                    related_job_id: Some(&second_job.handle.job_id),
+                    related_change_id: None,
+                    summary: "second attempt succeeded",
+                },
+            )
+            .await
+            .unwrap();
+        let third_job = store
+            .submit_job(
+                "remediation-job-3",
+                &job(json!({"event_id":event.event_id})),
+            )
+            .await
+            .unwrap()
+            .job;
+        let error = store
+            .begin_remediation(
+                &event.event_id,
+                "host-a",
+                "automation-a",
+                &third_job.handle.job_id,
+                2,
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("budget exhausted"));
     }
 
     #[tokio::test]

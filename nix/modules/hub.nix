@@ -17,11 +17,19 @@ let
       if host.executionTokenFile == null then null else "${credentialDir}/execution-${toString i}";
     readable_units = host.readableUnits;
     manageable_units = host.manageableUnits;
+    diagnostic_profile = host.diagnosticProfile;
+    diagnostic_probes = host.diagnosticProbes;
   }) cfg.hosts;
   clients = lib.imap0 (i: client: {
     name = client.name;
     token_file = "${credentialDir}/client-${toString i}";
-    inherit (client) hosts capabilities access repositories deployments;
+    inherit (client)
+      hosts
+      capabilities
+      access
+      repositories
+      deployments
+      ;
   }) cfg.clients;
   repositories = map (repository: {
     name = repository.name;
@@ -37,6 +45,13 @@ let
     source_reference = deployment.sourceReference;
     plan_ttl_seconds = deployment.planTtlSeconds;
   }) cfg.deployments;
+  eventSinks = lib.imap0 (i: sink: {
+    id = sink.id;
+    url = sink.url;
+    token_file = if sink.tokenFile == null then null else "${credentialDir}/event-sink-${toString i}";
+    inherit (sink) hosts kinds;
+    retry_seconds = sink.retrySeconds;
+  }) cfg.eventSinks;
   secretFiles =
     map (host: host.tokenFile) cfg.hosts
     ++ lib.filter (path: path != null) (map (host: host.executionTokenFile) cfg.hosts)
@@ -44,11 +59,22 @@ let
     ++ lib.optional cfg.alertIngress.enable cfg.alertIngress.tokenFile
     ++ lib.optional (
       cfg.alertIngress.enable && cfg.alertIngress.sinkTokenFile != null
-    ) cfg.alertIngress.sinkTokenFile;
+    ) cfg.alertIngress.sinkTokenFile
+    ++ lib.filter (path: path != null) (map (sink: sink.tokenFile) cfg.eventSinks);
   configFile = (pkgs.formats.json { }).generate "maxops-hub.json" {
     listen = "${cfg.listenAddress}:${toString cfg.port}";
     state_file = "/var/lib/maxops-hub/state.db";
-    inherit hosts clients repositories deployments;
+    inherit
+      hosts
+      clients
+      repositories
+      deployments
+      ;
+    event_sinks = eventSinks;
+    remediation_policy = {
+      max_attempts_per_episode = cfg.remediationPolicy.maxAttemptsPerEpisode;
+      cooldown_seconds = cfg.remediationPolicy.cooldownSeconds;
+    };
     prometheus_url = cfg.prometheusUrl;
     alertmanager_url = cfg.alertmanagerUrl;
     alert_ingress =
@@ -129,6 +155,16 @@ in
               default = [ ];
               description = "Exact readable services that management clients may mutate.";
             };
+            diagnosticProfile = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Executor profile used only for configured diagnostic probes.";
+            };
+            diagnosticProbes = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+              default = { };
+              description = "Named, fixed argv diagnostic probes available on this host.";
+            };
           };
         }
       );
@@ -162,7 +198,11 @@ in
                   "units:manage"
                   "logs:read"
                   "alerts:read"
+                  "events:read"
+                  "self:read"
                   "exec:run"
+                  "diagnostics:collect"
+                  "remediations:manage"
                   "jobs:read"
                   "jobs:cancel"
                   "workspace:read"
@@ -226,7 +266,10 @@ in
             builderHost = lib.mkOption { type = lib.types.str; };
             targetHost = lib.mkOption { type = lib.types.str; };
             kind = lib.mkOption {
-              type = lib.types.enum [ "system" "home" ];
+              type = lib.types.enum [
+                "system"
+                "home"
+              ];
               default = "system";
             };
             flakeAttribute = lib.mkOption { type = lib.types.str; };
@@ -260,6 +303,55 @@ in
         description = "Optional runtime sink credential path.";
       };
     };
+    eventSinks = lib.mkOption {
+      default = [ ];
+      description = "Durable ordered fleet-event webhook subscriptions.";
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            id = lib.mkOption { type = lib.types.str; };
+            url = lib.mkOption { type = lib.types.str; };
+            tokenFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = "Optional dedicated runtime bearer credential.";
+            };
+            hosts = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Inventory filter; empty selects every configured host.";
+            };
+            kinds = lib.mkOption {
+              type = lib.types.listOf (
+                lib.types.enum [
+                  "alert_firing"
+                  "alert_resolved"
+                  "diagnostic_collected"
+                  "remediation_started"
+                  "remediation_finished"
+                ]
+              );
+              default = [ ];
+              description = "Event kind filter; empty selects every kind.";
+            };
+            retrySeconds = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 5;
+            };
+          };
+        }
+      );
+    };
+    remediationPolicy = {
+      maxAttemptsPerEpisode = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 2;
+      };
+      cooldownSeconds = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 300;
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -291,39 +383,54 @@ in
       }
       {
         assertion = lib.all (
-          repository: lib.any (
-            host: host.name == repository.executorHost && host.executionTokenFile != null
-          ) cfg.hosts
+          host:
+          host.diagnosticProbes == { } || (host.diagnosticProfile != null && host.executionTokenFile != null)
+        ) cfg.hosts;
+        message = "maxops-hub diagnosticProbes require a profile and host execution credential.";
+      }
+      {
+        assertion = lib.all (
+          sink: lib.all (name: lib.any (host: host.name == name) cfg.hosts) sink.hosts
+        ) cfg.eventSinks;
+        message = "maxops-hub event sink host filters must reference configured inventory.";
+      }
+      {
+        assertion = lib.all (
+          repository:
+          lib.any (host: host.name == repository.executorHost && host.executionTokenFile != null) cfg.hosts
         ) cfg.repositories;
         message = "maxops-hub repositories require a known executor host with execution enabled.";
       }
       {
         assertion = lib.all (
-          client: lib.all (
-            repositoryName: lib.any (
-              repository:
-              repository.name == repositoryName && builtins.elem repository.executorHost client.hosts
+          client:
+          lib.all (
+            repositoryName:
+            lib.any (
+              repository: repository.name == repositoryName && builtins.elem repository.executorHost client.hosts
             ) cfg.repositories
           ) client.repositories
         ) cfg.clients;
         message = "maxops-hub client repositories must exist and their executor must be in host scope.";
       }
       {
-        assertion = lib.all (deployment:
-          lib.any (repository:
-            repository.name == deployment.repository
-            && repository.executorHost == deployment.builderHost
+        assertion = lib.all (
+          deployment:
+          lib.any (
+            repository:
+            repository.name == deployment.repository && repository.executorHost == deployment.builderHost
           ) cfg.repositories
-          && lib.any (host:
-            host.name == deployment.targetHost && host.executionTokenFile != null
-          ) cfg.hosts
+          && lib.any (host: host.name == deployment.targetHost && host.executionTokenFile != null) cfg.hosts
         ) cfg.deployments;
         message = "maxops-hub deployments require the configured repository builder and an enabled target executor.";
       }
       {
-        assertion = lib.all (client:
-          lib.all (deploymentName:
-            lib.any (deployment:
+        assertion = lib.all (
+          client:
+          lib.all (
+            deploymentName:
+            lib.any (
+              deployment:
               deployment.name == deploymentName
               && builtins.elem deployment.repository client.repositories
               && builtins.elem deployment.builderHost client.hosts
@@ -351,16 +458,19 @@ in
           ++ (lib.concatLists (
             lib.imap0 (
               i: host:
-              lib.optional (
-                host.executionTokenFile != null
-              ) "execution-${toString i}:${host.executionTokenFile}"
+              lib.optional (host.executionTokenFile != null) "execution-${toString i}:${host.executionTokenFile}"
             ) cfg.hosts
           ))
           ++ (lib.imap0 (i: client: "client-${toString i}:${client.tokenFile}") cfg.clients)
           ++ lib.optional cfg.alertIngress.enable "alert-ingress:${cfg.alertIngress.tokenFile}"
           ++ lib.optional (
             cfg.alertIngress.enable && cfg.alertIngress.sinkTokenFile != null
-          ) "alert-sink:${cfg.alertIngress.sinkTokenFile}";
+          ) "alert-sink:${cfg.alertIngress.sinkTokenFile}"
+          ++ lib.concatLists (
+            lib.imap0 (
+              i: sink: lib.optional (sink.tokenFile != null) "event-sink-${toString i}:${sink.tokenFile}"
+            ) cfg.eventSinks
+          );
         Restart = "on-failure";
         RestartSec = "10s";
         TimeoutStopSec = "15s";
