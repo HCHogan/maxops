@@ -376,15 +376,16 @@ prepared → checking → building → publishing → ready → activating → v
   对象。有人在验收窗口手动 rebuild 时，重新判断执行归属，不能覆盖其结果或
   继续声称验收的是原计划；历史成功也不等于该版本此刻仍在运行。
 - system 和独立 Home Manager 是不同目标，不隐式随系统部署所有用户 home。
-- 初版以 deploy-rs 为部署适配器，确认它激活的是冻结源码/已验证产物；若无法
-  保证，使用明确的预构建产物路径，不能让适配器重新解析一个移动中的远端 ref。
+- 初版直接激活冻结源码构建出的已验证 Nix 产物，不使用 deploy-rs，也不在目标
+  端重新解析移动中的远端 ref。executor 先以 CAS 核对 running closure 与
+  persistent profile，再设置明确的产物路径并调用该产物内配置的激活程序；系统
+  默认使用 `bin/switch-to-configuration switch`，Home Manager 可配置独立入口。
 
-deploy-rs 已有 activation confirmation 和 magic rollback，复用这些能力，但在
-配置准备阶段核对实际参数与版本，不能因适配器退出 0 就判定业务恢复。
-[deploy-rs 文档](https://github.com/serokell/deploy-rs/blob/master/README.md#magic-rollback)。
-适配器自身的回滚也必须遵守下面的外部变更检查；不能外层检测到别人 rebuild，
-内层计时器却继续无条件切回旧 generation。不能满足这一要求的默认回滚机制
-需要替换为目标端的条件恢复实现，不能直接启用。
+恢复由目标端 executor 执行：每次切换前重新观测实际 running closure 与
+persistent profile，只在失败 change 仍拥有当前运行状态时恢复已冻结的基线产物。
+若人或其他工具已 rebuild、回滚或切到新 generation，旧 change 转为 `superseded`
+并停止，不能用延迟计时器无条件覆盖外部修改。命令成功只证明激活程序退出 0；
+最终状态仍由闭包核对和 deployment profile 的业务验收决定。
 
 ### 8.3 验收与自动恢复
 
@@ -501,7 +502,7 @@ registry，只增加管理权限的操作集合。
 | **P1 异步命令** | 新增 executor/job-runner；agent 管理转发；Hub 派发核对；`exec.run` 与 `jobs.*`；Nix executor module | 断开 HTTP 后继续运行；Hub/agent/executor 重启后核对；完成与确认之间崩溃不会重复运行；大输出、超时、取消、进程树与满盘测试 |
 | **P2 服务操作** | `units.start/stop/restart/reload`；独立管理 unit 列表；主机锁、冷却时间 | 在 fixture 服务上验证效果；不可读/不可管理范围分别拒绝；不支持 reload 不隐式 restart；两个客户端的冲突变更正确排队 |
 | **P3 配置工作区** | workspace/Git 模块；revision CAS；checks；artifact；提交与 fast-forward 发布 | 不改变人的 dirty checkout；符号链接/路径逃逸拒绝；修改期间构建使用冻结 tree；远端 ref 变动返回冲突；构建进程无法读取发布凭据 |
-| **P4 构建部署** | ChangePlan；builder/target executor 协调；Nix/deploy-rs adapter；业务验收与条件恢复；外部变更观测 | 实际构建、激活并核对 closure；断网与业务失败恢复；手动 rebuild 使旧计划失效；外部新 generation 阻止旧计时器回滚；更新 Hub/executor 的恢复测试；源码与运行状态分别准确报告 |
+| **P4 构建部署** | ChangePlan；builder/target executor 协调；冻结 Nix 产物直接激活；业务验收与条件恢复；外部变更观测 | 实际构建、激活并核对 closure；断网与业务失败恢复；手动 rebuild 使旧计划失效；外部新 generation 阻止旧计时器回滚；更新 Hub/executor 的恢复测试；源码与运行状态分别准确报告 |
 | **P5 事件与诊断** | 持久事件、cursor、webhook；diagnostics bundle；修复关联/次数预算；自身 metrics/readiness | 重复告警不重复建 episode；订阅者离线后补取；cursor 与输出鉴权；同一事件的重复修复受预算约束；全链路自动修复 fixture |
 | **P6 客户端与推广** | CLI 完整体验；普通 HTTP 客户端示例；可选 MCP 薄适配；升级文档 | 不依赖 Max 即能走完整流程；MCP 与 REST 使用相同 registry、身份和作业；混合版本可降级为只读；逐机 rollout 和停用执行功能验证 |
 
