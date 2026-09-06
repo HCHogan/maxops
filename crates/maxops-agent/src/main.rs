@@ -144,7 +144,10 @@ async fn main() -> color_eyre::eyre::Result<()> {
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/unit", post(unit_status))
         .route("/v1/logs", post(logs))
-        .route("/v1/manage", post(manage))
+        .route(
+            "/v1/manage",
+            post(manage).layer(DefaultBodyLimit::max(maxops_proto::transport::MAX_BODY)),
+        )
         .layer(DefaultBodyLimit::max(128 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -195,10 +198,32 @@ async fn manage(
     .await
     {
         Ok(Ok(response)) => Ok(Json(response)),
-        _ => Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "executor unavailable",
-        )),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "executor rejected management request");
+            if let Some(rejected) = error.downcast_ref::<transport::ExecutorRejected>() {
+                return Err(match rejected.code.as_str() {
+                    "workspace_revision_conflict" => {
+                        ApiError(StatusCode::CONFLICT, "workspace revision changed")
+                    }
+                    "workspace_not_found" => ApiError(StatusCode::NOT_FOUND, "workspace not found"),
+                    "invalid_workspace_path" => {
+                        ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid workspace path")
+                    }
+                    _ => ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"),
+                });
+            }
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "executor unavailable",
+            ))
+        }
+        Err(_) => {
+            tracing::warn!("executor management request timed out");
+            Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "executor unavailable",
+            ))
+        }
     }
 }
 

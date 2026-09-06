@@ -6,6 +6,7 @@
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_proto::{
     JobEvent, JobEventKind, JobHandle, JobId, JobRecord, JobState, NewJob, ResourceObservation,
+    WorkspaceId, WorkspaceRecord, WorkspaceState,
 };
 use serde_json::Value;
 use sqlx::{
@@ -333,6 +334,130 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn create_workspace(
+        &self,
+        id: &WorkspaceId,
+        repository: &str,
+        executor: &str,
+        base_commit: &str,
+        tree_hash: &str,
+        creator: &str,
+    ) -> Result<WorkspaceRecord> {
+        ensure!(
+            maxops_proto::valid_repository_id(repository),
+            "invalid repository ID"
+        );
+        ensure!(
+            maxops_proto::valid_host(executor),
+            "invalid workspace executor"
+        );
+        ensure!(
+            maxops_proto::valid_git_oid(base_commit),
+            "invalid base commit"
+        );
+        ensure!(maxops_proto::valid_git_oid(tree_hash), "invalid tree hash");
+        ensure!(
+            !creator.is_empty() && creator.len() <= 128,
+            "invalid workspace creator"
+        );
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(row) = workspace_row(id, &mut transaction).await? {
+            let existing = row_to_workspace(&row)?;
+            ensure!(
+                existing.repository == repository
+                    && existing.executor == executor
+                    && existing.base_commit.eq_ignore_ascii_case(base_commit)
+                    && existing.tree_hash.eq_ignore_ascii_case(tree_hash)
+                    && existing.creator == creator,
+                "workspace ID was already used with different metadata"
+            );
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        let at = maxops_proto::now().to_string();
+        sqlx::query(
+            "INSERT INTO workspaces (
+                id, repository_id, executor, base_commit, revision, tree_hash,
+                commit_hash, state, creator, created_at, retain_until
+             ) VALUES (?, ?, ?, ?, 1, ?, NULL, 'clean', ?, ?, NULL)",
+        )
+        .bind(id.as_str())
+        .bind(repository)
+        .bind(executor)
+        .bind(base_commit.to_ascii_lowercase())
+        .bind(tree_hash.to_ascii_lowercase())
+        .bind(creator)
+        .bind(at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        self.get_workspace(id).await
+    }
+
+    pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<WorkspaceRecord> {
+        let row = sqlx::query(
+            "SELECT id, repository_id, executor, base_commit, revision, tree_hash,
+                    commit_hash, state, creator, created_at, retain_until
+             FROM workspaces WHERE id = ?",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| eyre!("workspace not found"))?;
+        row_to_workspace(&row)
+    }
+
+    pub async fn get_owned_workspace(
+        &self,
+        creator: &str,
+        repository: &str,
+        id: &WorkspaceId,
+    ) -> Result<WorkspaceRecord> {
+        let workspace = self.get_workspace(id).await?;
+        ensure!(
+            workspace.creator == creator && workspace.repository == repository,
+            "workspace not found"
+        );
+        Ok(workspace)
+    }
+
+    pub async fn transition_workspace(
+        &self,
+        id: &WorkspaceId,
+        creator: &str,
+        expected_revision: u64,
+        tree_hash: &str,
+        commit_hash: Option<&str>,
+        state: WorkspaceState,
+    ) -> Result<WorkspaceRecord> {
+        ensure!(maxops_proto::valid_git_oid(tree_hash), "invalid tree hash");
+        ensure!(
+            commit_hash.is_none_or(maxops_proto::valid_git_oid),
+            "invalid commit hash"
+        );
+        let _writer = self.writer.lock().await;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| eyre!("workspace revision overflow"))?;
+        let changed = sqlx::query(
+            "UPDATE workspaces
+             SET revision = ?, tree_hash = ?, commit_hash = ?, state = ?
+             WHERE id = ? AND creator = ? AND revision = ?",
+        )
+        .bind(to_i64(next_revision, "workspace revision")?)
+        .bind(tree_hash.to_ascii_lowercase())
+        .bind(commit_hash.map(str::to_ascii_lowercase))
+        .bind(state.as_str())
+        .bind(id.as_str())
+        .bind(creator)
+        .bind(to_i64(expected_revision, "workspace revision")?)
+        .execute(&self.pool)
+        .await?;
+        ensure!(changed.rows_affected() == 1, "workspace revision changed");
+        self.get_workspace(id).await
+    }
+
     pub async fn transition_job(
         &self,
         id: &JobId,
@@ -652,6 +777,41 @@ fn row_to_job(row: &sqlx::sqlite::SqliteRow) -> Result<JobRecord> {
     })
 }
 
+async fn workspace_row<'a>(
+    id: &WorkspaceId,
+    transaction: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
+) -> Result<Option<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT id, repository_id, executor, base_commit, revision, tree_hash,
+                commit_hash, state, creator, created_at, retain_until
+         FROM workspaces WHERE id = ?",
+    )
+    .bind(id.as_str())
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        workspace_id: WorkspaceId::parse(row.try_get::<String, _>("id")?)
+            .map_err(|message| eyre!(message))?,
+        repository: row.try_get("repository_id")?,
+        executor: row.try_get("executor")?,
+        base_commit: row.try_get("base_commit")?,
+        revision: to_u64(row.try_get("revision")?, "workspace revision")?,
+        tree_hash: row.try_get("tree_hash")?,
+        commit_hash: row.try_get("commit_hash")?,
+        state: WorkspaceState::from_str(row.try_get::<&str, _>("state")?)
+            .map_err(|message| eyre!(message))?,
+        creator: row.try_get("creator")?,
+        created_at: parse_timestamp(row.try_get("created_at")?)?,
+        retain_until: row
+            .try_get::<Option<String>, _>("retain_until")?
+            .map(parse_timestamp)
+            .transpose()?,
+    })
+}
+
 fn parse_timestamp(value: String) -> Result<jiff::Timestamp> {
     value.parse().wrap_err("invalid timestamp in database")
 }
@@ -837,6 +997,56 @@ mod tests {
                 .release_resource("systemd_manager", "host-a", &second.handle.job_id)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_revision_compare_and_swap_preserves_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("store.db"))
+            .await
+            .unwrap();
+        let id = WorkspaceId::parse("00000000-0000-0000-0000-000000000123").unwrap();
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let tree = "1123456789abcdef0123456789abcdef01234567";
+        let workspace = store
+            .create_workspace(&id, "infra", "host-a", base, tree, "automation-a")
+            .await
+            .unwrap();
+        assert_eq!(workspace.revision, 1);
+        assert_eq!(workspace.state, WorkspaceState::Clean);
+        assert!(
+            store
+                .get_owned_workspace("other", "infra", &id)
+                .await
+                .is_err()
+        );
+        let commit = "2123456789abcdef0123456789abcdef01234567";
+        let committed = store
+            .transition_workspace(
+                &id,
+                "automation-a",
+                1,
+                tree,
+                Some(commit),
+                WorkspaceState::Committed,
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.revision, 2);
+        assert_eq!(committed.commit_hash.as_deref(), Some(commit));
+        assert!(
+            store
+                .transition_workspace(
+                    &id,
+                    "automation-a",
+                    1,
+                    tree,
+                    Some(commit),
+                    WorkspaceState::Published,
+                )
+                .await
+                .is_err()
         );
     }
 

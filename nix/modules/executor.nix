@@ -7,16 +7,28 @@ self:
 }:
 let
   cfg = config.services.maxops-executor;
-  profiles = lib.mapAttrs (_: profile: {
+  workspaceRoot = "/var/lib/maxops-workspaces";
+  profiles = lib.mapAttrs (name: profile: {
     inherit (profile) user environment privileged;
     interpreter = toString profile.interpreter;
     timeout_seconds = profile.timeoutSeconds;
     output_limit_bytes = profile.outputLimitBytes;
-    working_roots = profile.workingRoots;
+    working_roots = profile.workingRoots ++ lib.optional (
+      lib.any (repository: repository.checkProfile == name) (lib.attrValues cfg.repositories)
+    ) workspaceRoot;
     allowed_credentials = profile.allowedCredentials;
     tasks_max = profile.tasksMax;
     memory_max_bytes = profile.memoryMaxBytes;
   }) cfg.profiles;
+  repositories = lib.mapAttrs (_: repository: {
+    url = repository.url;
+    default_ref = repository.defaultRef;
+    publish_refs = repository.publishRefs;
+    check_profile = repository.checkProfile;
+    checks = repository.checks;
+    author_name = repository.authorName;
+    author_email = repository.authorEmail;
+  }) cfg.repositories;
   configFile = (pkgs.formats.json { }).generate "maxops-executor.json" {
     host = cfg.hostName;
     socket_path = cfg.socketPath;
@@ -26,9 +38,12 @@ let
     systemd_run = "${pkgs.systemd}/bin/systemd-run";
     systemctl = "${pkgs.systemd}/bin/systemctl";
     runner = "${cfg.package}/bin/maxops-job-runner";
+    git = "${pkgs.git}/bin/git";
+    workspace_root = workspaceRoot;
+    repository_root = "/var/lib/maxops-executor/repositories";
     manageable_units = cfg.manageableUnits;
     credential_sources = cfg.credentialSources;
-    inherit profiles;
+    inherit profiles repositories;
   };
 in
 {
@@ -122,6 +137,50 @@ in
       default = [ ];
       description = "Exact systemd service names the executor may mutate over D-Bus.";
     };
+    repositories = lib.mkOption {
+      default = { };
+      description = "Configured Git repositories and server-owned checks.";
+      type = lib.types.attrsOf (
+        lib.types.submodule {
+          options = {
+            url = lib.mkOption {
+              type = lib.types.str;
+              description = "Trusted fetch and publish URL; API callers cannot override it.";
+            };
+            defaultRef = lib.mkOption {
+              type = lib.types.str;
+              default = "refs/heads/main";
+              description = "Configured branch used as the workspace base.";
+            };
+            publishRefs = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Exact branch refs that workspace commits may publish.";
+            };
+            checkProfile = lib.mkOption {
+              type = lib.types.str;
+              default = "diagnostic";
+              description = "Unprivileged execution profile used for repository checks.";
+            };
+            checks = lib.mkOption {
+              type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+              default = { };
+              description = "Named structured argv checks available through workspace.check.";
+            };
+            authorName = lib.mkOption {
+              type = lib.types.str;
+              default = "maxops";
+              description = "Server-controlled Git author and committer name.";
+            };
+            authorEmail = lib.mkOption {
+              type = lib.types.str;
+              default = "maxops@localhost";
+              description = "Server-controlled Git author and committer email.";
+            };
+          };
+        }
+      );
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -148,16 +207,27 @@ in
         ) (lib.attrValues cfg.profiles);
         message = "maxops executor profiles may only allow declared credential source names.";
       }
+      {
+        assertion = lib.all (
+          repository: builtins.hasAttr repository.checkProfile cfg.profiles
+        ) (lib.attrValues cfg.repositories);
+        message = "maxops executor repository checks must reference a configured profile.";
+      }
     ];
 
     users.groups.maxops-executor = { };
     users.groups.maxops-runner = { };
+    users.groups.maxops-workspace = { };
     users.users.maxops-runner = {
       isSystemUser = true;
       group = "maxops-runner";
+      extraGroups = [ "maxops-workspace" ];
     };
 
-    systemd.tmpfiles.rules = [ "d /var/lib/maxops-jobs 0711 root root - -" ];
+    systemd.tmpfiles.rules = [
+      "d /var/lib/maxops-jobs 0711 root root - -"
+      "d ${workspaceRoot} 2770 root maxops-workspace - -"
+    ];
     systemd.services.maxops-executor = {
       description = "maxops durable local job executor";
       wantedBy = [ "multi-user.target" ];
@@ -167,6 +237,7 @@ in
         ExecStart = "${cfg.package}/bin/maxops-executor --config ${configFile}";
         User = "root";
         Group = "maxops-executor";
+        SupplementaryGroups = [ "maxops-workspace" ];
         RuntimeDirectory = "maxops-executor";
         RuntimeDirectoryMode = "0770";
         StateDirectory = "maxops-executor";
@@ -183,7 +254,11 @@ in
         ProtectKernelModules = true;
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
-        RestrictAddressFamilies = [ "AF_UNIX" ];
+        RestrictAddressFamilies = [ "AF_UNIX" ] ++ lib.optionals (cfg.repositories != { }) [
+          "AF_INET"
+          "AF_INET6"
+        ];
+        ReadWritePaths = [ workspaceRoot ];
         CapabilityBoundingSet = "";
         LockPersonality = true;
         UMask = "0007";

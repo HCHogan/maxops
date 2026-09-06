@@ -21,8 +21,12 @@ let
   clients = lib.imap0 (i: client: {
     name = client.name;
     token_file = "${credentialDir}/client-${toString i}";
-    inherit (client) hosts capabilities access;
+    inherit (client) hosts capabilities access repositories;
   }) cfg.clients;
+  repositories = map (repository: {
+    name = repository.name;
+    executor_host = repository.executorHost;
+  }) cfg.repositories;
   secretFiles =
     map (host: host.tokenFile) cfg.hosts
     ++ lib.filter (path: path != null) (map (host: host.executionTokenFile) cfg.hosts)
@@ -34,7 +38,7 @@ let
   configFile = (pkgs.formats.json { }).generate "maxops-hub.json" {
     listen = "${cfg.listenAddress}:${toString cfg.port}";
     state_file = "/var/lib/maxops-hub/state.db";
-    inherit hosts clients;
+    inherit hosts clients repositories;
     prometheus_url = cfg.prometheusUrl;
     alertmanager_url = cfg.alertmanagerUrl;
     alert_ingress =
@@ -151,10 +155,18 @@ in
                   "exec:run"
                   "jobs:read"
                   "jobs:cancel"
+                  "workspace:read"
+                  "workspace:write"
+                  "workspace:publish"
                 ]
               );
               default = [ ];
               description = "Explicit operation capabilities.";
+            };
+            repositories = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Exact configured repository IDs available to this principal.";
             };
             access = lib.mkOption {
               type = lib.types.enum [
@@ -163,6 +175,24 @@ in
               ];
               default = "observe";
               description = "Credential class; manage is required for every job operation.";
+            };
+          };
+        }
+      );
+    };
+    repositories = lib.mkOption {
+      default = [ ];
+      description = "Repository IDs routed to their configured executor hosts.";
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            name = lib.mkOption {
+              type = lib.types.str;
+              description = "Repository ID shared with the target executor configuration.";
+            };
+            executorHost = lib.mkOption {
+              type = lib.types.str;
+              description = "Inventory host that owns this repository's mirror and workspaces.";
             };
           };
         }
@@ -214,6 +244,25 @@ in
           host: lib.all (unit: builtins.elem unit host.readableUnits) host.manageableUnits
         ) cfg.hosts;
         message = "maxops-hub manageableUnits must be a subset of readableUnits.";
+      }
+      {
+        assertion = lib.all (
+          repository: lib.any (
+            host: host.name == repository.executorHost && host.executionTokenFile != null
+          ) cfg.hosts
+        ) cfg.repositories;
+        message = "maxops-hub repositories require a known executor host with execution enabled.";
+      }
+      {
+        assertion = lib.all (
+          client: lib.all (
+            repositoryName: lib.any (
+              repository:
+              repository.name == repositoryName && builtins.elem repository.executorHost client.hosts
+            ) cfg.repositories
+          ) client.repositories
+        ) cfg.clients;
+        message = "maxops-hub client repositories must exist and their executor must be in host scope.";
       }
     ];
     systemd.services.maxops-hub = {

@@ -8,7 +8,7 @@ use futures::future::join_all;
 use maxops_proto::{
     ExecutorRequest, ExecutorResponse, IdempotencyRequirement, JobCancelParams, JobId, JobIdParams,
     JobRecord, JobState, JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, Request,
-    Snapshot, UnitActionParams, now, operations,
+    Snapshot, UnitActionParams, WorkspaceTargetRequest, WorkspaceTargetResponse, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -60,6 +60,8 @@ pub struct Config {
     hosts: Vec<HostConfig>,
     clients: Vec<ClientConfig>,
     #[serde(default)]
+    repositories: Vec<RepositoryConfig>,
+    #[serde(default)]
     prometheus_url: Option<String>,
     #[serde(default)]
     alertmanager_url: Option<String>,
@@ -93,7 +95,16 @@ struct ClientConfig {
     hosts: BTreeSet<String>,
     capabilities: BTreeSet<String>,
     #[serde(default)]
+    repositories: BTreeSet<String>,
+    #[serde(default)]
     access: Access,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryConfig {
+    name: String,
+    executor_host: String,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
@@ -123,6 +134,7 @@ struct Principal {
     hosts: BTreeSet<String>,
     capabilities: BTreeSet<String>,
     access: Access,
+    repositories: BTreeSet<String>,
 }
 struct AlertIngress {
     token: Token,
@@ -138,6 +150,7 @@ struct App {
     alert_ingress: Option<AlertIngress>,
     slots: Semaphore,
     store: Option<Store>,
+    repositories: BTreeMap<String, String>,
 }
 
 pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Router)> {
@@ -203,6 +216,25 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             "duplicate inventory host"
         );
     }
+    let mut repositories = BTreeMap::new();
+    for repository in config.repositories {
+        color_eyre::eyre::ensure!(
+            maxops_proto::valid_repository_id(&repository.name),
+            "invalid repository ID"
+        );
+        color_eyre::eyre::ensure!(
+            hosts
+                .get(&repository.executor_host)
+                .is_some_and(|host| host.execution_token.is_some()),
+            "repository executor host is unknown or has execution disabled"
+        );
+        color_eyre::eyre::ensure!(
+            repositories
+                .insert(repository.name, repository.executor_host)
+                .is_none(),
+            "duplicate repository ID"
+        );
+    }
     let known_caps: BTreeSet<_> = operations().into_iter().map(|op| op.capability).collect();
     let management_caps: BTreeSet<_> = operations()
         .into_iter()
@@ -231,6 +263,21 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             client.hosts.iter().all(|name| hosts.contains_key(name)),
             "policy references an unknown host"
         );
+        color_eyre::eyre::ensure!(
+            client
+                .repositories
+                .iter()
+                .all(|name| repositories.contains_key(name)),
+            "policy references an unknown repository"
+        );
+        color_eyre::eyre::ensure!(
+            client.repositories.iter().all(|name| {
+                repositories
+                    .get(name)
+                    .is_some_and(|host| client.hosts.contains(host))
+            }),
+            "repository executor must also be in the client's host scope"
+        );
         let token = Token::read(&client.token_file)?;
         color_eyre::eyre::ensure!(
             !clients
@@ -256,6 +303,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
             hosts: client.hosts,
             capabilities: client.capabilities,
             access: client.access,
+            repositories: client.repositories,
         });
     }
     color_eyre::eyre::ensure!(
@@ -338,6 +386,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         alert_ingress,
         slots: Semaphore::new(16),
         store,
+        repositories,
     });
     if let Some(store) = &app.store {
         for job in store.nonterminal_jobs().await? {
@@ -354,7 +403,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/v1/openapi.json", get(openapi))
         .route(
             "/v1/execute",
-            post(execute).layer(DefaultBodyLimit::max(128 * 1024)),
+            post(execute).layer(DefaultBodyLimit::max(maxops_proto::transport::MAX_BODY)),
         )
         .route("/v1/alerts", post(alerts))
         .layer(DefaultBodyLimit::max(256 * 1024))
@@ -375,6 +424,22 @@ fn host_for<'a>(app: &'a App, principal: &Principal, name: &str) -> Result<&'a H
     app.hosts
         .get(name)
         .ok_or(ApiError(StatusCode::FORBIDDEN, "host not permitted"))
+}
+
+fn repository_host<'a>(
+    app: &'a App,
+    principal: &Principal,
+    repository: &str,
+) -> Result<&'a str, ApiError> {
+    if !principal.repositories.contains(repository) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "repository not permitted"));
+    }
+    let host = app
+        .repositories
+        .get(repository)
+        .ok_or(ApiError(StatusCode::FORBIDDEN, "repository not permitted"))?;
+    host_for(app, principal, host)?;
+    Ok(host)
 }
 
 fn unit_allowed(host: &Host, unit: &str) -> Result<(), ApiError> {
@@ -683,7 +748,15 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         | Request::JobsList(_)
         | Request::JobsStatus(_)
         | Request::JobsLogs(_)
-        | Request::JobsCancel(_) => Err(ApiError(
+        | Request::JobsCancel(_)
+        | Request::WorkspaceCreate(_)
+        | Request::WorkspaceStatus(_)
+        | Request::WorkspaceRead(_)
+        | Request::WorkspaceApply(_)
+        | Request::WorkspaceDiff(_)
+        | Request::WorkspaceCommit(_)
+        | Request::WorkspaceCheck(_)
+        | Request::WorkspacePublish(_) => Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "job operation routed as observation",
         )),
@@ -785,6 +858,169 @@ async fn run_job_operation(
         }
         Request::UnitsReload(params) => {
             submit_unit_action(app, principal, headers, "units.reload", params).await
+        }
+        Request::WorkspaceCreate(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            submit_workspace_job(
+                app,
+                principal,
+                headers,
+                "workspace.create",
+                &repository,
+                serde_json::to_value(params).expect("serializable workspace create"),
+                300,
+            )
+            .await
+        }
+        Request::WorkspaceCheck(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            submit_workspace_job(
+                app,
+                principal,
+                headers,
+                "workspace.check",
+                &repository,
+                serde_json::to_value(params).expect("serializable workspace check"),
+                3600,
+            )
+            .await
+        }
+        Request::WorkspacePublish(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            submit_workspace_job(
+                app,
+                principal,
+                headers,
+                "workspace.publish",
+                &repository,
+                serde_json::to_value(params).expect("serializable workspace publish"),
+                300,
+            )
+            .await
+        }
+        Request::WorkspaceStatus(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            let response = forward_workspace(
+                app,
+                principal,
+                &repository,
+                WorkspaceTargetRequest::Status(params),
+            )
+            .await?;
+            let WorkspaceTargetResponse::Record(record) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(record).expect("serializable workspace"),
+            ))
+        }
+        Request::WorkspaceRead(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            let response = forward_workspace(
+                app,
+                principal,
+                &repository,
+                WorkspaceTargetRequest::Read(params),
+            )
+            .await?;
+            let WorkspaceTargetResponse::File(file) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(file).expect("serializable workspace file"),
+            ))
+        }
+        Request::WorkspaceApply(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            let response = forward_workspace(
+                app,
+                principal,
+                &repository,
+                WorkspaceTargetRequest::Apply(params),
+            )
+            .await?;
+            let WorkspaceTargetResponse::Record(record) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(record).expect("serializable workspace"),
+            ))
+        }
+        Request::WorkspaceDiff(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            let response = forward_workspace(
+                app,
+                principal,
+                &repository,
+                WorkspaceTargetRequest::Diff(params),
+            )
+            .await?;
+            let WorkspaceTargetResponse::Diff(diff) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(diff).expect("serializable workspace diff"),
+            ))
+        }
+        Request::WorkspaceCommit(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            let repository = params.repository.clone();
+            let response = forward_workspace(
+                app,
+                principal,
+                &repository,
+                WorkspaceTargetRequest::Commit(params),
+            )
+            .await?;
+            let WorkspaceTargetResponse::Record(record) = response else {
+                return Err(ApiError(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid executor response",
+                ));
+            };
+            Ok((
+                StatusCode::OK,
+                serde_json::to_value(record).expect("serializable workspace"),
+            ))
         }
         Request::JobsList(params) => {
             if let Some(host) = &params.host {
@@ -968,6 +1204,81 @@ async fn submit_unit_action(
     ))
 }
 
+async fn submit_workspace_job(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    operation: &str,
+    repository: &str,
+    spec: Value,
+    timeout_seconds: u64,
+) -> Result<(StatusCode, Value), ApiError> {
+    let host = repository_host(app, principal, repository)?.to_owned();
+    let key = idempotency_key(headers)?;
+    let deadline = now()
+        .checked_add(std::time::Duration::from_secs(timeout_seconds))
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?;
+    let job = NewJob {
+        principal: principal.name.clone(),
+        host,
+        operation: operation.into(),
+        spec_version: 1,
+        spec,
+        policy_version: "hub-config-v1".into(),
+        deadline: Some(deadline),
+    };
+    let submitted = durable_store(app)?
+        .submit_job(key, &job)
+        .await
+        .map_err(map_store_error)?;
+    if submitted.created || submitted.job.handle.state == JobState::Queued {
+        spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+    ))
+}
+
+async fn forward_workspace(
+    app: &App,
+    principal: &Principal,
+    repository: &str,
+    request: WorkspaceTargetRequest,
+) -> Result<WorkspaceTargetResponse, ApiError> {
+    let host = repository_host(app, principal, repository)?;
+    let response = agent_request(
+        app,
+        host,
+        &ExecutorRequest::Workspace {
+            principal: principal.name.clone(),
+            request,
+        },
+    )
+    .await
+    .map_err(map_workspace_upstream_error)?;
+    let ExecutorResponse::Workspace(response) = response else {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "invalid executor response",
+        ));
+    };
+    Ok(response)
+}
+
+fn map_workspace_upstream_error(error: color_eyre::Report) -> ApiError {
+    match transport::upstream_status(&error) {
+        Some(StatusCode::CONFLICT) => ApiError(StatusCode::CONFLICT, "workspace revision changed"),
+        Some(StatusCode::NOT_FOUND) => ApiError(StatusCode::NOT_FOUND, "workspace not found"),
+        Some(StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY) => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace request rejected",
+        ),
+        Some(StatusCode::FORBIDDEN) => ApiError(StatusCode::FORBIDDEN, "workspace not permitted"),
+        _ => ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"),
+    }
+}
+
 async fn agent_request(
     app: &App,
     host_name: &str,
@@ -994,7 +1305,7 @@ async fn agent_request(
 
 async fn project_target_job(
     store: &Store,
-    current: JobRecord,
+    mut current: JobRecord,
     target: JobRecord,
 ) -> color_eyre::eyre::Result<JobRecord> {
     color_eyre::eyre::ensure!(
@@ -1003,9 +1314,30 @@ async fn project_target_job(
             && current.spec_hash == target.spec_hash,
         "executor job identity mismatch"
     );
-    if current.handle.state == target.handle.state
-        || !current.handle.state.can_transition_to(target.handle.state)
+    if current.handle.state == target.handle.state {
+        return Ok(current);
+    }
+    if target.handle.state == JobState::OutcomeUnknown
+        && !current
+            .handle
+            .state
+            .can_transition_to(JobState::OutcomeUnknown)
+        && current
+            .handle
+            .state
+            .can_transition_to(JobState::Reconciling)
     {
+        current = store
+            .transition_job(
+                &current.handle.job_id,
+                current.handle.revision,
+                JobState::Reconciling,
+                &json!({"source":"executor","target_revision":target.handle.revision}),
+                target.result.as_ref(),
+            )
+            .await?;
+    }
+    if !current.handle.state.can_transition_to(target.handle.state) {
         return Ok(current);
     }
     store
@@ -1171,11 +1503,26 @@ fn dispatch_authorized(app: &App, job: &JobRecord) -> bool {
         } else {
             true
         };
+        let repository_still_allowed = if job.handle.operation.starts_with("workspace.") {
+            job.spec
+                .get("repository")
+                .and_then(Value::as_str)
+                .is_some_and(|repository| {
+                    principal.repositories.contains(repository)
+                        && app
+                            .repositories
+                            .get(repository)
+                            .is_some_and(|host| host == &job.handle.host)
+                })
+        } else {
+            true
+        };
         principal.name == job.principal
             && principal.access == Access::Manage
             && capability.is_some_and(|capability| principal.capabilities.contains(capability))
             && principal.hosts.contains(&job.handle.host)
             && target_still_allowed
+            && repository_still_allowed
     })
 }
 

@@ -4,11 +4,13 @@ pub mod events;
 pub mod jobs;
 pub mod observations;
 pub mod transport;
+pub mod workspaces;
 
 pub use changes::*;
 pub use events::*;
 pub use jobs::*;
 pub use observations::*;
+pub use workspaces::*;
 
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -182,6 +184,14 @@ operations! {
     JobsStatus(JobIdParams) -> JobRecord, "jobs.status", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one durable job and its current target-confirmed state";
     JobsLogs(JobLogsParams) -> JobLogsResponse, "jobs.logs", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read bounded command output using byte offsets";
     JobsCancel(JobCancelParams) -> JobRecord, "jobs.cancel", "jobs:cancel", OperationKind::JobControl, false, IdempotencyRequirement::None, "Request cancellation of a non-terminal job";
+    WorkspaceCreate(WorkspaceCreateParams) -> JobHandle, "workspace.create", "workspace:write", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Create an isolated workspace at the currently observed configured remote ref";
+    WorkspaceStatus(WorkspaceStatusParams) -> WorkspaceRecord, "workspace.status", "workspace:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a workspace's durable revision and Git identities";
+    WorkspaceRead(WorkspaceReadParams) -> WorkspaceFile, "workspace.read", "workspace:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one regular UTF-8 file from an exact workspace revision";
+    WorkspaceApply(WorkspaceApplyParams) -> WorkspaceRecord, "workspace.apply", "workspace:write", OperationKind::JobControl, false, IdempotencyRequirement::None, "Create a new immutable workspace revision from bounded file replacements or deletions";
+    WorkspaceDiff(WorkspaceRevisionParams) -> WorkspaceDiff, "workspace.diff", "workspace:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Render the bounded Git patch for an exact workspace revision";
+    WorkspaceCommit(WorkspaceCommitParams) -> WorkspaceRecord, "workspace.commit", "workspace:write", OperationKind::JobControl, false, IdempotencyRequirement::None, "Commit an exact workspace tree using the configured author identity";
+    WorkspaceCheck(WorkspaceCheckParams) -> JobHandle, "workspace.check", "workspace:write", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run one configured check against an immutable workspace revision";
+    WorkspacePublish(WorkspacePublishParams) -> JobHandle, "workspace.publish", "workspace:publish", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Publish an exact committed workspace revision if the remote ref baseline is unchanged";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -251,7 +261,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 18);
+        assert_eq!(operations.len(), 26);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only
@@ -287,5 +297,29 @@ mod tests {
         assert!(params.validate().is_ok());
         params.expected_invocation_id = Some("not-an-invocation".into());
         assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn workspace_edits_are_revisioned_bounded_and_unique() {
+        let mut params = WorkspaceApplyParams {
+            repository: "infra".into(),
+            workspace_id: WorkspaceId::parse("00000000-0000-0000-0000-000000000001").unwrap(),
+            expected_revision: 1,
+            edits: vec![WorkspaceEdit {
+                path: "nixos/hosts/example/default.nix".into(),
+                content: Some("{ ... }: { }".into()),
+            }],
+        };
+        assert!(params.validate().is_ok());
+        params.edits.push(params.edits[0].clone());
+        assert!(params.validate().is_err());
+        params.edits.pop();
+        params.edits[0].content = Some("x".repeat(MAX_WORKSPACE_APPLY_BYTES + 1));
+        assert!(params.validate().is_err());
+        assert!(operations().iter().any(|operation| {
+            operation.name == "workspace.publish"
+                && operation.capability == "workspace:publish"
+                && operation.idempotency == IdempotencyRequirement::Required
+        }));
     }
 }

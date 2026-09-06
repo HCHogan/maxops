@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{fmt, net::SocketAddr, path::Path, time::Duration};
 use subtle::ConstantTimeEq;
 
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -52,6 +52,53 @@ impl IntoResponse for ApiError {
 }
 pub type ApiResult<T> = Result<Json<T>, ApiError>;
 
+#[derive(Debug)]
+pub struct UpstreamHttpError {
+    status: StatusCode,
+}
+
+impl UpstreamHttpError {
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl fmt::Display for UpstreamHttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "upstream request failed with HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
+
+#[derive(Debug)]
+pub struct ExecutorRejected {
+    pub code: String,
+    pub message: String,
+}
+
+impl fmt::Display for ExecutorRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "executor rejected request ({}): {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for ExecutorRejected {}
+
+pub fn upstream_status(error: &color_eyre::Report) -> Option<StatusCode> {
+    error
+        .downcast_ref::<UpstreamHttpError>()
+        .map(UpstreamHttpError::status)
+}
+
 pub fn client() -> color_eyre::eyre::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -87,7 +134,12 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
     request: reqwest::RequestBuilder,
 ) -> color_eyre::eyre::Result<T> {
     let mut response = request.send().await?;
-    color_eyre::eyre::ensure!(response.status().is_success(), "upstream request failed");
+    if !response.status().is_success() {
+        return Err(UpstreamHttpError {
+            status: response.status(),
+        }
+        .into());
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         color_eyre::eyre::ensure!(
@@ -107,7 +159,7 @@ pub async fn executor_request(
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let mut stream = tokio::net::UnixStream::connect(socket).await?;
     let mut bytes = serde_json::to_vec(request)?;
-    color_eyre::eyre::ensure!(bytes.len() <= 128 * 1024, "executor request too large");
+    color_eyre::eyre::ensure!(bytes.len() < MAX_BODY, "executor request too large");
     bytes.push(b'\n');
     stream.write_all(&bytes).await?;
     stream.shutdown().await?;
@@ -120,7 +172,7 @@ pub async fn executor_request(
     match serde_json::from_slice(&response)? {
         crate::ExecutorWireResponse::Ok { response } => Ok(*response),
         crate::ExecutorWireResponse::Error { code, message } => {
-            color_eyre::eyre::bail!("executor rejected request ({code}): {message}")
+            Err(ExecutorRejected { code, message }.into())
         }
     }
 }

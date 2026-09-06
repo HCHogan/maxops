@@ -1,3 +1,4 @@
+use crate::{WorkspaceTargetRequest, WorkspaceTargetResponse};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -325,10 +326,17 @@ pub struct JobLogsResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(tag = "action", content = "params", rename_all = "snake_case")]
 pub enum ExecutorRequest {
-    Submit { job_id: JobId, job: NewJob },
+    Submit {
+        job_id: JobId,
+        job: NewJob,
+    },
     Status(JobIdParams),
     Logs(JobLogsParams),
     Cancel(JobCancelParams),
+    Workspace {
+        principal: String,
+        request: WorkspaceTargetRequest,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
@@ -336,6 +344,7 @@ pub enum ExecutorRequest {
 pub enum ExecutorResponse {
     Job(JobRecord),
     Logs(JobLogsResponse),
+    Workspace(WorkspaceTargetResponse),
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]

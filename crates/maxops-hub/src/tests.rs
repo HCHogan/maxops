@@ -54,6 +54,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
             hosts: BTreeSet::from(["alpha".into()]),
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
             access: Access::Observe,
+            repositories: BTreeSet::new(),
         }],
         client: transport::client().unwrap(),
         prometheus_url: None,
@@ -61,6 +62,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
         alert_ingress: None,
         slots: Semaphore::new(16),
         store: None,
+        repositories: BTreeMap::new(),
     }
 }
 
@@ -157,6 +159,7 @@ async fn successful_executor(
             },
         ))),
         ExecutorRequest::Cancel(_) => Err(StatusCode::CONFLICT),
+        ExecutorRequest::Workspace { .. } => Err(StatusCode::BAD_REQUEST),
     }
 }
 
@@ -246,6 +249,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
                 "jobs:cancel".into(),
             ]),
             access: Access::Manage,
+            repositories: BTreeSet::new(),
         }],
         client: transport::client().unwrap(),
         prometheus_url: None,
@@ -253,6 +257,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
         alert_ingress: None,
         slots: Semaphore::new(16),
         store: Some(Store::open(state_file).await.unwrap()),
+        repositories: BTreeMap::new(),
     }
 }
 

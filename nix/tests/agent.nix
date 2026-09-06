@@ -10,6 +10,7 @@ pkgs.testers.runNixOSTest {
     environment.systemPackages = [
       self.packages.${pkgs.stdenv.hostPlatform.system}.default
       pkgs.curl
+      pkgs.git
       pkgs.jq
     ];
     systemd.tmpfiles.rules = [
@@ -34,6 +35,22 @@ pkgs.testers.runNixOSTest {
         memoryMaxBytes = 268435456;
         allowedCredentials = [ "fixture" ];
       };
+      repositories.fixture = {
+        url = "/var/lib/maxops-executor/fixture-remote.git";
+        publishRefs = [ "refs/heads/main" ];
+        checks = {
+          content = [
+            "${pkgs.bash}/bin/bash"
+            "-c"
+            ''test "$(cat config.txt)" = changed-again && test -z "''${CREDENTIALS_DIRECTORY+x}"''
+          ];
+          frozen = [
+            "${pkgs.bash}/bin/bash"
+            "-c"
+            ''first=$(cat config.txt); sleep 6; test "$first" = changed && test "$(cat config.txt)" = changed && test -z "''${CREDENTIALS_DIRECTORY+x}"''
+          ];
+        };
+      };
     };
     services.maxops-agent = {
       enable = true;
@@ -55,6 +72,12 @@ pkgs.testers.runNixOSTest {
     };
     services.maxops-hub = {
       enable = true;
+      repositories = [
+        {
+          name = "fixture";
+          executorHost = "fixture";
+        }
+      ];
       hosts = [
         {
           name = "fixture";
@@ -94,7 +117,11 @@ pkgs.testers.runNixOSTest {
             "units:manage"
             "jobs:read"
             "jobs:cancel"
+            "workspace:read"
+            "workspace:write"
+            "workspace:publish"
           ];
+          repositories = [ "fixture" ];
         }
         {
           name = "manager2";
@@ -109,6 +136,21 @@ pkgs.testers.runNixOSTest {
         }
       ];
     };
+    systemd.services.maxops-executor.preStart = ''
+      if ! ${pkgs.git}/bin/git --git-dir=/var/lib/maxops-executor/fixture-remote.git rev-parse --verify refs/heads/main >/dev/null 2>&1; then
+        rm -rf /var/lib/maxops-executor/fixture-remote.git /var/lib/maxops-executor/fixture-seed
+        ${pkgs.git}/bin/git init --bare --initial-branch=main /var/lib/maxops-executor/fixture-remote.git
+        ${pkgs.git}/bin/git init --initial-branch=main /var/lib/maxops-executor/fixture-seed
+        printf 'initial\n' > /var/lib/maxops-executor/fixture-seed/config.txt
+        ln -s /etc/shadow /var/lib/maxops-executor/fixture-seed/escape
+        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed add config.txt escape
+        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed \
+          -c user.name=Fixture -c user.email=fixture@example.invalid commit -m initial
+        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed remote add origin /var/lib/maxops-executor/fixture-remote.git
+        ${pkgs.git}/bin/git -C /var/lib/maxops-executor/fixture-seed push origin refs/heads/main
+        rm -rf /var/lib/maxops-executor/fixture-seed
+      fi
+    '';
     systemd.services.maxops-fixture = {
       wantedBy = [ "multi-user.target" ];
       serviceConfig.Type = "oneshot";
@@ -149,7 +191,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_open_port(9721)
     machine.succeed("curl -fsS http://127.0.0.1:9720/healthz")
     machine.fail("curl -fsS http://127.0.0.1:9720/v1/snapshot")
-    ctl = "maxopsctl --token-file /run/client-token "
+    ctl = "timeout 60 maxopsctl --token-file /run/client-token "
     machine.succeed(ctl + "host.facts --host fixture | jq -e '.facts.system_closure | startswith(\"/nix/store/\")'")
     machine.succeed(ctl + "units.failed | jq -e '.hosts[0].units[0].unit == \"maxops-fixture.service\"'")
     machine.succeed(ctl + "units.list --host fixture | jq -e '.units | length == 3'")
@@ -159,13 +201,13 @@ pkgs.testers.runNixOSTest {
     machine.fail(ctl + "units.logs --host fixture --unit sshd.service")
     machine.fail("runuser -u maxops-agent -- systemctl --no-ask-password restart maxops-fixture.service")
 
-    manager = "maxopsctl --token-file /run/manager-token "
+    manager = "timeout 60 maxopsctl --token-file /run/manager-token "
     machine.succeed("echo '{\"host\":\"fixture\",\"profile\":\"diagnostic\",\"command\":{\"argv\":[\"${pkgs.bash}/bin/bash\",\"-c\",\"printf first; sleep 12; printf second\"]},\"timeout_seconds\":30}' > /tmp/long-job.json")
     machine.fail(ctl + "exec.run --params-file /tmp/long-job.json --idempotency-key observer-cannot-run")
     job = machine.succeed(manager + "exec.run --params-file /tmp/long-job.json --idempotency-key restart-survival | jq -r .job_id").strip()
     same_job = machine.succeed(manager + "exec.run --params-file /tmp/long-job.json --idempotency-key restart-survival | jq -r .job_id").strip()
     assert job == same_job
-    machine.wait_until_succeeds(f"systemctl is-active maxops-job-{job}.service")
+    machine.wait_until_succeeds(f"systemctl is-active maxops-job-{job}.service", timeout=20)
     machine.succeed(f"systemctl show maxops-job-{job}.service -p User --value | grep -x maxops-runner")
     machine.succeed(f"systemctl show maxops-job-{job}.service -p KillMode --value | grep -x control-group")
     machine.succeed(f"systemctl show maxops-job-{job}.service -p NoNewPrivileges --value | grep -x yes")
@@ -176,7 +218,7 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed("echo '{\"host\":\"fixture\",\"profile\":\"diagnostic\",\"command\":{\"argv\":[\"${pkgs.bash}/bin/bash\",\"-c\",\"sleep 30\"]},\"timeout_seconds\":30}' > /tmp/cancel-job.json")
     cancel_job = machine.succeed(manager + "exec.run --params-file /tmp/cancel-job.json --idempotency-key cancellation | jq -r .job_id").strip()
-    machine.wait_until_succeeds(f"systemctl is-active maxops-job-{cancel_job}.service")
+    machine.wait_until_succeeds(f"systemctl is-active maxops-job-{cancel_job}.service", timeout=20)
     revision = machine.succeed(manager + f"jobs.status --job-id {cancel_job} | jq -r .handle.revision").strip()
     machine.succeed(manager + f"jobs.cancel --job-id {cancel_job} --expected-revision {revision} --reason fixture-stop | jq -e '.handle.state == \"cancelled\"'")
     machine.fail(f"systemctl is-active maxops-job-{cancel_job}.service")
@@ -221,7 +263,7 @@ pkgs.testers.runNixOSTest {
 
     reload_job = machine.succeed(manager + "units.reload --host fixture --unit maxops-managed.service --idempotency-key service-reload | jq -r .job_id").strip()
     machine.wait_until_succeeds(manager + f"jobs.status --job-id {reload_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
-    machine.wait_until_succeeds("grep -x reload /var/lib/maxops-managed-reloads")
+    machine.wait_until_succeeds("grep -x reload /var/lib/maxops-managed-reloads", timeout=20)
     machine.succeed("touch /run/maxops-fail-reload")
     failed_reload = machine.succeed(manager + "units.reload --host fixture --unit maxops-managed.service --idempotency-key failed-reload | jq -r .job_id").strip()
     machine.wait_until_succeeds(manager + f"jobs.status --job-id {failed_reload} | jq -e '.handle.state == \"failed\" and .result.after.reload_result != \"success\"'", timeout=20)
@@ -242,7 +284,7 @@ pkgs.testers.runNixOSTest {
 
     # Two independent principals may submit concurrently, but the executor's
     # persistent host-level manager lock makes the observed invocation chain serial.
-    manager2 = "maxopsctl --token-file /run/manager2-token "
+    manager2 = "timeout 60 maxopsctl --token-file /run/manager2-token "
     first_restart = machine.succeed(manager + "units.restart --host fixture --unit maxops-managed.service --idempotency-key concurrent-manager-1 | jq -r .job_id").strip()
     machine.wait_until_succeeds(manager + f"jobs.status --job-id {first_restart} | jq -e '.handle.state == \"reconciling\"'", timeout=20)
     second_restart = machine.succeed(manager2 + "units.restart --host fixture --unit maxops-managed.service --idempotency-key concurrent-manager-2 | jq -r .job_id").strip()
@@ -252,5 +294,60 @@ pkgs.testers.runNixOSTest {
     second_before = machine.succeed(manager2 + f"jobs.status --job-id {second_restart} | jq -r .result.before.invocation_id").strip()
     assert first_after == second_before
     machine.fail(manager2 + f"jobs.status --job-id {first_restart}")
+
+    # Repository work happens in private immutable revisions, never in a human checkout.
+    machine.succeed("git clone /var/lib/maxops-executor/fixture-remote.git /tmp/human")
+    machine.succeed("printf dirty >> /tmp/human/config.txt")
+    machine.fail(ctl + "workspace.create --repository fixture --idempotency-key observer-workspace")
+    machine.fail(manager2 + "workspace.create --repository fixture --idempotency-key ungranted-workspace")
+    machine.succeed(manager + "workspace.create --repository fixture --idempotency-key workspace-create --wait > /tmp/workspace-create.json")
+    workspace = machine.succeed("jq -r .result.workspace.workspace_id /tmp/workspace-create.json").strip()
+    base = machine.succeed("jq -r .result.workspace.base_commit /tmp/workspace-create.json").strip()
+    machine.succeed(manager + f"workspace.status --repository fixture --workspace-id {workspace} | jq -e '.revision == 1 and .state == \"clean\"'")
+    machine.succeed(manager + f"workspace.read --repository fixture --workspace-id {workspace} --expected-revision 1 --path config.txt | jq -e '.content == \"initial\\n\"'")
+    machine.fail(manager + f"workspace.read --repository fixture --workspace-id {workspace} --expected-revision 1 --path ../etc/shadow 2> /tmp/traversal-error")
+    machine.succeed("grep -F 422 /tmp/traversal-error")
+    machine.fail(manager + f"workspace.read --repository fixture --workspace-id {workspace} --expected-revision 1 --path escape 2> /tmp/symlink-error")
+    machine.succeed("grep -F 422 /tmp/symlink-error")
+    machine.succeed(f"cat > /tmp/workspace-apply.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{workspace}\",\"expected_revision\":1,\"edits\":[{{\"path\":\"config.txt\",\"content\":\"changed\\n\"}}]}}\nEOF")
+    machine.succeed(manager + "workspace.apply --params-file /tmp/workspace-apply.json | jq -e '.revision == 2 and .state == \"dirty\"'")
+    machine.fail(manager + "workspace.apply --params-file /tmp/workspace-apply.json 2> /tmp/revision-error")
+    machine.succeed("grep -F 409 /tmp/revision-error")
+    machine.succeed(manager + f"workspace.diff --repository fixture --workspace-id {workspace} --expected-revision 2 | jq -r .patch | grep -F '+changed'")
+
+    frozen_job = machine.succeed(manager + f"workspace.check --repository fixture --workspace-id {workspace} --expected-revision 2 --check frozen --idempotency-key frozen-check | jq -r .job_id").strip()
+    machine.wait_until_succeeds(f"systemctl is-active maxops-job-{frozen_job}.service", timeout=20)
+    machine.succeed(f"cat > /tmp/workspace-apply-2.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{workspace}\",\"expected_revision\":2,\"edits\":[{{\"path\":\"config.txt\",\"content\":\"changed-again\\n\"}}]}}\nEOF")
+    machine.succeed(manager + "workspace.apply --params-file /tmp/workspace-apply-2.json | jq -e '.revision == 3'")
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {frozen_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
+    machine.succeed(manager + f"workspace.check --repository fixture --workspace-id {workspace} --expected-revision 3 --check content --idempotency-key content-check --wait | jq -e '.handle.state == \"succeeded\"'")
+    machine.succeed(manager + f"workspace.commit --repository fixture --workspace-id {workspace} --expected-revision 3 --message 'maxops change' > /tmp/workspace-commit.json")
+    commit = machine.succeed("jq -r .commit_hash /tmp/workspace-commit.json").strip()
+    assert len(commit) == 40
+
+    # Another writer advances the remote. The old baseline cannot be published over it.
+    machine.succeed("git clone /var/lib/maxops-executor/fixture-remote.git /tmp/external")
+    machine.succeed("printf external\\n > /tmp/external/external.txt")
+    machine.succeed("git -C /tmp/external add external.txt && git -C /tmp/external -c user.name=External -c user.email=external@example.invalid commit -m external && git -C /tmp/external push origin main")
+    external = machine.succeed("git --git-dir=/var/lib/maxops-executor/fixture-remote.git rev-parse refs/heads/main").strip()
+    machine.succeed(f"cat > /tmp/workspace-publish-stale.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{workspace}\",\"expected_revision\":4,\"reference\":\"refs/heads/main\",\"expected_remote_head\":\"{base}\"}}\nEOF")
+    stale_publish = machine.succeed(manager + "workspace.publish --params-file /tmp/workspace-publish-stale.json --idempotency-key stale-publish | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {stale_publish} | jq -e '.handle.state == \"failed\" and .result.error == \"baseline_changed\" and .result.observed_remote_head == \"{external}\"'", timeout=20)
+    machine.succeed("git --git-dir=/var/lib/maxops-executor/fixture-remote.git show refs/heads/main:config.txt | grep -x initial")
+
+    # Re-observe the new remote head in a new workspace, then publish by fast-forward.
+    machine.succeed(f"cat > /tmp/workspace-create-2-request.json <<'EOF'\n{{\"repository\":\"fixture\",\"expected_remote_head\":\"{external}\"}}\nEOF")
+    machine.succeed(manager + "workspace.create --params-file /tmp/workspace-create-2-request.json --idempotency-key workspace-rebase --wait > /tmp/workspace-create-2.json")
+    workspace2 = machine.succeed("jq -r .result.workspace.workspace_id /tmp/workspace-create-2.json").strip()
+    machine.succeed(f"cat > /tmp/workspace-apply-3.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{workspace2}\",\"expected_revision\":1,\"edits\":[{{\"path\":\"config.txt\",\"content\":\"published\\n\"}}]}}\nEOF")
+    machine.succeed(manager + "workspace.apply --params-file /tmp/workspace-apply-3.json > /tmp/workspace-apply-3-result.json")
+    machine.succeed(manager + f"workspace.commit --repository fixture --workspace-id {workspace2} --expected-revision 2 --message 'publish after external change' > /tmp/workspace-commit-2.json")
+    commit2 = machine.succeed("jq -r .commit_hash /tmp/workspace-commit-2.json").strip()
+    machine.succeed(f"cat > /tmp/workspace-publish.json <<'EOF'\n{{\"repository\":\"fixture\",\"workspace_id\":\"{workspace2}\",\"expected_revision\":3,\"reference\":\"refs/heads/main\",\"expected_remote_head\":\"{external}\"}}\nEOF")
+    machine.succeed(manager + "workspace.publish --params-file /tmp/workspace-publish.json --idempotency-key publish-after-refresh --wait | jq -e '.handle.state == \"succeeded\" and .result.workspace.state == \"published\"'")
+    machine.succeed(f"test \"$(git --git-dir=/var/lib/maxops-executor/fixture-remote.git rev-parse refs/heads/main)\" = {commit2}")
+    machine.succeed("git --git-dir=/var/lib/maxops-executor/fixture-remote.git show refs/heads/main:config.txt | grep -x published")
+    machine.fail("git -C /tmp/human diff --quiet")
+    machine.succeed("grep -F dirty /tmp/human/config.txt")
   '';
 }

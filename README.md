@@ -33,6 +33,11 @@ and external changes to repositories and hosts.
   Nix-declared unit. The executor records the before/after state and
   InvocationID, serializes its own service changes per host, rejects a stale
   expected InvocationID, and reconciles an accepted action after restart.
+- `workspace.create/status/read/apply/diff/commit/check/publish` operate on
+  Nix-declared repositories in private immutable revision directories. Every
+  read or mutation uses revision compare-and-swap; checks run against a frozen
+  revision, and publish re-observes the remote ref before a normal fast-forward
+  push. Human checkouts are never used or cleaned.
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
@@ -48,8 +53,8 @@ and external changes to repositories and hosts.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: configuration workspaces, deployment, MCP,
-QQ impersonation/delegation, reboot, hub-side durable notification storage,
+Not implemented: deployment, MCP, QQ impersonation/delegation, reboot,
+hub-side durable notification storage,
 arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
 generation is distinct from the running closure; filesystem ctime is never
 called deployment time.
@@ -106,6 +111,18 @@ maxopsctl units.restart --host example --unit nginx.service \
   --idempotency-key incident-123-restart --wait
 maxopsctl alerts.active
 maxopsctl exec.run --params-file ./job.json --idempotency-key incident-123 --wait --follow
+maxopsctl workspace.create --repository nix-config --idempotency-key change-123 --wait
+maxopsctl workspace.read --repository nix-config --workspace-id "$WORKSPACE" \
+  --expected-revision 1 --path nixos/hosts/example/default.nix
+maxopsctl workspace.apply --params-file ./workspace-edit.json
+maxopsctl workspace.diff --repository nix-config --workspace-id "$WORKSPACE" \
+  --expected-revision 2
+maxopsctl workspace.check --repository nix-config --workspace-id "$WORKSPACE" \
+  --expected-revision 2 --check flake-check --idempotency-key change-123-check --wait
+maxopsctl workspace.commit --repository nix-config --workspace-id "$WORKSPACE" \
+  --expected-revision 2 --message 'fix: update example host'
+maxopsctl workspace.publish --params-file ./workspace-publish.json \
+  --idempotency-key change-123-publish --wait
 maxopsctl jobs.list
 maxopsctl jobs.status --job-id 00000000-0000-0000-0000-000000000000
 maxopsctl jobs.logs --job-id 00000000-0000-0000-0000-000000000000

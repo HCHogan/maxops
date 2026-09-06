@@ -23,7 +23,9 @@ use tokio::{
     process::Command,
 };
 
-const MAX_REQUEST_BYTES: u64 = 128 * 1024;
+mod workspace;
+
+const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -45,11 +47,30 @@ struct Config {
     systemd_run: PathBuf,
     systemctl: PathBuf,
     runner: PathBuf,
+    git: PathBuf,
+    workspace_root: PathBuf,
+    repository_root: PathBuf,
     #[serde(default)]
     manageable_units: BTreeSet<String>,
     #[serde(default)]
     credential_sources: BTreeMap<String, PathBuf>,
     profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    repositories: BTreeMap<String, RepositoryConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryConfig {
+    url: String,
+    default_ref: String,
+    #[serde(default)]
+    publish_refs: BTreeSet<String>,
+    check_profile: String,
+    #[serde(default)]
+    checks: BTreeMap<String, Vec<String>>,
+    author_name: String,
+    author_email: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -94,6 +115,8 @@ struct App {
     store: Store,
     bus: zbus::Connection,
     service_workers: Mutex<HashSet<JobId>>,
+    workspace_workers: Mutex<HashSet<JobId>>,
+    workspace_serial: tokio::sync::Mutex<()>,
 }
 
 #[zbus::proxy(
@@ -189,6 +212,8 @@ async fn main() -> Result<()> {
     validate_config(&config)?;
     prepare_socket(&config.socket_path)?;
     std::fs::create_dir_all(&config.spec_directory)?;
+    std::fs::create_dir_all(&config.workspace_root)?;
+    std::fs::create_dir_all(&config.repository_root)?;
     let listener = UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o660))?;
     let store = Store::open(&config.state_file).await?;
@@ -198,6 +223,8 @@ async fn main() -> Result<()> {
         store,
         bus,
         service_workers: Mutex::new(HashSet::new()),
+        workspace_workers: Mutex::new(HashSet::new()),
+        workspace_serial: tokio::sync::Mutex::new(()),
     });
     for job in app.store.nonterminal_jobs().await? {
         recover_job(app.clone(), job);
@@ -233,12 +260,21 @@ fn validate_config(config: &Config) -> Result<()> {
         &config.systemd_run,
         &config.systemctl,
         &config.runner,
+        &config.git,
+        &config.workspace_root,
+        &config.repository_root,
     ] {
         ensure!(path.is_absolute(), "executor paths must be absolute");
     }
     ensure!(
         !config.profiles.is_empty(),
         "at least one execution profile is required"
+    );
+    ensure!(
+        config.workspace_root != config.repository_root
+            && !config.workspace_root.starts_with(&config.repository_root)
+            && !config.repository_root.starts_with(&config.workspace_root),
+        "workspace and repository roots must be separate"
     );
     ensure!(
         config.spool_root == Path::new("/var/lib/maxops-jobs"),
@@ -306,7 +342,59 @@ fn validate_config(config: &Config) -> Result<()> {
             "working roots must be absolute"
         );
     }
+    for (name, repository) in &config.repositories {
+        ensure!(
+            maxops_proto::valid_repository_id(name),
+            "invalid repository ID"
+        );
+        ensure!(
+            !repository.url.is_empty()
+                && repository.url.len() <= 4096
+                && !repository.url.contains(['\0', '\n', '\r']),
+            "invalid repository URL"
+        );
+        ensure!(
+            valid_git_ref(&repository.default_ref)
+                && repository.publish_refs.iter().all(|reference| {
+                    valid_git_ref(reference) && reference.starts_with("refs/heads/")
+                }),
+            "invalid repository ref"
+        );
+        ensure!(
+            config.profiles.contains_key(&repository.check_profile),
+            "repository references an unknown check profile"
+        );
+        ensure!(
+            !repository.author_name.trim().is_empty()
+                && !repository.author_email.trim().is_empty()
+                && !repository.author_name.contains(['\0', '\n', '\r'])
+                && !repository.author_email.contains(['\0', '\n', '\r']),
+            "invalid configured Git author"
+        );
+        ensure!(
+            repository.checks.iter().all(|(check, argv)| {
+                maxops_proto::valid_check_id(check)
+                    && !argv.is_empty()
+                    && argv.len() <= 256
+                    && argv
+                        .iter()
+                        .all(|argument| argument.len() <= 16 * 1024 && !argument.contains('\0'))
+            }),
+            "invalid configured repository check"
+        );
+    }
     Ok(())
+}
+
+fn valid_git_ref(reference: &str) -> bool {
+    reference.starts_with("refs/")
+        && reference.len() <= 512
+        && !reference.contains("..")
+        && !reference.contains("@{")
+        && !reference.ends_with(['/', '.'])
+        && !reference
+            .bytes()
+            .any(|byte| byte <= b' ' || b"~^:?*[\\".contains(&byte))
 }
 
 fn valid_credential_name(value: &str) -> bool {
@@ -348,10 +436,13 @@ async fn serve_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {
         Ok(response) => ExecutorWireResponse::Ok {
             response: Box::new(response),
         },
-        Err(error) => ExecutorWireResponse::Error {
-            code: "executor_request_failed".into(),
-            message: error.to_string(),
-        },
+        Err(error) => {
+            let message = format!("{error:#}");
+            ExecutorWireResponse::Error {
+                code: executor_error_code(&message).into(),
+                message,
+            }
+        }
     };
     let mut response = serde_json::to_vec(&response)?;
     ensure!(
@@ -364,17 +455,37 @@ async fn serve_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
+fn executor_error_code(message: &str) -> &'static str {
+    if message.contains("workspace revision changed") {
+        "workspace_revision_conflict"
+    } else if message.contains("workspace not found") {
+        "workspace_not_found"
+    } else if message.contains("workspace path")
+        || message.contains("workspace target")
+        || message.contains("workspace ancestor")
+        || message.contains("workspace file exceeds")
+    {
+        "invalid_workspace_path"
+    } else {
+        "executor_request_failed"
+    }
+}
+
 async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorResponse> {
     match request {
         ExecutorRequest::Submit { job_id, job } => submit_job(app, job_id, job).await,
         ExecutorRequest::Status(params) => {
             let job = app.store.get_job(&params.job_id).await?;
-            if job.handle.operation == "exec.run" {
+            if is_runner_job(&job.handle.operation) {
                 reconcile_once(&app, &params.job_id).await?;
             } else if ServiceAction::from_operation(&job.handle.operation).is_some()
                 && !job.handle.state.is_terminal()
             {
                 spawn_service_job(app.clone(), job.handle.job_id.clone());
+            } else if workspace::is_workspace_job(&job.handle.operation)
+                && !job.handle.state.is_terminal()
+            {
+                workspace::spawn(app.clone(), job.handle.job_id.clone());
             }
             Ok(ExecutorResponse::Job(
                 app.store.get_job(&params.job_id).await?,
@@ -389,6 +500,11 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
             let existing = app.store.get_job(&params.job_id).await?;
             if ServiceAction::from_operation(&existing.handle.operation).is_some() {
                 return cancel_service_job(&app, existing, params).await;
+            }
+            if workspace::is_workspace_job(&existing.handle.operation)
+                && existing.handle.operation != "workspace.check"
+            {
+                return workspace::cancel(&app, params).await;
             }
             let requested = app
                 .store
@@ -415,6 +531,9 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
                 .await?;
             Ok(ExecutorResponse::Job(cancelled))
         }
+        ExecutorRequest::Workspace { principal, request } => Ok(ExecutorResponse::Workspace(
+            workspace::handle(&app, &principal, request).await?,
+        )),
     }
 }
 
@@ -426,7 +545,9 @@ async fn submit_job(
     ensure!(job.host == app.config.host, "job targets another host");
     let service_action = ServiceAction::from_operation(&job.operation);
     ensure!(
-        job.operation == "exec.run" || service_action.is_some(),
+        job.operation == "exec.run"
+            || service_action.is_some()
+            || workspace::is_workspace_job(&job.operation),
         "unsupported executor operation"
     );
     let accepted = app.store.accept_job(&job_id, &job).await?;
@@ -466,6 +587,31 @@ async fn submit_job(
         }
         return Ok(ExecutorResponse::Job(accepted.job));
     }
+    if workspace::is_workspace_job(&job.operation) {
+        if accepted.created
+            && let Err(error) = workspace::validate_job(&app, &job).await
+        {
+            tracing::warn!(job_id = %job_id, %error, "workspace job validation failed");
+            let failed = app
+                .store
+                .transition_job(
+                    &job_id,
+                    accepted.job.handle.revision,
+                    JobState::Failed,
+                    &json!({"phase":"validation"}),
+                    Some(&json!({"error":"workspace job is not permitted by the target"})),
+                )
+                .await?;
+            return Ok(ExecutorResponse::Job(failed));
+        }
+        if job.operation == "workspace.check" {
+            return submit_command_job(app, job_id, job, accepted).await;
+        }
+        if !accepted.job.handle.state.is_terminal() {
+            workspace::spawn(app, job_id);
+        }
+        return Ok(ExecutorResponse::Job(accepted.job));
+    }
     submit_command_job(app, job_id, job, accepted).await
 }
 
@@ -476,16 +622,12 @@ async fn submit_command_job(
     accepted: maxops_store::SubmitResult,
 ) -> Result<ExecutorResponse> {
     if accepted.created {
-        let prepared = (|| {
-            let params: ExecRunParams = serde_json::from_value(job.spec.clone())?;
-            params.validate().map_err(|message| eyre!(message))?;
-            ensure!(
-                params.host == app.config.host,
-                "command targets another host"
-            );
+        let prepared = async {
+            let params = runner_params(&app, &job.principal, &job.operation, &job.spec).await?;
             let prepared = prepare_runner_spec(&app.config, &params)?;
             Result::<_>::Ok((params, prepared))
-        })();
+        }
+        .await;
         let (params, prepared) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -553,6 +695,29 @@ async fn submit_command_job(
         recover_job(app, accepted.job.clone());
         Ok(ExecutorResponse::Job(accepted.job))
     }
+}
+
+fn is_runner_job(operation: &str) -> bool {
+    matches!(operation, "exec.run" | "workspace.check")
+}
+
+async fn runner_params(
+    app: &App,
+    principal: &str,
+    operation: &str,
+    spec: &serde_json::Value,
+) -> Result<ExecRunParams> {
+    if operation == "workspace.check" {
+        return workspace::check_exec_params(app, principal, spec).await;
+    }
+    ensure!(operation == "exec.run", "unsupported runner job");
+    let params: ExecRunParams = serde_json::from_value(spec.clone())?;
+    params.validate().map_err(|message| eyre!(message))?;
+    ensure!(
+        params.host == app.config.host,
+        "command targets another host"
+    );
+    Ok(params)
 }
 
 async fn cancel_service_job(
@@ -1291,11 +1456,18 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
         spawn_service_job(app, job.handle.job_id);
         return;
     }
+    if workspace::is_workspace_job(&job.handle.operation)
+        && job.handle.operation != "workspace.check"
+    {
+        workspace::spawn(app, job.handle.job_id);
+        return;
+    }
     let id = job.handle.job_id;
     tokio::spawn(async move {
         if job.handle.state == JobState::Queued {
             let recovered = async {
-                let params: ExecRunParams = serde_json::from_value(job.spec.clone())?;
+                let params =
+                    runner_params(&app, &job.principal, &job.handle.operation, &job.spec).await?;
                 let prepared = prepare_runner_spec(&app.config, &params)?;
                 persist_runner_spec(&app.config, &id, &prepared).await?;
                 let dispatching = app
@@ -1354,7 +1526,9 @@ fn recover_job(app: Arc<App>, job: JobRecord) {
                             .await?;
                     }
                     Ok(None) => {
-                        let params: ExecRunParams = serde_json::from_value(job.spec.clone())?;
+                        let params =
+                            runner_params(&app, &job.principal, &job.handle.operation, &job.spec)
+                                .await?;
                         let prepared = prepare_runner_spec(&app.config, &params)?;
                         persist_runner_spec(&app.config, &id, &prepared).await?;
                         launch(&app.config, &id, &params, &prepared, job.deadline).await?;
@@ -1649,6 +1823,9 @@ mod tests {
             systemd_run: "systemd-run".into(),
             systemctl: "/run/current-system/sw/bin/systemctl".into(),
             runner: "/nix/store/example/bin/maxops-job-runner".into(),
+            git: "/run/current-system/sw/bin/git".into(),
+            workspace_root: "/var/lib/maxops-workspaces".into(),
+            repository_root: "/var/lib/maxops-executor/repositories".into(),
             manageable_units: BTreeSet::new(),
             credential_sources: BTreeMap::new(),
             profiles: BTreeMap::from([(
@@ -1666,6 +1843,7 @@ mod tests {
                     memory_max_bytes: None,
                 },
             )]),
+            repositories: BTreeMap::new(),
         };
         assert!(validate_config(&config).is_err());
     }

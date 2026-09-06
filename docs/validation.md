@@ -6,16 +6,16 @@ Validated locally on aarch64-darwin using the devenv toolchain (Rust 1.95.0).
 | --- | --- |
 | `cargo fmt --all --check` | Passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
-| `cargo nextest run --workspace --locked` | 44 passed, none skipped |
+| `cargo nextest run --workspace --locked` | 48 passed, none skipped |
 | `cargo test --workspace --doc --locked` | Passed; no doctest examples yet |
 | `cargo build --workspace --locked` | All workspace targets built |
 | `python3 scripts/smoke.py` | Real hub and CLI passed against a synthetic loopback agent |
 | Criterion protocol benchmarks | Both benchmarks executed successfully |
 | `scripts/check-pins.py <nix-config>/flake.lock` | All three complete nixpkgs lock records match |
 | `nix flake check --all-systems --no-build` | Packages and both Linux VM test derivations evaluated |
-| `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 44 nextest tests in the Nix build sandbox |
+| `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 48 nextest tests in the Nix build sandbox |
 | Smoke test with Nix-packaged binaries | Passed against the synthetic loopback agent |
-| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 44 nextest tests in the Nix build sandbox |
+| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 48 nextest tests in the Nix build sandbox |
 
 The Linux build initially failed when reqwest's platform verifier found no CA
 store inside the Nix sandbox. The package now supplies nixpkgs' CA bundle through
@@ -122,3 +122,35 @@ The macOS store cannot represent ncurses' case-distinct terminfo directories
 faithfully on its case-insensitive volume. The VM fixture therefore uses the
 classic scripted initrd so the closure avoids that damaged local ncurses path;
 the actual VM execution and package build ran on Linux.
+
+## Configuration workspaces
+
+On 2026-09-06, P3 passed the devenv gate with all 48 nextest tests and
+`nix flake check --all-systems --no-build`. The final
+`checks.x86_64-linux.agent-vm` derivation ran under KVM on b650 from the isolated
+`/tmp/maxops-build` checkout; it did not activate a b650 configuration or alter
+its running services.
+
+The VM used a real bare Git remote, Hub, Agent, Executor and transient check
+unit. It verified:
+
+- observation credentials and a management principal without a repository
+  grant cannot create a workspace;
+- create, status, bounded read, file apply, diff and commit operate on revisioned
+  private directories, while traversal and symbolic-link escape return 422;
+- a repeated apply against the old revision returns HTTP 409;
+- a check already running on revision 2 continues to see revision 2 while an
+  apply creates revision 3, and the check process has no credentials directory;
+- a human checkout with an uncommitted edit remains unchanged throughout;
+- an external clone can advance the remote branch, causing a publish with the
+  old expected head to fail as `baseline_changed` without overwriting it; and
+- a new workspace based on the re-observed external commit can commit and
+  publish by fast-forward, after which the remote ref is checked against the
+  exact intended commit.
+
+The VM gate exposed and fixed three integration defects before passing: custom
+workspace jobs skipped the protocol's `dispatching` state, bare
+`checkout-index` lacked an explicit work tree, and revision directories did not
+inherit the check account's dedicated group. CLI calls and polling assertions
+also have explicit test timeouts so a nonterminal regression fails the gate
+instead of hanging it.

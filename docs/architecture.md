@@ -39,8 +39,9 @@ The service uses a dynamic unprivileged user with no capabilities or privilege
 escalation. Journal membership remains a broader process-level read privilege
 than the API allowlist, and is disabled by default.
 
-Limits: 128 KiB execution requests, 256 KiB incoming alert payloads, 2 MiB upstream
-JSON, 1 MiB journal output, 1–200 journal entries and a 1–86400 second window.
+Limits: 128 KiB ordinary requests, 2 MiB management requests, 256 KiB incoming
+alert payloads, 1 MiB workspace edits, 2 MiB upstream JSON, 1 MiB journal output,
+1–200 journal entries and a 1–86400 second window.
 The journal subprocess has a ten-second timeout and is killed on cancellation;
 HTTP connects have a two-second timeout and requests twelve seconds. Requests
 use a shared client with redirects and environment/system proxies disabled.
@@ -155,6 +156,38 @@ Once the systemd call may have begun, a cancellation request is retained but
 does not apply an inverse service action. Deadlines likewise prevent an action
 that has not started; an already accepted action proceeds through reconciliation
 rather than being reported as a safe timeout.
+
+## Configuration workspaces
+
+Repositories, their URLs, default branch, publishable refs, check commands and
+commit identity are Nix-owned executor configuration. Clients name a repository
+and a configured check; they cannot supply a Git URL, arbitrary check command or
+publish destination. Hub principals need an explicit repository grant in
+addition to `workspace:read`, `workspace:write` or `workspace:publish`.
+
+The executor keeps a private bare mirror and one directory per immutable
+workspace revision. A workspace ID is the durable create-job ID, and the SQLite
+record is the commit point for revision changes. `read`, `apply`, `diff` and
+`commit` require the caller's expected revision. Apply creates the next revision
+copy, atomically replaces regular UTF-8 files, updates a private Git index, then
+advances SQLite by compare-and-swap. An interrupted unpublished directory may be
+discarded on retry; a committed revision is never edited in place. Absolute
+paths, traversal, `.git`, symbolic-link targets and special files are rejected.
+
+Checks are normal durable command jobs, but their argv and sandbox profile come
+from repository configuration and their cwd is the exact requested revision.
+The check account can read workspace trees through a dedicated group. It cannot
+read the executor's bare mirror or any future publish credential. A later apply
+therefore does not change the tree observed by an already running check.
+
+Publish accepts only a configured branch and a committed workspace revision. It
+fetches immediately before pushing, compares the observed remote commit with the
+caller's expected remote head, verifies ancestry, and uses a normal non-force
+push. A human or another tool advancing the branch yields `baseline_changed` and
+the external commit remains untouched. The internal fetch/publish locks
+coordinate maxops jobs only. If a push may have succeeded but its result cannot
+be confirmed, the job is `outcome_unknown`; recovery re-observes the remote and
+does not blindly repeat or overwrite it.
 
 ## Library choices
 
