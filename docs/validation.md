@@ -6,16 +6,16 @@ Validated locally on aarch64-darwin using the devenv toolchain (Rust 1.95.0).
 | --- | --- |
 | `cargo fmt --all --check` | Passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
-| `cargo nextest run --workspace --locked` | 14 passed, none skipped |
+| `cargo nextest run --workspace --locked` | 44 passed, none skipped |
 | `cargo test --workspace --doc --locked` | Passed; no doctest examples yet |
-| `cargo build --workspace --locked` | All three binaries built |
+| `cargo build --workspace --locked` | All workspace targets built |
 | `python3 scripts/smoke.py` | Real hub and CLI passed against a synthetic loopback agent |
 | Criterion protocol benchmarks | Both benchmarks executed successfully |
 | `scripts/check-pins.py <nix-config>/flake.lock` | All three complete nixpkgs lock records match |
 | `nix flake check --all-systems --no-build` | Packages and both Linux VM test derivations evaluated |
-| `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 14 nextest tests in the Nix build sandbox |
+| `nix build .#packages.aarch64-darwin.default --no-link` | Passed, including all 44 nextest tests in the Nix build sandbox |
 | Smoke test with Nix-packaged binaries | Passed against the synthetic loopback agent |
-| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 14 nextest tests in the Nix build sandbox |
+| `nix build .#packages.x86_64-linux.default --no-link` on a Linux host | Passed, including all 44 nextest tests in the Nix build sandbox |
 
 The Linux build initially failed when reqwest's platform verifier found no CA
 store inside the Nix sandbox. The package now supplies nixpkgs' CA bundle through
@@ -83,6 +83,40 @@ It verified:
 - a declared credential is injected through systemd credentials, while an
   undeclared credential produces a durable failed job without exposing a
   credential value.
+
+## Durable systemd service execution
+
+On 2026-09-06, P2 passed the devenv gate with all 44 nextest tests and
+`nix flake check --all-systems --no-build`. `scripts/check-pins.py` confirmed
+the repository, devenv and nix-config nixpkgs lock records still match at
+`34268251cf5547d39063f2c5ea9a196246f7f3a6`.
+
+The final `checks.x86_64-linux.agent-vm` derivation ran to completion under KVM
+on b650 from the isolated `/tmp/maxops-build` checkout. The package build ran
+the same 44 tests before starting the VM. It did not change b650's NixOS
+configuration or any service in its running system.
+
+The VM used real systemd D-Bus calls and verified:
+
+- observation credentials and a merely readable failed unit cannot submit a
+  service mutation;
+- restart records exact before/after InvocationIDs and completes after the
+  executor is restarted while the systemd manager job is still in progress;
+- stop and start reach their requested states;
+- a successful reload reaches its service handler, a nonzero `ExecReload`
+  records `failed` from systemd's `ReloadResult`, and a unit without reload
+  support fails without being restarted;
+- a manual `systemctl restart` changes the InvocationID and causes a subsequent
+  request using the old expected ID to fail as `stale_baseline`, leaving the
+  externally changed service running;
+- two independent management principals can submit overlapping restarts, while
+  the executor's durable host-level manager lock makes the second job observe
+  the first job's resulting InvocationID before it acts; and
+- each principal can read only its own job record.
+
+The lock serializes maxops jobs only. The external `systemctl restart` fixture
+deliberately bypasses it, demonstrating that manual and other fleet writers
+remain valid inputs to the next baseline check.
 
 The macOS store cannot represent ncurses' case-distinct terminfo directories
 faithfully on its case-insensitive volume. The VM fixture therefore uses the

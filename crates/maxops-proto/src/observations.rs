@@ -32,6 +32,8 @@ pub struct UnitDetails {
     pub restarts: Option<u32>,
     pub exec_main_code: Option<i32>,
     pub exec_main_status: Option<i32>,
+    #[serde(default)]
+    pub invocation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]

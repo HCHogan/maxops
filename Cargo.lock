@@ -1564,6 +1564,7 @@ dependencies = [
  "base64",
  "clap",
  "color-eyre",
+ "futures",
  "jiff",
  "maxops-proto",
  "maxops-store",
@@ -1573,6 +1574,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

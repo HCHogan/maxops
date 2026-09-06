@@ -26,6 +26,7 @@ let
     systemd_run = "${pkgs.systemd}/bin/systemd-run";
     systemctl = "${pkgs.systemd}/bin/systemctl";
     runner = "${cfg.package}/bin/maxops-job-runner";
+    manageable_units = cfg.manageableUnits;
     credential_sources = cfg.credentialSources;
     inherit profiles;
   };
@@ -115,6 +116,11 @@ in
       type = lib.types.attrsOf lib.types.str;
       default = { };
       description = "Runtime secret paths keyed by API credential reference name.";
+    };
+    manageableUnits = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Exact systemd service names the executor may mutate over D-Bus.";
     };
   };
 

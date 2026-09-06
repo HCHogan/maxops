@@ -123,6 +123,39 @@ per-profile allowlist. The target passes only requested names through systemd's
 `LoadCredential`; API clients cannot choose source paths or read credential
 contents through job metadata.
 
+## Durable systemd service jobs
+
+`units.start`, `units.stop`, `units.restart` and `units.reload` share the durable
+Hub/executor job protocol. They require a management credential, the
+`units:manage` capability and an exact unit present in the Hub, Agent and
+Executor `manageable_units` inventories. The Agent forwards only the typed
+operation to the executor's Unix socket. The executor calls systemd over D-Bus;
+it does not construct a shell command or accept an arbitrary unit path.
+
+Before a call, the executor reads `ActiveState`, `SubState` and `InvocationID`.
+An optional expected InvocationID is a compare-before-write guard: a mismatch
+fails the job as `stale_baseline` before systemd receives the action. This catches
+observable manual restarts between diagnosis and execution without treating
+maxops as the only service writer.
+
+The executor serializes its own service jobs with a durable host-level systemd
+manager lock. This queue cannot block `systemctl`, another deployment tool or a
+human. Each job moves to `running` before making the D-Bus call, then to
+`reconciling` after systemd returns its manager job path. An executor restart
+never blindly repeats a `running` action. It observes the unit instead; when the
+target effect is visible it records that external change cannot be excluded,
+and otherwise returns `outcome_unknown`. A `reconciling` job continues to watch
+the accepted systemd job and records the before/after state. Unsupported reload
+is a failed action and never falls back to restart. The lock remains held for a
+short property-settle interval before the final observation and next maxops
+service action.
+
+Cancellation is definitive only while an action is still queued or dispatching.
+Once the systemd call may have begun, a cancellation request is retained but
+does not apply an inverse service action. Deadlines likewise prevent an action
+that has not started; an already accepted action proceeds through reconciliation
+rather than being reported as a safe timeout.
+
 ## Library choices
 
 - `reqwest`: shared async HTTP client, rustls, explicit deadlines and bounded
@@ -147,11 +180,11 @@ References: [reqwest](https://docs.rs/reqwest/latest/reqwest/),
 
 ## Mutation boundary
 
-Version 0.2 includes preauthorized command execution with observation credentials
-kept separate. It does not require per-command human confirmation within the
-configured scope. Immutable job specifications, execution-time checks,
-idempotency, durable records and reconciliation of unknown outcomes remain
-required.
+Version 0.2 includes preauthorized command and service execution with
+observation credentials kept separate. It does not require per-command human
+confirmation within the configured scope. Immutable job specifications,
+execution-time checks, idempotency, durable records and reconciliation of
+unknown outcomes remain required.
 
 maxops is one of several fleet writers. People and other tools may push commits,
 rebuild hosts or change services directly. Live observations and remote refs are

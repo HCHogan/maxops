@@ -16,6 +16,7 @@ let
     execution_token_file =
       if host.executionTokenFile == null then null else "${credentialDir}/execution-${toString i}";
     readable_units = host.readableUnits;
+    manageable_units = host.manageableUnits;
   }) cfg.hosts;
   clients = lib.imap0 (i: client: {
     name = client.name;
@@ -109,6 +110,11 @@ in
               default = [ ];
               description = "Exact readable service names, also configured on the agent.";
             };
+            manageableUnits = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              description = "Exact readable services that management clients may mutate.";
+            };
           };
         }
       );
@@ -139,6 +145,7 @@ in
                   "host:read"
                   "metrics:read"
                   "units:read"
+                  "units:manage"
                   "logs:read"
                   "alerts:read"
                   "exec:run"
@@ -202,9 +209,15 @@ in
         ) secretFiles;
         message = "maxops-hub tokens must use runtime paths outside the Nix store.";
       }
+      {
+        assertion = lib.all (
+          host: lib.all (unit: builtins.elem unit host.readableUnits) host.manageableUnits
+        ) cfg.hosts;
+        message = "maxops-hub manageableUnits must be a subset of readableUnits.";
+      }
     ];
     systemd.services.maxops-hub = {
-      description = "maxops read-only fleet hub";
+      description = "maxops fleet hub";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"

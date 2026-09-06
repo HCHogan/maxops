@@ -9,6 +9,7 @@ license.workspace = true
 base64.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
+futures.workspace = true
 jiff.workspace = true
 maxops-proto.workspace = true
 maxops-store.workspace = true
@@ -17,6 +18,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zbus.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

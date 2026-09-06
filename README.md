@@ -1,14 +1,14 @@
 # maxops
 
 A small fleet control plane with authenticated observations and opt-in durable
-command jobs. Nix owns deployment and inventory; Prometheus owns metrics. No
-host or user from a private fleet is built in.
+command and systemd service jobs. Nix owns deployment and inventory; Prometheus
+owns metrics. No host or user from a private fleet is built in.
 
 Version 0.2 extends the initial single-host pilot with fleet observations.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
 The [implementation plan](docs/implementation-plan.md) covers the remaining
-service, configuration, deployment, event and client stages. Every API is usable
+configuration, deployment, event and client stages. Every API is usable
 by people and arbitrary automation clients. The design supports concurrent manual
 and external changes to repositories and hosts.
 
@@ -29,6 +29,10 @@ and external changes to repositories and hosts.
   reconciles persistent result records after restart. Diagnostic profiles run as
   an ordinary account with systemd hardening; root profiles require an explicit
   privileged setting.
+- `units.start/stop/restart/reload` use systemd's typed D-Bus API for an exact
+  Nix-declared unit. The executor records the before/after state and
+  InvocationID, serializes its own service changes per host, rejects a stale
+  expected InvocationID, and reconciles an accepted action after restart.
 - Explicit per-client host and capability grants. Request bodies cannot supply
   an identity. Both hub and agent enforce readable service allowlists.
 - Agent: systemd D-Bus status, kernel, uptime, current `/run/current-system`
@@ -44,7 +48,7 @@ and external changes to repositories and hosts.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 
-Not implemented: service changes, configuration workspaces, deployment, MCP,
+Not implemented: configuration workspaces, deployment, MCP,
 QQ impersonation/delegation, reboot, hub-side durable notification storage,
 arbitrary PromQL, or trustworthy activation timestamps. Persistent profile
 generation is distinct from the running closure; filesystem ctime is never
@@ -96,6 +100,10 @@ maxopsctl deploy.status
 maxopsctl units.list --host example
 maxopsctl units.status --host example --unit nginx.service
 maxopsctl units.logs --host example --unit nginx.service --lines 50 --since-seconds 3600
+CURRENT_INVOCATION_ID=$(maxopsctl units.status --host example --unit nginx.service | jq -r .unit.details.invocation_id)
+maxopsctl units.restart --host example --unit nginx.service \
+  --expected-invocation-id "$CURRENT_INVOCATION_ID" \
+  --idempotency-key incident-123-restart --wait
 maxopsctl alerts.active
 maxopsctl exec.run --params-file ./job.json --idempotency-key incident-123 --wait --follow
 maxopsctl jobs.list
@@ -159,6 +167,7 @@ imports = [
 ];
 services.maxops-executor = {
   enable = true;
+  manageableUnits = [ "nginx.service" ];
   credentialSources.github-token = "/run/secrets/github-token";
   profiles.diagnostic.allowedCredentials = [ "github-token" ];
 };
@@ -168,6 +177,7 @@ services.maxops-agent = {
   listenAddress = "100.64.0.10";
   tokenFile = "/run/secrets/maxops-agent";
   readableUnits = [ "nginx.service" ];
+  manageableUnits = [ "nginx.service" ];
   allowLogs = false;
   execution = {
     enable = true;
@@ -186,6 +196,7 @@ services.maxops-hub = {
     tokenFile = "/run/secrets/example-agent";
     executionTokenFile = "/run/secrets/example-agent-execution";
     readableUnits = [ "nginx.service" ];
+    manageableUnits = [ "nginx.service" ];
   }];
   clients = [{
     name = "operator";
@@ -198,10 +209,12 @@ services.maxops-hub = {
 };
 ```
 
-Add a separate client with `access = "manage"` and the `exec:run`, `jobs:read`
-and `jobs:cancel` capabilities to enable command jobs. Observation clients remain
-read-only. Execution profiles and their users, timeout, output, process, memory,
-working-directory and environment limits are declared under
+Add a separate client with `access = "manage"` and the `units:manage`, `exec:run`,
+`jobs:read` and `jobs:cancel` capabilities for the corresponding job APIs.
+Observation clients remain read-only. A unit must appear in the Hub, Agent and
+Executor `manageableUnits` lists; these are exact names and are separate from
+the broader readable inventory. Execution profiles and their users, timeout,
+output, process, memory, working-directory and environment limits are declared under
 `services.maxops-executor.profiles`.
 Credential references are server-side names: the API cannot supply a filesystem
 path, and a profile can request only names in its `allowedCredentials` list.
@@ -230,7 +243,8 @@ notifications. In particular:
   with an exact host selector. CPU busy fraction is one minus idle rate per CPU.
   Source times are queried separately; stale, future, missing, duplicate and
   non-finite observations are not healthy zeroes. Arbitrary PromQL is disabled.
-- Management scope is set by Nix inventory, client capabilities and executor
-  profiles. maxops does not assume it is the fleet's only writer: later service,
-  Git and deployment stages re-observe remote and runtime baselines before each
-  side effect. Internal job locks cannot exclude a human or another tool.
+- Management scope is set by Nix inventory, client capabilities, manageable
+  units and executor profiles. maxops does not assume it is the fleet's only
+  writer: service operations re-observe the unit immediately before acting;
+  later Git and deployment stages re-observe remote and runtime baselines before
+  each side effect. Internal job locks cannot exclude a human or another tool.

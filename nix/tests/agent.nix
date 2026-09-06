@@ -17,10 +17,15 @@ pkgs.testers.runNixOSTest {
       "f /run/client-token 0400 root root - client-test-token-bbbbbbbbbbbbbbbbbbbbb"
       "f /run/execution-token 0400 root root - execution-test-token-cccccccccccccccccc"
       "f /run/manager-token 0400 root root - manager-test-token-dddddddddddddddddddd"
+      "f /run/manager2-token 0400 root root - manager2-test-token-eeeeeeeeeeeeeeeeeeeee"
       "f /run/job-credential 0400 root root - fixture-credential-value"
     ];
     services.maxops-executor = {
       enable = true;
+      manageableUnits = [
+        "maxops-managed.service"
+        "maxops-no-reload.service"
+      ];
       credentialSources.fixture = "/run/job-credential";
       profiles.diagnostic = {
         timeoutSeconds = 30;
@@ -33,7 +38,15 @@ pkgs.testers.runNixOSTest {
     services.maxops-agent = {
       enable = true;
       tokenFile = "/run/agent-token";
-      readableUnits = [ "maxops-fixture.service" ];
+      readableUnits = [
+        "maxops-fixture.service"
+        "maxops-managed.service"
+        "maxops-no-reload.service"
+      ];
+      manageableUnits = [
+        "maxops-managed.service"
+        "maxops-no-reload.service"
+      ];
       allowLogs = true;
       execution = {
         enable = true;
@@ -48,7 +61,15 @@ pkgs.testers.runNixOSTest {
           agentUrl = "http://127.0.0.1:9720";
           tokenFile = "/run/agent-token";
           executionTokenFile = "/run/execution-token";
-          readableUnits = [ "maxops-fixture.service" ];
+          readableUnits = [
+            "maxops-fixture.service"
+            "maxops-managed.service"
+            "maxops-no-reload.service"
+          ];
+          manageableUnits = [
+            "maxops-managed.service"
+            "maxops-no-reload.service"
+          ];
         }
       ];
       clients = [
@@ -70,6 +91,18 @@ pkgs.testers.runNixOSTest {
           access = "manage";
           capabilities = [
             "exec:run"
+            "units:manage"
+            "jobs:read"
+            "jobs:cancel"
+          ];
+        }
+        {
+          name = "manager2";
+          tokenFile = "/run/manager2-token";
+          hosts = [ "fixture" ];
+          access = "manage";
+          capabilities = [
+            "units:manage"
             "jobs:read"
             "jobs:cancel"
           ];
@@ -84,6 +117,29 @@ pkgs.testers.runNixOSTest {
         exit 1
       '';
     };
+    systemd.services.maxops-managed = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        echo "$INVOCATION_ID" >> /var/lib/maxops-managed-invocations
+        trap 'echo reload >> /var/lib/maxops-managed-reloads' HUP
+        while true; do sleep 1; done
+      '';
+      reload = ''
+        if test -e /run/maxops-fail-reload; then
+          exit 1
+        fi
+        kill -HUP "$MAINPID"
+      '';
+      preStop = ''
+        sleep 4
+      '';
+    };
+    systemd.services.maxops-no-reload = {
+      wantedBy = [ "multi-user.target" ];
+      script = ''
+        while true; do sleep 1; done
+      '';
+    };
   };
   testScript = ''
     start_all()
@@ -96,7 +152,7 @@ pkgs.testers.runNixOSTest {
     ctl = "maxopsctl --token-file /run/client-token "
     machine.succeed(ctl + "host.facts --host fixture | jq -e '.facts.system_closure | startswith(\"/nix/store/\")'")
     machine.succeed(ctl + "units.failed | jq -e '.hosts[0].units[0].unit == \"maxops-fixture.service\"'")
-    machine.succeed(ctl + "units.list --host fixture | jq -e '.units | length == 1'")
+    machine.succeed(ctl + "units.list --host fixture | jq -e '.units | length == 3'")
     machine.succeed(ctl + "units.status --host fixture --unit maxops-fixture.service | jq -e '.unit.details.exec_main_status == 1'")
     machine.succeed(ctl + "deploy.status | jq -e '.hosts[0].activated_at == null'")
     machine.succeed(ctl + "units.logs --host fixture --unit maxops-fixture.service | jq -e '[.entries[].message] | any(contains(\"maxops-journal-fixture\"))'")
@@ -141,5 +197,60 @@ pkgs.testers.runNixOSTest {
     machine.succeed("jq '.credential_refs = [\"undeclared\"]' /tmp/credential-job.json > /tmp/forbidden-credential-job.json")
     forbidden_job = machine.succeed(manager + "exec.run --params-file /tmp/forbidden-credential-job.json --idempotency-key forbidden-credential | jq -r .job_id").strip()
     machine.wait_until_succeeds(manager + f"jobs.status --job-id {forbidden_job} | jq -e '.handle.state == \"failed\"'", timeout=20)
+
+    # Service mutations use a distinct capability and exact manageable-unit list.
+    machine.fail(ctl + "units.restart --host fixture --unit maxops-managed.service --idempotency-key observer-service-action")
+    machine.fail(manager + "units.restart --host fixture --unit maxops-fixture.service --idempotency-key forbidden-service")
+    invocation = machine.succeed(ctl + "units.status --host fixture --unit maxops-managed.service | jq -r .unit.details.invocation_id").strip()
+    assert len(invocation) == 32
+    machine.succeed(f"echo '{{\"host\":\"fixture\",\"unit\":\"maxops-managed.service\",\"expected_invocation_id\":\"{invocation}\"}}' > /tmp/restart-service.json")
+    restart_job = machine.succeed(manager + "units.restart --params-file /tmp/restart-service.json --idempotency-key service-restart-recovery | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {restart_job} | jq -e '.handle.state == \"reconciling\"'", timeout=20)
+    machine.succeed("systemctl restart maxops-executor.service")
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {restart_job} | jq -e '.handle.state == \"succeeded\"'", timeout=30)
+    restarted_invocation = machine.succeed(ctl + "units.status --host fixture --unit maxops-managed.service | jq -r .unit.details.invocation_id").strip()
+    assert restarted_invocation != invocation
+    machine.succeed(manager + f"jobs.status --job-id {restart_job} | jq -e '.result.before.invocation_id == \"{invocation}\" and .result.after.invocation_id == \"{restarted_invocation}\"'")
+
+    stop_job = machine.succeed(manager + "units.stop --host fixture --unit maxops-managed.service --idempotency-key service-stop | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {stop_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
+    machine.fail("systemctl is-active maxops-managed.service")
+    start_job = machine.succeed(manager + "units.start --host fixture --unit maxops-managed.service --idempotency-key service-start | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {start_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
+    machine.succeed("systemctl is-active maxops-managed.service")
+
+    reload_job = machine.succeed(manager + "units.reload --host fixture --unit maxops-managed.service --idempotency-key service-reload | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {reload_job} | jq -e '.handle.state == \"succeeded\"'", timeout=20)
+    machine.wait_until_succeeds("grep -x reload /var/lib/maxops-managed-reloads")
+    machine.succeed("touch /run/maxops-fail-reload")
+    failed_reload = machine.succeed(manager + "units.reload --host fixture --unit maxops-managed.service --idempotency-key failed-reload | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {failed_reload} | jq -e '.handle.state == \"failed\" and .result.after.reload_result != \"success\"'", timeout=20)
+    machine.succeed("rm /run/maxops-fail-reload")
+    unsupported_reload = machine.succeed(manager + "units.reload --host fixture --unit maxops-no-reload.service --idempotency-key unsupported-reload | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {unsupported_reload} | jq -e '.handle.state == \"failed\" and .result.error == \"systemd_rejected_action\"'", timeout=20)
+
+    # A manual restart is a valid external fleet write. It invalidates an old
+    # InvocationID instead of being overwritten by the stale maxops request.
+    stale_invocation = machine.succeed(ctl + "units.status --host fixture --unit maxops-managed.service | jq -r .unit.details.invocation_id").strip()
+    machine.succeed("systemctl restart maxops-managed.service")
+    external_invocation = machine.succeed(ctl + "units.status --host fixture --unit maxops-managed.service | jq -r .unit.details.invocation_id").strip()
+    assert external_invocation != stale_invocation
+    machine.succeed(f"echo '{{\"host\":\"fixture\",\"unit\":\"maxops-managed.service\",\"expected_invocation_id\":\"{stale_invocation}\"}}' > /tmp/stale-restart.json")
+    stale_job = machine.succeed(manager + "units.restart --params-file /tmp/stale-restart.json --idempotency-key stale-service-restart | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {stale_job} | jq -e '.handle.state == \"failed\" and .result.error == \"stale_baseline\"'", timeout=20)
+    machine.succeed("systemctl is-active maxops-managed.service")
+
+    # Two independent principals may submit concurrently, but the executor's
+    # persistent host-level manager lock makes the observed invocation chain serial.
+    manager2 = "maxopsctl --token-file /run/manager2-token "
+    first_restart = machine.succeed(manager + "units.restart --host fixture --unit maxops-managed.service --idempotency-key concurrent-manager-1 | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {first_restart} | jq -e '.handle.state == \"reconciling\"'", timeout=20)
+    second_restart = machine.succeed(manager2 + "units.restart --host fixture --unit maxops-managed.service --idempotency-key concurrent-manager-2 | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {first_restart} | jq -e '.handle.state == \"succeeded\"'", timeout=30)
+    machine.wait_until_succeeds(manager2 + f"jobs.status --job-id {second_restart} | jq -e '.handle.state == \"succeeded\"'", timeout=30)
+    first_after = machine.succeed(manager + f"jobs.status --job-id {first_restart} | jq -r .result.after.invocation_id").strip()
+    second_before = machine.succeed(manager2 + f"jobs.status --job-id {second_restart} | jq -r .result.before.invocation_id").strip()
+    assert first_after == second_before
+    machine.fail(manager2 + f"jobs.status --job-id {first_restart}")
   '';
 }

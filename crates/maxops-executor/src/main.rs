@@ -4,17 +4,17 @@ use color_eyre::eyre::{Context, Result, ensure, eyre};
 use maxops_executor::{RunnerResult, RunnerSpec};
 use maxops_proto::{
     ExecRunParams, ExecutorRequest, ExecutorResponse, ExecutorWireResponse, JobId, JobLogsResponse,
-    JobRecord, JobState,
+    JobRecord, JobState, UnitActionParams,
 };
 use maxops_store::Store;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashSet},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -45,6 +45,8 @@ struct Config {
     systemd_run: PathBuf,
     systemctl: PathBuf,
     runner: PathBuf,
+    #[serde(default)]
+    manageable_units: BTreeSet<String>,
     #[serde(default)]
     credential_sources: BTreeMap<String, PathBuf>,
     profiles: BTreeMap<String, Profile>,
@@ -90,6 +92,86 @@ fn default_tasks_max() -> u32 {
 struct App {
     config: Config,
     store: Store,
+    bus: zbus::Connection,
+    service_workers: Mutex<HashSet<JobId>>,
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.systemd1.Manager",
+    default_service = "org.freedesktop.systemd1",
+    default_path = "/org/freedesktop/systemd1"
+)]
+trait SystemdManager {
+    fn get_unit(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn get_job(&self, id: u32) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn start_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn restart_unit(&self, name: &str, mode: &str)
+    -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn reload_unit(&self, name: &str, mode: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.systemd1.Unit",
+    default_service = "org.freedesktop.systemd1"
+)]
+trait SystemdUnit {
+    #[zbus(property)]
+    fn active_state(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn sub_state(&self) -> zbus::Result<String>;
+    #[zbus(property, name = "InvocationID")]
+    fn invocation_id(&self) -> zbus::Result<Vec<u8>>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.systemd1.Service",
+    default_service = "org.freedesktop.systemd1"
+)]
+trait SystemdService {
+    #[zbus(property)]
+    fn result(&self) -> zbus::Result<String>;
+    #[zbus(property, name = "ReloadResult")]
+    fn reload_result(&self) -> zbus::Result<String>;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+    Reload,
+}
+
+impl ServiceAction {
+    fn from_operation(operation: &str) -> Option<Self> {
+        match operation {
+            "units.start" => Some(Self::Start),
+            "units.stop" => Some(Self::Stop),
+            "units.restart" => Some(Self::Restart),
+            "units.reload" => Some(Self::Reload),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ServiceUnitState {
+    active_state: String,
+    sub_state: String,
+    invocation_id: Option<String>,
+    service_result: Option<String>,
+    reload_result: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ServiceProgress {
+    action: ServiceAction,
+    unit: String,
+    before: ServiceUnitState,
+    #[serde(default)]
+    manager_job: Option<String>,
 }
 
 #[tokio::main]
@@ -110,7 +192,13 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&config.socket_path)?;
     std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o660))?;
     let store = Store::open(&config.state_file).await?;
-    let app = Arc::new(App { config, store });
+    let bus = zbus::Connection::system().await?;
+    let app = Arc::new(App {
+        config,
+        store,
+        bus,
+        service_workers: Mutex::new(HashSet::new()),
+    });
     for job in app.store.nonterminal_jobs().await? {
         recover_job(app.clone(), job);
     }
@@ -155,6 +243,13 @@ fn validate_config(config: &Config) -> Result<()> {
     ensure!(
         config.spool_root == Path::new("/var/lib/maxops-jobs"),
         "spool_root must match systemd StateDirectory root /var/lib/maxops-jobs"
+    );
+    ensure!(
+        config
+            .manageable_units
+            .iter()
+            .all(|unit| maxops_proto::valid_unit(unit)),
+        "manageable_units must contain exact service names"
     );
     for (name, path) in &config.credential_sources {
         ensure!(
@@ -271,100 +366,16 @@ async fn serve_connection(app: Arc<App>, stream: UnixStream) -> Result<()> {
 
 async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorResponse> {
     match request {
-        ExecutorRequest::Submit { job_id, job } => {
-            ensure!(job.host == app.config.host, "job targets another host");
-            ensure!(
-                job.operation == "exec.run",
-                "unsupported executor operation"
-            );
-            let accepted = app.store.accept_job(&job_id, &job).await?;
-            if accepted.created {
-                let prepared = (|| {
-                    let params: ExecRunParams = serde_json::from_value(job.spec.clone())?;
-                    params.validate().map_err(|message| eyre!(message))?;
-                    ensure!(
-                        params.host == app.config.host,
-                        "command targets another host"
-                    );
-                    let prepared = prepare_runner_spec(&app.config, &params)?;
-                    Result::<_>::Ok((params, prepared))
-                })();
-                let (params, prepared) = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        tracing::warn!(job_id = %job_id, %error, "job validation failed");
-                        let failed = app
-                            .store
-                            .transition_job(
-                                &job_id,
-                                accepted.job.handle.revision,
-                                JobState::Failed,
-                                &json!({"phase":"validation"}),
-                                Some(&json!({"phase":"validation","error":"job is not permitted by the target profile"})),
-                            )
-                            .await?;
-                        return Ok(ExecutorResponse::Job(failed));
-                    }
-                };
-                if let Err(error) = persist_runner_spec(&app.config, &job_id, &prepared).await {
-                    tracing::warn!(job_id = %job_id, %error, "persisting job specification failed");
-                    let failed = app
-                        .store
-                        .transition_job(
-                            &job_id,
-                            accepted.job.handle.revision,
-                            JobState::Failed,
-                            &json!({"phase":"prepare"}),
-                            Some(&json!({"phase":"prepare","error":"target could not persist the job specification"})),
-                        )
-                        .await?;
-                    return Ok(ExecutorResponse::Job(failed));
-                }
-                let dispatching = app
-                    .store
-                    .transition_job(
-                        &job_id,
-                        accepted.job.handle.revision,
-                        JobState::Dispatching,
-                        &json!({"launcher":"systemd"}),
-                        None,
-                    )
-                    .await?;
-                if launch(&app.config, &job_id, &params, &prepared, job.deadline)
-                    .await
-                    .is_err()
-                {
-                    let failed = app
-                        .store
-                        .transition_job(
-                            &job_id,
-                            dispatching.handle.revision,
-                            JobState::Failed,
-                            &json!({"phase":"launch"}),
-                            Some(&json!({"phase":"launch","error":"executor launch failed"})),
-                        )
-                        .await?;
-                    return Ok(ExecutorResponse::Job(failed));
-                }
-                let running = app
-                    .store
-                    .transition_job(
-                        &job_id,
-                        dispatching.handle.revision,
-                        JobState::Running,
-                        &json!({"unit":unit_name(&job_id)}),
-                        None,
-                    )
-                    .await?;
-                monitor(app, job_id);
-                Ok(ExecutorResponse::Job(running))
-            } else {
-                recover_job(app, accepted.job.clone());
-                Ok(ExecutorResponse::Job(accepted.job))
-            }
-        }
+        ExecutorRequest::Submit { job_id, job } => submit_job(app, job_id, job).await,
         ExecutorRequest::Status(params) => {
-            reconcile_once(&app, &params.job_id).await?;
+            let job = app.store.get_job(&params.job_id).await?;
+            if job.handle.operation == "exec.run" {
+                reconcile_once(&app, &params.job_id).await?;
+            } else if ServiceAction::from_operation(&job.handle.operation).is_some()
+                && !job.handle.state.is_terminal()
+            {
+                spawn_service_job(app.clone(), job.handle.job_id.clone());
+            }
             Ok(ExecutorResponse::Job(
                 app.store.get_job(&params.job_id).await?,
             ))
@@ -375,6 +386,10 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
             Ok(ExecutorResponse::Logs(response))
         }
         ExecutorRequest::Cancel(params) => {
+            let existing = app.store.get_job(&params.job_id).await?;
+            if ServiceAction::from_operation(&existing.handle.operation).is_some() {
+                return cancel_service_job(&app, existing, params).await;
+            }
             let requested = app
                 .store
                 .request_cancel(&params.job_id, params.expected_revision, &params.reason)
@@ -401,6 +416,745 @@ async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorRespo
             Ok(ExecutorResponse::Job(cancelled))
         }
     }
+}
+
+async fn submit_job(
+    app: Arc<App>,
+    job_id: JobId,
+    job: maxops_proto::NewJob,
+) -> Result<ExecutorResponse> {
+    ensure!(job.host == app.config.host, "job targets another host");
+    let service_action = ServiceAction::from_operation(&job.operation);
+    ensure!(
+        job.operation == "exec.run" || service_action.is_some(),
+        "unsupported executor operation"
+    );
+    let accepted = app.store.accept_job(&job_id, &job).await?;
+    if service_action.is_some() {
+        if accepted.created {
+            let params: UnitActionParams = match serde_json::from_value(job.spec.clone())
+                .map_err(color_eyre::Report::from)
+                .and_then(|params: UnitActionParams| {
+                    params.validate().map_err(|message| eyre!(message))?;
+                    ensure!(
+                        params.host == app.config.host,
+                        "service action targets another host"
+                    );
+                    ensure!(
+                        app.config.manageable_units.contains(&params.unit),
+                        "service is not manageable"
+                    );
+                    Ok(params)
+                }) {
+                Ok(params) => params,
+                Err(error) => {
+                    tracing::warn!(job_id = %job_id, %error, "service job validation failed");
+                    let failed = app.store.transition_job(
+                        &job_id,
+                        accepted.job.handle.revision,
+                        JobState::Failed,
+                        &json!({"phase":"validation"}),
+                        Some(&json!({"phase":"validation","error":"service action is not permitted by the target"})),
+                    ).await?;
+                    return Ok(ExecutorResponse::Job(failed));
+                }
+            };
+            drop(params);
+        }
+        if !accepted.job.handle.state.is_terminal() {
+            spawn_service_job(app, job_id);
+        }
+        return Ok(ExecutorResponse::Job(accepted.job));
+    }
+    submit_command_job(app, job_id, job, accepted).await
+}
+
+async fn submit_command_job(
+    app: Arc<App>,
+    job_id: JobId,
+    job: maxops_proto::NewJob,
+    accepted: maxops_store::SubmitResult,
+) -> Result<ExecutorResponse> {
+    if accepted.created {
+        let prepared = (|| {
+            let params: ExecRunParams = serde_json::from_value(job.spec.clone())?;
+            params.validate().map_err(|message| eyre!(message))?;
+            ensure!(
+                params.host == app.config.host,
+                "command targets another host"
+            );
+            let prepared = prepare_runner_spec(&app.config, &params)?;
+            Result::<_>::Ok((params, prepared))
+        })();
+        let (params, prepared) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(job_id = %job_id, %error, "job validation failed");
+                let failed = app.store.transition_job(
+                    &job_id,
+                    accepted.job.handle.revision,
+                    JobState::Failed,
+                    &json!({"phase":"validation"}),
+                    Some(&json!({"phase":"validation","error":"job is not permitted by the target profile"})),
+                ).await?;
+                return Ok(ExecutorResponse::Job(failed));
+            }
+        };
+        if let Err(error) = persist_runner_spec(&app.config, &job_id, &prepared).await {
+            tracing::warn!(job_id = %job_id, %error, "persisting job specification failed");
+            let failed = app.store.transition_job(
+                &job_id,
+                accepted.job.handle.revision,
+                JobState::Failed,
+                &json!({"phase":"prepare"}),
+                Some(&json!({"phase":"prepare","error":"target could not persist the job specification"})),
+            ).await?;
+            return Ok(ExecutorResponse::Job(failed));
+        }
+        let dispatching = app
+            .store
+            .transition_job(
+                &job_id,
+                accepted.job.handle.revision,
+                JobState::Dispatching,
+                &json!({"launcher":"systemd"}),
+                None,
+            )
+            .await?;
+        if launch(&app.config, &job_id, &params, &prepared, job.deadline)
+            .await
+            .is_err()
+        {
+            let failed = app
+                .store
+                .transition_job(
+                    &job_id,
+                    dispatching.handle.revision,
+                    JobState::Failed,
+                    &json!({"phase":"launch"}),
+                    Some(&json!({"phase":"launch","error":"executor launch failed"})),
+                )
+                .await?;
+            return Ok(ExecutorResponse::Job(failed));
+        }
+        let running = app
+            .store
+            .transition_job(
+                &job_id,
+                dispatching.handle.revision,
+                JobState::Running,
+                &json!({"unit":unit_name(&job_id)}),
+                None,
+            )
+            .await?;
+        monitor(app, job_id);
+        Ok(ExecutorResponse::Job(running))
+    } else {
+        recover_job(app, accepted.job.clone());
+        Ok(ExecutorResponse::Job(accepted.job))
+    }
+}
+
+async fn cancel_service_job(
+    app: &App,
+    _existing: JobRecord,
+    params: maxops_proto::JobCancelParams,
+) -> Result<ExecutorResponse> {
+    let requested = app
+        .store
+        .request_cancel(&params.job_id, params.expected_revision, &params.reason)
+        .await?;
+    if matches!(
+        requested.handle.state,
+        JobState::Queued | JobState::Dispatching
+    ) {
+        let cancelled = app
+            .store
+            .transition_job(
+                &params.job_id,
+                requested.handle.revision,
+                JobState::Cancelled,
+                &json!({"phase":"before_systemd_action"}),
+                Some(&json!({"cancelled":true,"effect":"not_started"})),
+            )
+            .await?;
+        let _ = app
+            .store
+            .release_resource("systemd_manager", &app.config.host, &params.job_id)
+            .await;
+        return Ok(ExecutorResponse::Job(cancelled));
+    }
+    Ok(ExecutorResponse::Job(requested))
+}
+
+fn spawn_service_job(app: Arc<App>, id: JobId) {
+    let inserted = app
+        .service_workers
+        .lock()
+        .expect("service worker lock poisoned")
+        .insert(id.clone());
+    if !inserted {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let Err(error) = run_service_job(&app, &id).await else {
+                break;
+            };
+            tracing::warn!(job_id = %id, %error, "service job stopped");
+            match record_service_worker_error(&app, &id).await {
+                Ok(()) => break,
+                Err(record_error) => {
+                    tracing::error!(
+                        job_id = %id,
+                        %record_error,
+                        "could not durably record service worker failure; retaining resource lock"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        app.service_workers
+            .lock()
+            .expect("service worker lock poisoned")
+            .remove(&id);
+    });
+}
+
+async fn record_service_worker_error(app: &App, id: &JobId) -> Result<()> {
+    let mut job = app.store.get_job(id).await?;
+    if job.handle.state.is_terminal() {
+        let _ = app
+            .store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        return Ok(());
+    }
+
+    if job.handle.state == JobState::Running {
+        let progress = job.result.clone();
+        job = app
+            .store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::Reconciling,
+                &json!({"phase":"executor_error","effect":"may_have_started"}),
+                progress.as_ref(),
+            )
+            .await?;
+    }
+
+    let (state, effect) = if job.handle.state == JobState::Reconciling {
+        (JobState::OutcomeUnknown, "unknown")
+    } else {
+        (JobState::Failed, "not_started")
+    };
+    let previous = job.result.clone();
+    app.store
+        .transition_job(
+            id,
+            job.handle.revision,
+            state,
+            &json!({"phase":"executor_error","effect":effect}),
+            Some(&json!({
+                "error":"service_worker_failed",
+                "effect":effect,
+                "previous":previous,
+            })),
+        )
+        .await?;
+    app.store
+        .release_resource("systemd_manager", &app.config.host, id)
+        .await?;
+    Ok(())
+}
+
+async fn run_service_job(app: &App, id: &JobId) -> Result<()> {
+    let mut job = app.store.get_job(id).await?;
+    let action = ServiceAction::from_operation(&job.handle.operation)
+        .ok_or_else(|| eyre!("unsupported service operation"))?;
+    let params: UnitActionParams = serde_json::from_value(job.spec.clone())?;
+    params.validate().map_err(|message| eyre!(message))?;
+    ensure!(
+        app.config.manageable_units.contains(&params.unit),
+        "service is no longer manageable"
+    );
+    while !app
+        .store
+        .try_acquire_resource("systemd_manager", &app.config.host, id)
+        .await?
+    {
+        job = app.store.get_job(id).await?;
+        if job.handle.state.is_terminal() {
+            return Ok(());
+        }
+        if matches!(job.handle.state, JobState::Queued | JobState::Dispatching)
+            && job
+                .deadline
+                .is_some_and(|deadline| deadline <= maxops_proto::now())
+        {
+            app.store
+                .transition_job(
+                    id,
+                    job.handle.revision,
+                    JobState::TimedOut,
+                    &json!({"phase":"host_queue"}),
+                    Some(&json!({"error":"deadline_expired_before_systemd_action"})),
+                )
+                .await?;
+            return Ok(());
+        }
+        if job.cancel_requested {
+            let cancelled = app
+                .store
+                .transition_job(
+                    id,
+                    job.handle.revision,
+                    JobState::Cancelled,
+                    &json!({"phase":"resource_queue"}),
+                    Some(&json!({"cancelled":true,"effect":"not_started"})),
+                )
+                .await?;
+            tracing::info!(job_id = %id, revision = cancelled.handle.revision, "queued service job cancelled");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    job = app.store.get_job(id).await?;
+    if job.handle.state.is_terminal() {
+        let _ = app
+            .store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        return Ok(());
+    }
+    if matches!(job.handle.state, JobState::Queued | JobState::Dispatching)
+        && job
+            .deadline
+            .is_some_and(|deadline| deadline <= maxops_proto::now())
+    {
+        app.store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::TimedOut,
+                &json!({"phase":"before_systemd_action"}),
+                Some(&json!({"error":"deadline_expired_before_systemd_action"})),
+            )
+            .await?;
+        app.store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        return Ok(());
+    }
+    if job.cancel_requested && matches!(job.handle.state, JobState::Queued | JobState::Dispatching)
+    {
+        let cancelled = app
+            .store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::Cancelled,
+                &json!({"phase":"before_systemd_action"}),
+                Some(&json!({"cancelled":true,"effect":"not_started"})),
+            )
+            .await?;
+        tracing::info!(job_id = %id, revision = cancelled.handle.revision, "service job cancelled");
+        app.store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        return Ok(());
+    }
+
+    match job.handle.state {
+        JobState::Queued => {
+            let before = observe_service_unit(app, &params.unit).await?;
+            if params
+                .expected_invocation_id
+                .as_deref()
+                .is_some_and(|expected| {
+                    before
+                        .invocation_id
+                        .as_deref()
+                        .is_none_or(|observed| !expected.eq_ignore_ascii_case(observed))
+                })
+            {
+                app.store
+                    .transition_job(
+                        id,
+                        job.handle.revision,
+                        JobState::Failed,
+                        &json!({"phase":"baseline","reason":"stale_baseline"}),
+                        Some(&json!({
+                            "error":"stale_baseline",
+                            "expected_invocation_id":params.expected_invocation_id,
+                            "observed":before,
+                        })),
+                    )
+                    .await?;
+                app.store
+                    .release_resource("systemd_manager", &app.config.host, id)
+                    .await?;
+                return Ok(());
+            }
+            let progress = ServiceProgress {
+                action,
+                unit: params.unit.clone(),
+                before,
+                manager_job: None,
+            };
+            job = app
+                .store
+                .transition_job(
+                    id,
+                    job.handle.revision,
+                    JobState::Dispatching,
+                    &json!({"resource":"systemd_manager","host":app.config.host,"unit":params.unit}),
+                    Some(&serde_json::to_value(&progress)?),
+                )
+                .await?;
+            start_service_action(app, id, job, progress).await?;
+        }
+        JobState::Dispatching => {
+            let progress: ServiceProgress = serde_json::from_value(
+                job.result
+                    .clone()
+                    .ok_or_else(|| eyre!("service baseline is missing"))?,
+            )?;
+            start_service_action(app, id, job, progress).await?;
+        }
+        JobState::Running => {
+            recover_uncertain_service_action(app, id, job).await?;
+        }
+        JobState::Reconciling => {
+            let progress: ServiceProgress = serde_json::from_value(
+                job.result
+                    .clone()
+                    .ok_or_else(|| eyre!("service progress is missing"))?,
+            )?;
+            finish_accepted_service_action(app, id, job, progress).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn start_service_action(
+    app: &App,
+    id: &JobId,
+    job: JobRecord,
+    mut progress: ServiceProgress,
+) -> Result<()> {
+    let running = app
+        .store
+        .transition_job(
+            id,
+            job.handle.revision,
+            JobState::Running,
+            &json!({"phase":"systemd_call_may_have_started"}),
+            Some(&serde_json::to_value(&progress)?),
+        )
+        .await?;
+    let manager = SystemdManagerProxy::new(&app.bus).await?;
+    let called = match progress.action {
+        ServiceAction::Start => manager.start_unit(&progress.unit, "replace").await,
+        ServiceAction::Stop => manager.stop_unit(&progress.unit, "replace").await,
+        ServiceAction::Restart => manager.restart_unit(&progress.unit, "replace").await,
+        ServiceAction::Reload => manager.reload_unit(&progress.unit, "replace").await,
+    };
+    let manager_job = match called {
+        Ok(path) => path.to_string(),
+        Err(error) if explicit_systemd_rejection(&error) => {
+            app.store
+                .transition_job(
+                    id,
+                    running.handle.revision,
+                    JobState::Failed,
+                    &json!({"phase":"systemd_call","rejected":true}),
+                    Some(&json!({
+                        "action":progress.action,
+                        "unit":progress.unit,
+                        "before":progress.before,
+                        "error":"systemd_rejected_action",
+                    })),
+                )
+                .await?;
+            app.store
+                .release_resource("systemd_manager", &app.config.host, id)
+                .await?;
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::warn!(job_id = %id, %error, "systemd action acknowledgement unavailable");
+            let reconciling = app
+                .store
+                .transition_job(
+                    id,
+                    running.handle.revision,
+                    JobState::Reconciling,
+                    &json!({"phase":"systemd_call","acknowledgement":"unavailable"}),
+                    Some(&serde_json::to_value(&progress)?),
+                )
+                .await?;
+            transition_service_unknown(
+                app,
+                id,
+                reconciling,
+                &progress,
+                "systemd_acknowledgement_unavailable",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    progress.manager_job = Some(manager_job);
+    let reconciling = app
+        .store
+        .transition_job(
+            id,
+            running.handle.revision,
+            JobState::Reconciling,
+            &json!({"phase":"systemd_job_accepted"}),
+            Some(&serde_json::to_value(&progress)?),
+        )
+        .await?;
+    finish_accepted_service_action(app, id, reconciling, progress).await
+}
+
+async fn finish_accepted_service_action(
+    app: &App,
+    id: &JobId,
+    job: JobRecord,
+    progress: ServiceProgress,
+) -> Result<()> {
+    let Some(manager_job) = progress.manager_job.as_deref() else {
+        return transition_service_unknown(app, id, job, &progress, "manager_job_missing").await;
+    };
+    let Some(job_number) = manager_job
+        .rsplit('/')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return transition_service_unknown(app, id, job, &progress, "invalid_manager_job_path")
+            .await;
+    };
+    let manager = SystemdManagerProxy::new(&app.bus).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return transition_service_unknown(app, id, job, &progress, "systemd_job_timeout")
+                .await;
+        }
+        match manager.get_job(job_number).await {
+            Ok(_) => {}
+            Err(error) if systemd_job_finished(&error) => break,
+            Err(error) => {
+                tracing::warn!(job_id = %id, %error, "systemd job observation unavailable");
+                return transition_service_unknown(
+                    app,
+                    id,
+                    job,
+                    &progress,
+                    "systemd_job_observation_unavailable",
+                )
+                .await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Keep maxops's host-level manager lock briefly after systemd finishes so
+    // the final properties have settled before the next maxops action observes them.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after = observe_service_unit(app, &progress.unit).await?;
+    let succeeded = match progress.action {
+        ServiceAction::Start => after.active_state == "active",
+        ServiceAction::Stop => after.active_state == "inactive",
+        ServiceAction::Restart => {
+            after.active_state == "active"
+                && after.invocation_id.is_some()
+                && after.invocation_id != progress.before.invocation_id
+        }
+        ServiceAction::Reload => {
+            after.active_state == "active" && after.reload_result.as_deref() == Some("success")
+        }
+    };
+    let state = if succeeded {
+        JobState::Succeeded
+    } else {
+        JobState::Failed
+    };
+    app.store
+        .transition_job(
+            id,
+            job.handle.revision,
+            state,
+            &json!({"phase":"systemd_job_completed","observed_state":after.active_state}),
+            Some(&json!({
+                "action":progress.action,
+                "unit":progress.unit,
+                "before":progress.before,
+                "after":after,
+                "manager_job":progress.manager_job,
+                "attribution":"systemd_job_accepted_and_target_observed",
+                "success":succeeded,
+            })),
+        )
+        .await?;
+    app.store
+        .release_resource("systemd_manager", &app.config.host, id)
+        .await?;
+    Ok(())
+}
+
+async fn recover_uncertain_service_action(app: &App, id: &JobId, job: JobRecord) -> Result<()> {
+    let progress: ServiceProgress = serde_json::from_value(
+        job.result
+            .clone()
+            .ok_or_else(|| eyre!("service progress is missing"))?,
+    )?;
+    let after = observe_service_unit(app, &progress.unit).await?;
+    let effect_observed = match progress.action {
+        ServiceAction::Start => {
+            progress.before.active_state != "active" && after.active_state == "active"
+        }
+        ServiceAction::Stop => {
+            progress.before.active_state != "inactive" && after.active_state == "inactive"
+        }
+        ServiceAction::Restart => {
+            after.active_state == "active"
+                && after.invocation_id.is_some()
+                && after.invocation_id != progress.before.invocation_id
+        }
+        ServiceAction::Reload => false,
+    };
+    if effect_observed {
+        app.store
+            .transition_job(
+                id,
+                job.handle.revision,
+                JobState::Succeeded,
+                &json!({"phase":"recovered_by_observation"}),
+                Some(&json!({
+                    "action":progress.action,
+                    "unit":progress.unit,
+                    "before":progress.before,
+                    "after":after,
+                    "attribution":"observed_after_executor_restart_external_change_not_excluded",
+                    "success":true,
+                })),
+            )
+            .await?;
+        app.store
+            .release_resource("systemd_manager", &app.config.host, id)
+            .await?;
+        return Ok(());
+    }
+    let reconciling = app
+        .store
+        .transition_job(
+            id,
+            job.handle.revision,
+            JobState::Reconciling,
+            &json!({"phase":"recovery","effect":"not_attributable"}),
+            Some(&serde_json::to_value(&progress)?),
+        )
+        .await?;
+    transition_service_unknown(app, id, reconciling, &progress, "effect_not_attributable").await
+}
+
+async fn transition_service_unknown(
+    app: &App,
+    id: &JobId,
+    job: JobRecord,
+    progress: &ServiceProgress,
+    reason: &str,
+) -> Result<()> {
+    app.store
+        .transition_job(
+            id,
+            job.handle.revision,
+            JobState::OutcomeUnknown,
+            &json!({"phase":"recovery","reason":reason}),
+            Some(&json!({
+                "action":progress.action,
+                "unit":progress.unit,
+                "before":progress.before,
+                "manager_job":progress.manager_job,
+                "effect":"unknown",
+                "reason":reason,
+            })),
+        )
+        .await?;
+    app.store
+        .release_resource("systemd_manager", &app.config.host, id)
+        .await?;
+    Ok(())
+}
+
+fn explicit_systemd_rejection(error: &zbus::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "not applicable",
+        "not supported",
+        "not loaded",
+        "not found",
+        "no such unit",
+        "invalid name",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn systemd_job_finished(error: &zbus::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("nosuchjob")
+        || message.contains("no such job")
+        || message.contains("no job") && message.contains("known")
+}
+
+async fn observe_service_unit(app: &App, unit: &str) -> Result<ServiceUnitState> {
+    let manager = SystemdManagerProxy::new(&app.bus).await?;
+    let path = match manager.get_unit(unit).await {
+        Ok(path) => path,
+        Err(error) if explicit_systemd_rejection(&error) => {
+            return Ok(ServiceUnitState {
+                active_state: "not_loaded".into(),
+                sub_state: "not_loaded".into(),
+                invocation_id: None,
+                service_result: None,
+                reload_result: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let proxy = SystemdUnitProxy::builder(&app.bus)
+        .path(path.clone())?
+        .build()
+        .await?;
+    let service = SystemdServiceProxy::builder(&app.bus)
+        .path(path)?
+        .build()
+        .await?;
+    let bytes = proxy.invocation_id().await?;
+    Ok(ServiceUnitState {
+        active_state: proxy.active_state().await?,
+        sub_state: proxy.sub_state().await?,
+        invocation_id: (!bytes.is_empty()).then(|| bytes_to_hex(&bytes)),
+        service_result: service.result().await.ok(),
+        reload_result: service.reload_result().await.ok(),
+    })
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
 }
 
 fn prepare_runner_spec(config: &Config, params: &ExecRunParams) -> Result<RunnerSpec> {
@@ -533,6 +1287,10 @@ async fn launch(
 }
 
 fn recover_job(app: Arc<App>, job: JobRecord) {
+    if ServiceAction::from_operation(&job.handle.operation).is_some() {
+        spawn_service_job(app, job.handle.job_id);
+        return;
+    }
     let id = job.handle.job_id;
     tokio::spawn(async move {
         if job.handle.state == JobState::Queued {
@@ -891,6 +1649,7 @@ mod tests {
             systemd_run: "systemd-run".into(),
             systemctl: "/run/current-system/sw/bin/systemctl".into(),
             runner: "/nix/store/example/bin/maxops-job-runner".into(),
+            manageable_units: BTreeSet::new(),
             credential_sources: BTreeMap::new(),
             profiles: BTreeMap::from([(
                 "diagnostic".into(),

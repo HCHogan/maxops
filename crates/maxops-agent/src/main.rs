@@ -6,8 +6,8 @@ use axum::{
 };
 use clap::Parser;
 use maxops_proto::{
-    ExecutorRequest, ExecutorResponse, Facts, LogEntry, LogParams, Snapshot, UnitDetails,
-    UnitObservation, UnitParams, UnitStatus, now,
+    ExecutorRequest, ExecutorResponse, Facts, LogEntry, LogParams, Snapshot, UnitActionParams,
+    UnitDetails, UnitObservation, UnitParams, UnitStatus, now,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -39,6 +39,8 @@ struct Config {
     executor_socket: Option<PathBuf>,
     #[serde(default)]
     readable_units: BTreeSet<String>,
+    #[serde(default)]
+    manageable_units: BTreeSet<String>,
     #[serde(default)]
     allow_logs: bool,
     #[serde(default = "journalctl")]
@@ -78,6 +80,15 @@ trait Manager {
     fn list_units(&self) -> zbus::Result<Vec<ListedUnit>>;
 }
 
+#[zbus::proxy(
+    interface = "org.freedesktop.systemd1.Unit",
+    default_service = "org.freedesktop.systemd1"
+)]
+trait SystemdUnit {
+    #[zbus(property, name = "InvocationID")]
+    fn invocation_id(&self) -> zbus::Result<Vec<u8>>;
+}
+
 #[tokio::main]
 async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
@@ -96,6 +107,13 @@ async fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::eyre::ensure!(
         config.readable_units.iter().all(|u| valid_unit(u)),
         "readable_units must contain exact service names"
+    );
+    color_eyre::eyre::ensure!(
+        config
+            .manageable_units
+            .iter()
+            .all(|unit| { valid_unit(unit) && config.readable_units.contains(unit) }),
+        "manageable_units must be valid readable service names"
     );
     let token = Token::read(&config.token_file)?;
     color_eyre::eyre::ensure!(
@@ -149,10 +167,21 @@ async fn manage(
     if !token.matches(&headers) {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
-    if let ExecutorRequest::Submit { job, .. } = &request
-        && job.host != app.config.host
-    {
-        return Err(ApiError(StatusCode::FORBIDDEN, "job targets another host"));
+    if let ExecutorRequest::Submit { job, .. } = &request {
+        if job.host != app.config.host {
+            return Err(ApiError(StatusCode::FORBIDDEN, "job targets another host"));
+        }
+        if job.operation.starts_with("units.") {
+            let params: UnitActionParams = serde_json::from_value(job.spec.clone())
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid service action"))?;
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            if params.host != app.config.host || !app.config.manageable_units.contains(&params.unit)
+            {
+                return Err(ApiError(StatusCode::FORBIDDEN, "service is not manageable"));
+            }
+        }
     }
     let socket = app
         .config
@@ -300,6 +329,11 @@ async fn collect_unit(app: &App, name: &str) -> color_eyre::eyre::Result<UnitSta
     let properties = proxy
         .get_all("org.freedesktop.systemd1.Service".try_into()?)
         .await?;
+    let unit_proxy = SystemdUnitProxy::builder(&app.bus)
+        .path(unit.6.clone())?
+        .build()
+        .await?;
+    let invocation = unit_proxy.invocation_id().await?;
     let details = UnitDetails {
         main_pid: properties
             .get("MainPID")
@@ -317,6 +351,7 @@ async fn collect_unit(app: &App, name: &str) -> color_eyre::eyre::Result<UnitSta
         exec_main_status: properties
             .get("ExecMainStatus")
             .and_then(|value| i32::try_from(value).ok()),
+        invocation_id: (!invocation.is_empty()).then(|| bytes_to_hex(&invocation)),
     };
     Ok(UnitStatus {
         unit: unit.0.clone(),
@@ -326,6 +361,16 @@ async fn collect_unit(app: &App, name: &str) -> color_eyre::eyre::Result<UnitSta
         sub_state: unit.4.clone(),
         details: Some(details),
     })
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
 }
 
 async fn snapshot(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Snapshot> {

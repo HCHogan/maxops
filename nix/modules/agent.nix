@@ -18,6 +18,7 @@ let
         null;
     executor_socket = if cfg.execution.enable then cfg.execution.socketPath else null;
     readable_units = cfg.readableUnits;
+    manageable_units = cfg.manageableUnits;
     allow_logs = cfg.allowLogs;
     journalctl = "${pkgs.systemd}/bin/journalctl";
   };
@@ -53,6 +54,11 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Exact .service names exposed by status and optional log queries.";
+    };
+    manageableUnits = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Exact readable services whose management jobs may be forwarded.";
     };
     allowLogs = lib.mkOption {
       type = lib.types.bool;
@@ -98,10 +104,14 @@ in
           );
         message = "maxops-agent.execution.tokenFile must be a runtime path outside the Nix store.";
       }
+      {
+        assertion = lib.all (unit: builtins.elem unit cfg.readableUnits) cfg.manageableUnits;
+        message = "maxops-agent manageableUnits must be a subset of readableUnits.";
+      }
     ];
     users.groups.maxops-executor = lib.mkIf cfg.execution.enable { };
     systemd.services.maxops-agent = {
-      description = "maxops read-only host agent";
+      description = "maxops host agent";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"

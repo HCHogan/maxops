@@ -92,7 +92,7 @@ impl JobState {
         use JobState::*;
         matches!(
             (self, next),
-            (Queued, Dispatching | Failed | Cancelled)
+            (Queued, Dispatching | Failed | Cancelled | TimedOut)
                 | (
                     Dispatching,
                     Running | Reconciling | Succeeded | Failed | Cancelled | TimedOut

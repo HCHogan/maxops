@@ -41,6 +41,32 @@ pub struct UnitParams {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct UnitActionParams {
+    pub host: String,
+    pub unit: String,
+    #[serde(default)]
+    pub expected_invocation_id: Option<String>,
+}
+
+impl UnitActionParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_host(&self.host) {
+            return Err("invalid host");
+        }
+        if !valid_unit(&self.unit) {
+            return Err("invalid service unit name");
+        }
+        if self.expected_invocation_id.as_ref().is_some_and(|value| {
+            value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("expected invocation ID must contain 32 hexadecimal digits");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogParams {
     pub host: String,
     pub unit: String,
@@ -148,6 +174,10 @@ operations! {
     UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
     AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
     ExecRun(ExecRunParams) -> JobHandle, "exec.run", "exec:run", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run a bounded command using a configured target profile";
+    UnitsStart(UnitActionParams) -> JobHandle, "units.start", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Start one explicitly manageable systemd service";
+    UnitsStop(UnitActionParams) -> JobHandle, "units.stop", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Stop one explicitly manageable systemd service";
+    UnitsRestart(UnitActionParams) -> JobHandle, "units.restart", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Restart one explicitly manageable systemd service";
+    UnitsReload(UnitActionParams) -> JobHandle, "units.reload", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Reload one explicitly manageable systemd service without upgrading to restart";
     JobsList(JobsListParams) -> JobsListResponse, "jobs.list", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "List durable jobs owned by the authenticated principal";
     JobsStatus(JobIdParams) -> JobRecord, "jobs.status", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one durable job and its current target-confirmed state";
     JobsLogs(JobLogsParams) -> JobLogsResponse, "jobs.logs", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read bounded command output using byte offsets";
@@ -181,7 +211,7 @@ mod tests {
     #[test]
     fn requests_fail_closed() {
         for value in [
-            r#"{"op":"units.restart","params":{"host":"a","unit":"a.service"}}"#,
+            r#"{"op":"units.restart","params":{"host":"a","unit":"a.service","force":true}}"#,
             r#"{"op":"host.facts","params":{"host":"a","uid":"admin"}}"#,
             r#"{"op":"host.facts","params":{"host":"a"},"confirmed":true}"#,
         ] {
@@ -221,7 +251,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 14);
+        assert_eq!(operations.len(), 18);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only
@@ -239,5 +269,23 @@ mod tests {
         assert_eq!(execute.minimum_protocol_version, 2);
         assert_eq!(execute.idempotency, IdempotencyRequirement::Required);
         assert!(!execute.read_only);
+        let restart = operations
+            .iter()
+            .find(|operation| operation.name == "units.restart")
+            .unwrap();
+        assert_eq!(restart.capability, "units:manage");
+        assert_eq!(restart.idempotency, IdempotencyRequirement::Required);
+    }
+
+    #[test]
+    fn unit_actions_validate_external_state_preconditions() {
+        let mut params = UnitActionParams {
+            host: "host-a".into(),
+            unit: "example.service".into(),
+            expected_invocation_id: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+        assert!(params.validate().is_ok());
+        params.expected_invocation_id = Some("not-an-invocation".into());
+        assert!(params.validate().is_err());
     }
 }

@@ -8,7 +8,7 @@ use futures::future::join_all;
 use maxops_proto::{
     ExecutorRequest, ExecutorResponse, IdempotencyRequirement, JobCancelParams, JobId, JobIdParams,
     JobRecord, JobState, JobsListResponse, NewJob, OperationKind, PROTOCOL_VERSION, Request,
-    Snapshot, now, operations,
+    Snapshot, UnitActionParams, now, operations,
     transport::{self, ApiError, ApiResult, Token},
     valid_host, valid_unit,
 };
@@ -81,6 +81,8 @@ struct HostConfig {
     execution_token_file: Option<PathBuf>,
     #[serde(default)]
     readable_units: BTreeSet<String>,
+    #[serde(default)]
+    manageable_units: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +154,12 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         color_eyre::eyre::ensure!(
             host.readable_units.iter().all(|u| valid_unit(u)),
             "invalid readable service name"
+        );
+        color_eyre::eyre::ensure!(
+            host.manageable_units
+                .iter()
+                .all(|unit| valid_unit(unit) && host.readable_units.contains(unit)),
+            "manageable services must be valid readable service names"
         );
         transport::validate_url(&host.agent_url)?;
         let token = Token::read(&host.agent_token_file)?;
@@ -372,6 +380,13 @@ fn host_for<'a>(app: &'a App, principal: &Principal, name: &str) -> Result<&'a H
 fn unit_allowed(host: &Host, unit: &str) -> Result<(), ApiError> {
     if !host.config.readable_units.contains(unit) {
         return Err(ApiError(StatusCode::FORBIDDEN, "unit not permitted"));
+    }
+    Ok(())
+}
+
+fn unit_manageable(host: &Host, unit: &str) -> Result<(), ApiError> {
+    if !host.config.manageable_units.contains(unit) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "unit is not manageable"));
     }
     Ok(())
 }
@@ -661,6 +676,10 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             )
         }
         Request::ExecRun(_)
+        | Request::UnitsStart(_)
+        | Request::UnitsStop(_)
+        | Request::UnitsRestart(_)
+        | Request::UnitsReload(_)
         | Request::JobsList(_)
         | Request::JobsStatus(_)
         | Request::JobsLogs(_)
@@ -754,6 +773,18 @@ async fn run_job_operation(
                 StatusCode::ACCEPTED,
                 serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
             ))
+        }
+        Request::UnitsStart(params) => {
+            submit_unit_action(app, principal, headers, "units.start", params).await
+        }
+        Request::UnitsStop(params) => {
+            submit_unit_action(app, principal, headers, "units.stop", params).await
+        }
+        Request::UnitsRestart(params) => {
+            submit_unit_action(app, principal, headers, "units.restart", params).await
+        }
+        Request::UnitsReload(params) => {
+            submit_unit_action(app, principal, headers, "units.reload", params).await
         }
         Request::JobsList(params) => {
             if let Some(host) = &params.host {
@@ -893,6 +924,50 @@ async fn run_job_operation(
     }
 }
 
+async fn submit_unit_action(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    operation: &str,
+    params: UnitActionParams,
+) -> Result<(StatusCode, Value), ApiError> {
+    params
+        .validate()
+        .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+    let host = host_for(app, principal, &params.host)?;
+    unit_manageable(host, &params.unit)?;
+    if host.execution_token.is_none() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host execution disabled",
+        ));
+    }
+    let key = idempotency_key(headers)?;
+    let deadline = now()
+        .checked_add(std::time::Duration::from_secs(60))
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?;
+    let job = NewJob {
+        principal: principal.name.clone(),
+        host: params.host.clone(),
+        operation: operation.into(),
+        spec_version: 1,
+        spec: serde_json::to_value(params).expect("serializable service action"),
+        policy_version: "hub-config-v1".into(),
+        deadline: Some(deadline),
+    };
+    let submitted = durable_store(app)?
+        .submit_job(key, &job)
+        .await
+        .map_err(map_store_error)?;
+    if submitted.created || submitted.job.handle.state == JobState::Queued {
+        spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        serde_json::to_value(submitted.job.handle).expect("serializable job handle"),
+    ))
+}
+
 async fn agent_request(
     app: &App,
     host_name: &str,
@@ -1024,7 +1099,10 @@ async fn monitor_target(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()
             .as_ref()
             .ok_or_else(|| color_eyre::eyre::eyre!("store disabled"))?;
         let current = store.get_job(&id).await?;
-        if current.handle.state.is_terminal() && current.handle.state != JobState::OutcomeUnknown {
+        if current.handle.state.is_terminal()
+            && (current.handle.state != JobState::OutcomeUnknown
+                || current.handle.operation.starts_with("units."))
+        {
             return Ok(());
         }
         match agent_request(
@@ -1037,7 +1115,8 @@ async fn monitor_target(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()
             Ok(ExecutorResponse::Job(target)) => {
                 let updated = project_target_job(store, current, target).await?;
                 if updated.handle.state.is_terminal()
-                    && updated.handle.state != JobState::OutcomeUnknown
+                    && (updated.handle.state != JobState::OutcomeUnknown
+                        || updated.handle.operation.starts_with("units."))
                 {
                     return Ok(());
                 }
@@ -1057,7 +1136,8 @@ async fn monitor_target(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()
                         Ok(ExecutorResponse::Job(target)) => {
                             let updated = project_target_job(store, current, target).await?;
                             if updated.handle.state.is_terminal()
-                                && updated.handle.state != JobState::OutcomeUnknown
+                                && (updated.handle.state != JobState::OutcomeUnknown
+                                    || updated.handle.operation.starts_with("units."))
                             {
                                 return Ok(());
                             }
@@ -1079,10 +1159,23 @@ async fn monitor_target(app: Arc<App>, id: JobId) -> color_eyre::eyre::Result<()
 
 fn dispatch_authorized(app: &App, job: &JobRecord) -> bool {
     app.clients.iter().any(|principal| {
+        let capability = operations()
+            .into_iter()
+            .find(|operation| operation.name == job.handle.operation)
+            .map(|operation| operation.capability);
+        let target_still_allowed = if job.handle.operation.starts_with("units.") {
+            serde_json::from_value::<UnitActionParams>(job.spec.clone())
+                .ok()
+                .and_then(|params| app.hosts.get(&job.handle.host).map(|host| (params, host)))
+                .is_some_and(|(params, host)| host.config.manageable_units.contains(&params.unit))
+        } else {
+            true
+        };
         principal.name == job.principal
             && principal.access == Access::Manage
-            && principal.capabilities.contains("exec:run")
+            && capability.is_some_and(|capability| principal.capabilities.contains(capability))
             && principal.hosts.contains(&job.handle.host)
+            && target_still_allowed
     })
 }
 

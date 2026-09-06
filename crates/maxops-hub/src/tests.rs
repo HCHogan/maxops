@@ -25,6 +25,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         agent_token_file: PathBuf::new(),
                         execution_token_file: None,
                         readable_units: BTreeSet::from(["demo.service".into()]),
+                        manageable_units: BTreeSet::new(),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                     execution_token: None,
@@ -40,6 +41,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                         agent_token_file: PathBuf::new(),
                         execution_token_file: None,
                         readable_units: BTreeSet::new(),
+                        manageable_units: BTreeSet::new(),
                     },
                     token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                     execution_token: None,
@@ -227,6 +229,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
                     agent_token_file: PathBuf::new(),
                     execution_token_file: None,
                     readable_units: BTreeSet::new(),
+                    manageable_units: BTreeSet::from(["demo.service".into()]),
                 },
                 token: Token::parse(AGENT_TOKEN.into()).unwrap(),
                 execution_token: Some(Token::parse(EXECUTION_TOKEN.into()).unwrap()),
@@ -238,6 +241,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
             hosts: BTreeSet::from(["alpha".into()]),
             capabilities: BTreeSet::from([
                 "exec:run".into(),
+                "units:manage".into(),
                 "jobs:read".into(),
                 "jobs:cancel".into(),
             ]),
@@ -361,6 +365,85 @@ async fn management_submission_is_durable_idempotent_and_target_confirmed() {
     }
     assert_eq!(observed["handle"]["state"], "succeeded");
     assert_eq!(observed["result"]["exit_code"], 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn service_submission_requires_capability_and_exact_manageable_unit() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_store = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(successful_executor))
+            .with_state(target_store),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let router = router(Arc::new(
+        management_app(&url, &hub_directory.path().join("hub.db")).await,
+    ));
+    let allowed = json!({
+        "op":"units.restart",
+        "params":{"host":"alpha","unit":"demo.service"}
+    });
+    let (status, submitted) = call_with_idempotency(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("service-restart"),
+        allowed,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let job_id = submitted["job_id"].as_str().unwrap();
+    for _ in 0..20 {
+        let (_, status) = call(
+            router.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            json!({"op":"jobs.status","params":{"job_id":job_id}}),
+        )
+        .await;
+        if status["handle"]["state"] == "succeeded" {
+            assert_eq!(status["handle"]["operation"], "units.restart");
+            task.abort();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("service job did not complete");
+}
+
+#[tokio::test]
+async fn service_submission_rejects_unit_outside_manageable_inventory() {
+    let target_directory = tempfile::tempdir().unwrap();
+    let target_store = Store::open(&target_directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(successful_executor))
+            .with_state(target_store),
+    )
+    .await;
+    let hub_directory = tempfile::tempdir().unwrap();
+    let router = router(Arc::new(
+        management_app(&url, &hub_directory.path().join("hub.db")).await,
+    ));
+    let (status, _) = call_with_idempotency(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("forbidden-service"),
+        json!({
+            "op":"units.restart",
+            "params":{"host":"alpha","unit":"secret.service"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     task.abort();
 }
 

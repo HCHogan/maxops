@@ -245,6 +245,94 @@ impl Store {
         })
     }
 
+    /// Acquire one target-local resource for a job. A lock owned by the same
+    /// job is recovered idempotently; a lock left by a terminal job is stale
+    /// and may be replaced. Locks owned by live jobs are never stolen.
+    pub async fn try_acquire_resource(
+        &self,
+        resource_kind: &str,
+        resource_key: &str,
+        owner: &JobId,
+    ) -> Result<bool> {
+        ensure!(
+            !resource_kind.is_empty() && !resource_key.is_empty(),
+            "resource identity must not be empty"
+        );
+        let _writer = self.writer.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(row) = sqlx::query(
+            "SELECT resources.owner_job_id, resources.revision, jobs.state
+             FROM resources JOIN jobs ON jobs.id = resources.owner_job_id
+             WHERE resource_kind = ? AND resource_key = ?",
+        )
+        .bind(resource_kind)
+        .bind(resource_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let current_owner: String = row.try_get("owner_job_id")?;
+            if current_owner == owner.as_str() {
+                transaction.commit().await?;
+                return Ok(true);
+            }
+            let state = row
+                .try_get::<&str, _>("state")?
+                .parse::<JobState>()
+                .map_err(|message| eyre!(message))?;
+            if !state.is_terminal() {
+                transaction.commit().await?;
+                return Ok(false);
+            }
+            let revision: i64 = row.try_get("revision")?;
+            sqlx::query(
+                "UPDATE resources SET owner_job_id = ?, revision = ?, acquired_at = ?
+                 WHERE resource_kind = ? AND resource_key = ? AND revision = ?",
+            )
+            .bind(owner.as_str())
+            .bind(revision + 1)
+            .bind(maxops_proto::now().to_string())
+            .bind(resource_kind)
+            .bind(resource_key)
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        sqlx::query(
+            "INSERT INTO resources
+             (resource_kind, resource_key, owner_job_id, revision, acquired_at)
+             VALUES (?, ?, ?, 1, ?)",
+        )
+        .bind(resource_kind)
+        .bind(resource_key)
+        .bind(owner.as_str())
+        .bind(maxops_proto::now().to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn release_resource(
+        &self,
+        resource_kind: &str,
+        resource_key: &str,
+        owner: &JobId,
+    ) -> Result<bool> {
+        let _writer = self.writer.lock().await;
+        let result = sqlx::query(
+            "DELETE FROM resources
+             WHERE resource_kind = ? AND resource_key = ? AND owner_job_id = ?",
+        )
+        .bind(resource_kind)
+        .bind(resource_key)
+        .bind(owner.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn transition_job(
         &self,
         id: &JobId,
@@ -692,6 +780,64 @@ mod tests {
         assert!(cancelling.cancel_requested);
         assert_eq!(cancelling.handle.revision, 3);
         assert_eq!(store.job_events(id, 0).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn resource_lock_serializes_jobs_and_recovers_from_terminal_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("store.db"))
+            .await
+            .unwrap();
+        let first = store
+            .submit_job("lock-first", &job(json!({"unit":"demo.service"})))
+            .await
+            .unwrap()
+            .job;
+        let second = store
+            .submit_job("lock-second", &job(json!({"unit":"demo.service"})))
+            .await
+            .unwrap()
+            .job;
+        assert!(
+            store
+                .try_acquire_resource("systemd_manager", "host-a", &first.handle.job_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .try_acquire_resource("systemd_manager", "host-a", &second.handle.job_id)
+                .await
+                .unwrap()
+        );
+        store
+            .transition_job(
+                &first.handle.job_id,
+                first.handle.revision,
+                JobState::Failed,
+                &json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .try_acquire_resource("systemd_manager", "host-a", &second.handle.job_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .release_resource("systemd_manager", "host-a", &first.handle.job_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_resource("systemd_manager", "host-a", &second.handle.job_id)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
