@@ -315,6 +315,8 @@ pub struct ChangeStatusParams {
 #[serde(deny_unknown_fields)]
 pub struct ChangeHistoryParams {
     #[serde(default)]
+    pub cursor: Option<ChangeId>,
+    #[serde(default)]
     pub host: Option<String>,
     #[serde(default = "default_change_limit")]
     #[schemars(range(min = 1, max = 200))]
@@ -330,6 +332,8 @@ pub const fn default_change_limit() -> u16 {
 #[serde(deny_unknown_fields)]
 pub struct ChangeHistoryResponse {
     pub changes: Vec<ChangeRecord>,
+    #[serde(default)]
+    pub next_cursor: Option<ChangeId>,
 }
 
 #[derive(

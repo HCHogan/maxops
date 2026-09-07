@@ -1,5 +1,6 @@
 //! Versioned operations and durable execution types shared by every frontend.
 pub mod changes;
+pub mod client_api;
 pub mod events;
 pub mod jobs;
 pub mod observations;
@@ -7,6 +8,7 @@ pub mod transport;
 pub mod workspaces;
 
 pub use changes::*;
+pub use client_api::*;
 pub use events::*;
 pub use jobs::*;
 pub use observations::*;
@@ -204,6 +206,11 @@ operations! {
     DiagnosticsCollect(DiagnosticCollectParams) -> JobHandle, "diagnostics.collect", "diagnostics:collect", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Collect bounded target evidence and configured probes into a durable bundle";
     RemediationsBegin(RemediationBeginParams) -> JobHandle, "remediations.begin", "remediations:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Claim one budgeted remediation attempt for an event episode";
     RemediationsFinish(RemediationFinishParams) -> RemediationRecord, "remediations.finish", "remediations:manage", OperationKind::JobControl, false, IdempotencyRequirement::None, "Record a remediation outcome and related job or change";
+    ResourcesList(ResourcesParams) -> serde_json::Value, "resources.list", "self:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Discover authorized hosts, units, repositories, deployments or target execution profiles in bounded pages";
+    JobsWait(JobWaitParams) -> serde_json::Value, "jobs.wait", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Wait up to 10 seconds for a job revision or terminal outcome; no submission is replayed";
+    JobsEvents(JobEventsParams) -> serde_json::Value, "jobs.events", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Replay durable events for an owned job after a sequence cursor";
+    JobsResult(JobResultParams) -> serde_json::Value, "jobs.result", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a bounded result fragment using a JSON pointer and UTF-8 byte offsets";
+    DeployRun(DeployRunParams) -> JobHandle, "deploy.run", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Durably run a prepared change through build or verified activation; preserves revision and external-writer guards";
 }
 
 pub fn valid_unit(name: &str) -> bool {
@@ -273,7 +280,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 38);
+        assert_eq!(operations.len(), 43);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only

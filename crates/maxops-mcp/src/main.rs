@@ -40,7 +40,6 @@ struct ServerOperation {
     read_only: bool,
     idempotency: String,
     params_schema: Value,
-    response_schema: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,15 +147,17 @@ impl Server {
                     "title": "maxops fleet operations",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Tools are the operations permitted to this maxops credential. Durable job submissions require _maxops_idempotency_key and return a job handle to poll with jobs.status. Re-observe state before every mutation because humans and other fleet tools can change hosts and repositories."
+                "instructions": "Tools are the operations permitted to this maxops credential. Durable job submissions require _maxops_idempotency_key and return a job handle to observe with jobs.wait or replay with jobs.events. Re-observe state before every mutation because humans and other fleet tools can change hosts and repositories."
             }),
         )
     }
 
     async fn catalog(&self) -> Result<Catalog, ()> {
         let catalog: Catalog = transport::read_json(
-            self.token
-                .apply(self.client.get(format!("{}/v1/operations", self.url))),
+            self.token.apply(
+                self.client
+                    .get(format!("{}/v1/operations?view=tools", self.url)),
+            ),
         )
         .await
         .map_err(|_| ())?;
@@ -220,10 +221,12 @@ impl Server {
         let response: Value = match transport::read_json(request).await {
             Ok(value) => value,
             Err(error) => {
-                let message = transport::upstream_status(&error).map_or_else(
-                    || "maxops hub request failed".to_owned(),
-                    |status| format!("maxops hub returned HTTP {}", status.as_u16()),
-                );
+                let message = error
+                    .downcast_ref::<transport::UpstreamHttpError>()
+                    .map_or_else(
+                        || "maxops hub request failed".to_owned(),
+                        ToString::to_string,
+                    );
                 return Ok(tool_error(&message));
             }
         };
@@ -244,19 +247,8 @@ enum CallError {
 
 fn tool_definition(operation: &ServerOperation) -> Result<Value, ()> {
     let mut input = operation.params_schema.clone();
-    let mut output = operation.response_schema.clone();
-    if !input.is_object() || !output.is_object() {
+    if !input.is_object() {
         return Err(());
-    }
-    let output_type = output.get("type").and_then(Value::as_str);
-    if output_type.is_some_and(|kind| kind != "object") {
-        return Err(());
-    }
-    if output_type.is_none() {
-        output
-            .as_object_mut()
-            .expect("object checked")
-            .insert("type".into(), Value::String("object".into()));
     }
     if operation.idempotency == "required" {
         let properties = input
@@ -294,7 +286,6 @@ fn tool_definition(operation: &ServerOperation) -> Result<Value, ()> {
         "title": operation.name,
         "description": operation.summary,
         "inputSchema": input,
-        "outputSchema": output,
         "annotations": {
             "readOnlyHint": operation.read_only,
             "destructiveHint": !operation.read_only,

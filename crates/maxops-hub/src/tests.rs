@@ -12,6 +12,548 @@ const AGENT_TOKEN: &str = "agent-token-bbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ALERT_TOKEN: &str = "alert-token-cccccccccccccccccccccccccc";
 const EXECUTION_TOKEN: &str = "execution-token-dddddddddddddddddddddddd";
 
+#[tokio::test]
+async fn compact_catalog_pages_are_complete_scoped_and_revision_bound() {
+    let router = router(Arc::new(app(
+        "http://127.0.0.1:1",
+        &["host:read", "units:read"],
+    )));
+    let (_, full) = get_json(router.clone(), "/v1/operations", Some(USER_TOKEN)).await;
+    let (_, tools) = get_json(
+        router.clone(),
+        "/v1/operations?view=tools",
+        Some(USER_TOKEN),
+    )
+    .await;
+    assert_eq!(full["total"], tools["total"]);
+    for operation in tools["operations"].as_array().unwrap() {
+        assert!(operation["params_schema"].is_object());
+        assert!(operation.get("response_schema").is_none());
+        assert_ne!(operation["name"], "exec.run");
+    }
+    let (_, first) = get_json(
+        router.clone(),
+        "/v1/operations?view=summary&limit=1",
+        Some(USER_TOKEN),
+    )
+    .await;
+    assert_eq!(first["operations"].as_array().unwrap().len(), 1);
+    assert!(first["operations"][0].get("params_schema").is_none());
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (status, next) = get_json(
+        router.clone(),
+        &format!("/v1/operations?view=summary&limit=1&cursor={cursor}"),
+        Some(USER_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        first["operations"][0]["name"],
+        next["operations"][0]["name"]
+    );
+    let (status, error) = get_json(
+        router,
+        &format!("/v1/operations?view=tools&cursor={cursor}"),
+        Some(USER_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "cursor_invalid");
+}
+
+#[tokio::test]
+async fn resource_discovery_never_returns_private_hosts_or_ungranted_units() {
+    let router = router(Arc::new(app(
+        "http://127.0.0.1:1",
+        &["self:read", "units:read"],
+    )));
+    let (_, hosts) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{}}),
+    )
+    .await;
+    assert_eq!(hosts["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(hosts["resources"][0]["host"], "alpha");
+    let (_, units) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{"kind":"units"}}),
+    )
+    .await;
+    assert_eq!(units["resources"][0]["unit"], "demo.service");
+    assert_eq!(units["resources"][0]["manageable"], false);
+    let (status, _) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{"host":"private"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+fn fixture_job(principal: &str, host: &str) -> NewJob {
+    NewJob {
+        principal: principal.into(),
+        host: host.into(),
+        operation: "exec.run".into(),
+        spec_version: 1,
+        spec: json!({"secret_fixture":"never in compact status"}),
+        policy_version: "test".into(),
+        deadline: None,
+    }
+}
+
+#[tokio::test]
+async fn wait_wakes_on_committed_revision_without_using_execution_slots() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    state.slots = Semaphore::new(0);
+    let store = state.store.as_ref().unwrap().clone();
+    let job = store
+        .submit_job("wait", &fixture_job("manager", "alpha"))
+        .await
+        .unwrap()
+        .job;
+    let id = job.handle.job_id;
+    let router = router(Arc::new(state));
+    let waiting = tokio::spawn(call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.wait","params":{"job_id":id,"after_revision":1,"timeout_seconds":10}}),
+    ));
+    tokio::task::yield_now().await;
+    store
+        .transition_job(
+            &id,
+            1,
+            JobState::Cancelled,
+            &json!({}),
+            Some(&json!({"cancelled":true})),
+        )
+        .await
+        .unwrap();
+    let (status, result) = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["job"]["handle"]["state"], "cancelled");
+    assert!(result["job"].get("spec").is_none());
+    let (status, _) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.status","params":{"job_id":id}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn job_pages_events_and_results_keep_scope_and_bounds() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    let store = state.store.as_ref().unwrap().clone();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let job = store
+            .submit_job(&format!("page-{index}"), &fixture_job("manager", "alpha"))
+            .await
+            .unwrap()
+            .job;
+        store
+            .transition_job(
+                &job.handle.job_id,
+                1,
+                JobState::Cancelled,
+                &json!({}),
+                Some(&json!({"large":"你好".repeat(20000)})),
+            )
+            .await
+            .unwrap();
+        ids.push(job.handle.job_id);
+    }
+    let foreign = store
+        .submit_job("foreign", &fixture_job("another", "alpha"))
+        .await
+        .unwrap()
+        .job;
+    let router = router(Arc::new(state));
+    let (_, first) = call(
+        router.clone(),
+        "/v1/execute?view=summary",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.list","params":{"limit":2}}),
+    )
+    .await;
+    assert_eq!(first["jobs"].as_array().unwrap().len(), 2);
+    assert!(first["jobs"][0].get("spec").is_none());
+    assert_eq!(first["jobs"][0]["result"], Value::Null);
+    let (_, second) = call(
+        router.clone(),
+        "/v1/execute?view=summary",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.list","params":{"limit":2,"cursor":first["next_cursor"]}}),
+    )
+    .await;
+    assert_eq!(second["jobs"].as_array().unwrap().len(), 1);
+    assert!(second["next_cursor"].is_null());
+    let (_, events) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.events","params":{"job_id":ids[0],"limit":1}}),
+    )
+    .await;
+    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+    let (_, later) = call(router.clone(), "/v1/execute", Some(USER_TOKEN), json!({"op":"jobs.events","params":{"job_id":ids[0],"after_sequence":events["next_sequence"]}})).await;
+    assert_eq!(later["events"][0]["state"], "cancelled");
+    let (_, fragment) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.result","params":{"job_id":ids[0],"pointer":"/large","limit":10}}),
+    )
+    .await;
+    assert!(fragment["text"].as_str().unwrap().len() <= 10);
+    assert_eq!(fragment["complete"], false);
+    let (status, _) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.events","params":{"job_id":foreign.handle.job_id}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn invalid_representation_rejects_before_submitting_a_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    let store = state.store.as_ref().unwrap().clone();
+    let (status, _) = call_with_idempotency(router(Arc::new(state)), "/v1/execute?view=invalid", Some(USER_TOKEN), Some("invalid-view"),
+        json!({"op":"exec.run","params":{"host":"alpha","profile":"diagnostic","command":{"argv":["true"]}}})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        store
+            .get_idempotent_job("manager", "invalid-view")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn prepared_change(app: &Arc<App>, key: &str) -> ChangeRecord {
+    let (status, handle) = call_with_idempotency(router(app.clone()), "/v1/execute", Some(USER_TOKEN), Some(key),
+        json!({"op":"deploy.prepare","params":{"repository":"fixture","workspace_id":"11111111-1111-1111-1111-111111111111",
+          "expected_revision":4,"target_host":"alpha","profile":"fixture-system"}})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{handle}");
+    let id: ChangeId = serde_json::from_value(handle["job_id"].clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match refresh_change(app, &app.clients[0], &id).await {
+                Ok(change) if change.state == ChangeState::Prepared => return change,
+                Ok(_) => {}
+                // The dispatch worker may commit the same observed revision
+                // first. Re-read this observation; never replay a submission.
+                Err(error) if error.0 == StatusCode::CONFLICT => {}
+                Err(error) => panic!("prepare observation failed: {error:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn terminal_job(app: &Arc<App>, id: &JobId) -> JobRecord {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let job = app.store.as_ref().unwrap().get_job(id).await.unwrap();
+            if job.handle.state.is_terminal() {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn deployment_workflow_runs_fixed_stages_and_reuses_submission_identity() {
+    for (until, expected, stages) in [
+        ("built", ChangeState::Ready, 2),
+        ("verified", ChangeState::Succeeded, 4),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let target = Store::open(&directory.path().join("target.db"))
+            .await
+            .unwrap();
+        let (url, server) = stub(
+            Router::new()
+                .route("/v1/manage", post(deployment_executor))
+                .with_state(DeploymentExecutor {
+                    store: target.clone(),
+                    remote_head: StdArc::new(StdMutex::new("a".repeat(40))),
+                    runtime: StdArc::new(StdMutex::new("/nix/store/base-system".into())),
+                }),
+        )
+        .await;
+        let app = Arc::new(deployment_management_app(&url, &directory.path().join("hub.db")).await);
+        let change = prepared_change(&app, "prepare").await;
+        let body = json!({"op":"deploy.run","params":{"change_id":change.plan.change_id,"expected_revision":change.revision,"until":until}});
+        let (status, first) = call_with_idempotency(
+            router(app.clone()),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            Some("workflow"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+        let (_, replay) = call_with_idempotency(
+            router(app.clone()),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            Some("workflow"),
+            body,
+        )
+        .await;
+        assert_eq!(first["job_id"], replay["job_id"]);
+        let id = serde_json::from_value(first["job_id"].clone()).unwrap();
+        let terminal = terminal_job(&app, &id).await;
+        assert_eq!(
+            terminal.handle.state,
+            JobState::Succeeded,
+            "{:?}",
+            terminal.result
+        );
+        let completed = app
+            .store
+            .as_ref()
+            .unwrap()
+            .get_owned_change("manager", &change.plan.change_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.state, expected);
+        assert_eq!(
+            target
+                .list_jobs(Some("manager"), None, &[], 20)
+                .await
+                .unwrap()
+                .len(),
+            stages
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn workflow_ownership_and_stage_link_survive_reopen_without_orphaned_jobs() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = Store::open(&directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, server) = stub(
+        Router::new()
+            .route("/v1/manage", post(deployment_executor))
+            .with_state(DeploymentExecutor {
+                store: target.clone(),
+                remote_head: StdArc::new(StdMutex::new("a".repeat(40))),
+                runtime: StdArc::new(StdMutex::new("/nix/store/base-system".into())),
+            }),
+    )
+    .await;
+    let state_path = directory.path().join("hub.db");
+    let app = Arc::new(deployment_management_app(&url, &state_path).await);
+    let change = prepared_change(&app, "prepare").await;
+    let params = maxops_proto::DeployRunParams {
+        change_id: change.plan.change_id.clone(),
+        expected_revision: change.revision,
+        until: maxops_proto::DeployUntil::Built,
+    };
+    let id = JobId::parse(uuid::Uuid::now_v7().to_string()).unwrap();
+    let mut spec = fixture_job("manager", "alpha");
+    spec.operation = "deploy.run".into();
+    spec.spec = json!(params);
+    let store = app.store.as_ref().unwrap();
+    let parent = store
+        .submit_linked_job(
+            "workflow",
+            &id,
+            &spec,
+            Some(maxops_store::ChangeJobLink {
+                change: &change,
+                next: ChangeState::Prepared,
+                action: None,
+                workflow: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .job;
+    let claimed = store
+        .get_owned_change("manager", &change.plan.change_id)
+        .await
+        .unwrap();
+    let (status, _) = call_with_idempotency(router(app.clone()), "/v1/execute", Some(USER_TOKEN), Some("competing"),
+        json!({"op":"deploy.build","params":{"change_id":change.plan.change_id,"expected_revision":claimed.revision}})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        store
+            .get_idempotent_job("manager", "competing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .list_jobs(Some("manager"), None, &[], 20)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let running = enter_local_job(store, parent).await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "idempotency-key",
+        format!("workflow:{id}:deploy.build").parse().unwrap(),
+    );
+    submit_change_stage_owned(
+        &app,
+        &app.clients[0],
+        &headers,
+        DeployChangeParams {
+            change_id: change.plan.change_id.clone(),
+            expected_revision: claimed.revision,
+        },
+        DeploymentAction::Build,
+        Some(&id),
+    )
+    .await
+    .unwrap();
+    // Reconstruct a fresh Hub owner from the durable database after the stage
+    // was linked. The existing child identity must be observed, never replaced.
+    let reopened = Arc::new(deployment_management_app(&url, &state_path).await);
+    deployment_workflow::spawn(reopened.clone(), running);
+    assert_eq!(
+        terminal_job(&reopened, &id).await.handle.state,
+        JobState::Succeeded
+    );
+    assert_eq!(
+        target
+            .list_jobs(Some("manager"), None, &[], 20)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_workflow_never_starts_a_stage_and_unknown_only_reconciles() {
+    for cancelled in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let target = Store::open(&directory.path().join("target.db"))
+            .await
+            .unwrap();
+        let (url, server) = stub(
+            Router::new()
+                .route("/v1/manage", post(deployment_executor))
+                .with_state(DeploymentExecutor {
+                    store: target.clone(),
+                    remote_head: StdArc::new(StdMutex::new("a".repeat(40))),
+                    runtime: StdArc::new(StdMutex::new("/nix/store/base-system".into())),
+                }),
+        )
+        .await;
+        let app = Arc::new(deployment_management_app(&url, &directory.path().join("hub.db")).await);
+        let change = prepared_change(&app, "prepare").await;
+        let store = app.store.as_ref().unwrap();
+        let id = JobId::parse(uuid::Uuid::now_v7().to_string()).unwrap();
+        let mut spec = fixture_job("manager", "alpha");
+        spec.operation = "deploy.run".into();
+        spec.spec = json!({"change_id":change.plan.change_id,"expected_revision":change.revision,"until":"verified"});
+        let parent = store
+            .submit_linked_job(
+                "workflow",
+                &id,
+                &spec,
+                Some(maxops_store::ChangeJobLink {
+                    change: &change,
+                    next: ChangeState::Prepared,
+                    action: None,
+                    workflow: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .job;
+        if cancelled {
+            store
+                .request_cancel(&id, parent.handle.revision, "stop before start")
+                .await
+                .unwrap();
+            // Deliberately pass the stale pre-cancel snapshot to the worker.
+            deployment_workflow::spawn(app.clone(), parent);
+            assert_eq!(
+                terminal_job(&app, &id).await.handle.state,
+                JobState::Cancelled
+            );
+        } else {
+            let running = enter_local_job(store, parent).await.unwrap();
+            let reconciling = store
+                .transition_job(
+                    &id,
+                    running.handle.revision,
+                    JobState::Reconciling,
+                    &json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
+            store
+                .transition_job(
+                    &id,
+                    reconciling.handle.revision,
+                    JobState::OutcomeUnknown,
+                    &json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let (status, observed) = call(
+                router(app.clone()),
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op":"jobs.status","params":{"job_id":id}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(observed["handle"]["state"], "failed");
+            assert_eq!(observed["result"]["stages_resumed"], false);
+        }
+        assert_eq!(
+            target
+                .list_jobs(Some("manager"), None, &[], 20)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        server.abort();
+    }
+}
+
 fn app(agent_url: &str, capabilities: &[&str]) -> App {
     App {
         hosts: BTreeMap::from([
@@ -68,6 +610,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
         event_sinks: Vec::new(),
         remediation_policy: RemediationPolicyConfig::default(),
         slots: Semaphore::new(16),
+        wait_slots: Semaphore::new(64),
         store: None,
         repositories: BTreeMap::new(),
         deployments: BTreeMap::new(),
@@ -127,6 +670,7 @@ async fn successful_executor(
         return Err(StatusCode::UNAUTHORIZED);
     }
     match request {
+        ExecutorRequest::ExecutionProfiles => Ok(Json(ExecutorResponse::ExecutionProfiles(vec![]))),
         ExecutorRequest::Submit { job_id, job } => {
             let accepted = store.accept_job(&job_id, &job).await.unwrap();
             let job = if accepted.created {
@@ -409,6 +953,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
         event_sinks: Vec::new(),
         remediation_policy: RemediationPolicyConfig::default(),
         slots: Semaphore::new(16),
+        wait_slots: Semaphore::new(64),
         store: Some(Store::open(state_file).await.unwrap()),
         repositories: BTreeMap::new(),
         deployments: BTreeMap::new(),

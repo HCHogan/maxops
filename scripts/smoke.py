@@ -98,7 +98,11 @@ with tempfile.TemporaryDirectory(prefix="maxops-smoke-") as directory:
         http_catalog = json.loads(subprocess.check_output([
             "python3", str(root / "examples/http-client.py"), "operations"
         ], text=True, env=client_env))
-        assert http_catalog == catalog
+        assert http_catalog["view"] == "summary"
+        assert http_catalog["next_cursor"] is None
+        assert [entry["name"] for entry in http_catalog["operations"]] == [entry["name"] for entry in catalog["operations"]]
+        assert all("params_schema" not in entry and "response_schema" not in entry for entry in http_catalog["operations"])
+        assert all("params_schema" in entry and "response_schema" in entry for entry in catalog["operations"])
         http_facts = json.loads(subprocess.check_output([
             "python3", str(root / "examples/http-client.py"), "call", "host.facts",
             json.dumps({"host": "fixture"})
@@ -136,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix="maxops-smoke-") as directory:
         assert {tool["name"] for tool in mcp_tools} == {
             operation["name"] for operation in catalog["operations"]
         }
+        assert all("inputSchema" in tool and "outputSchema" not in tool for tool in mcp_tools)
         mcp_facts = mcp_request({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "host.facts", "arguments": {"host": "fixture"}},

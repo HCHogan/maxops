@@ -44,10 +44,37 @@ impl Token {
     }
 }
 
+#[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        let (code, retry) = match self.1 {
+            "unsupported operation" => ("unsupported_operation", "refresh_catalog"),
+            "idempotency key conflicts with another request" => ("idempotency_conflict", "never"),
+            "job revision changed" | "change revision changed" => ("revision_conflict", "refresh"),
+            "deployment baseline changed" | "deployment plan expired" => {
+                ("stale_baseline", "replan")
+            }
+            "catalog revision changed" | "invalid cursor" => ("cursor_invalid", "restart_listing"),
+            "change is owned by a deployment workflow" => ("workflow_conflict", "observe"),
+            _ => match self.0 {
+                StatusCode::UNAUTHORIZED => ("unauthenticated", "never"),
+                StatusCode::FORBIDDEN => ("forbidden", "never"),
+                StatusCode::NOT_FOUND => ("not_found", "never"),
+                StatusCode::CONFLICT => ("state_conflict", "refresh"),
+                StatusCode::GONE => ("cursor_expired", "restart_listing"),
+                StatusCode::TOO_MANY_REQUESTS => ("busy", "backoff"),
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                    ("invalid_request", "never")
+                }
+                _ => ("unavailable", "observe_before_retry"),
+            },
+        };
+        (
+            self.0,
+            Json(serde_json::json!({"error": self.1, "code": code, "retry": retry})),
+        )
+            .into_response()
     }
 }
 pub type ApiResult<T> = Result<Json<T>, ApiError>;
@@ -55,15 +82,69 @@ pub type ApiResult<T> = Result<Json<T>, ApiError>;
 #[derive(Debug)]
 pub struct UpstreamHttpError {
     status: StatusCode,
+    code: Option<String>,
+    retry: Option<String>,
 }
 
 impl UpstreamHttpError {
     pub fn new(status: StatusCode) -> Self {
-        Self { status }
+        Self {
+            status,
+            code: None,
+            retry: None,
+        }
     }
 
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+    pub fn retry(&self) -> Option<&str> {
+        self.retry.as_deref()
+    }
+
+    fn with_public_body(mut self, bytes: &[u8]) -> Self {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            let code = value.get("code").and_then(serde_json::Value::as_str);
+            let retry = value.get("retry").and_then(serde_json::Value::as_str);
+            if let (Some(code), Some(retry)) = (code, retry)
+                && matches!(
+                    code,
+                    "unsupported_operation"
+                        | "idempotency_conflict"
+                        | "revision_conflict"
+                        | "stale_baseline"
+                        | "cursor_invalid"
+                        | "workflow_conflict"
+                        | "unauthenticated"
+                        | "forbidden"
+                        | "not_found"
+                        | "state_conflict"
+                        | "cursor_expired"
+                        | "busy"
+                        | "invalid_request"
+                        | "unavailable"
+                )
+                && matches!(
+                    retry,
+                    "refresh_catalog"
+                        | "never"
+                        | "refresh"
+                        | "replan"
+                        | "restart_listing"
+                        | "observe"
+                        | "backoff"
+                        | "observe_before_retry"
+                )
+            {
+                self.code = Some(code.into());
+                self.retry = Some(retry.into());
+            }
+        }
+        self
     }
 }
 
@@ -73,7 +154,11 @@ impl fmt::Display for UpstreamHttpError {
             formatter,
             "upstream request failed with HTTP {}",
             self.status
-        )
+        )?;
+        if let (Some(code), Some(retry)) = (&self.code, &self.retry) {
+            write!(formatter, " code={code} retry={retry}")?;
+        }
+        Ok(())
     }
 }
 
@@ -139,7 +224,15 @@ pub async fn read_json<T: serde::de::DeserializeOwned>(
 ) -> color_eyre::eyre::Result<T> {
     let mut response = request.send().await?;
     if !response.status().is_success() {
-        return Err(UpstreamHttpError::new(response.status()).into());
+        let error = UpstreamHttpError::new(response.status());
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > 4096 {
+                return Err(error.into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return Err(error.with_public_body(&bytes).into());
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {

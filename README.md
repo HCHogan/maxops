@@ -9,6 +9,9 @@ Version 0.3 extends the initial single-host pilot with durable execution,
 configuration deployment, event-driven diagnostics and generic clients.
 Fleet inventory and deployment evidence belong to the consuming Nix repository.
 
+The [public client contract](docs/api-client-contract.md) defines discovery,
+compact results, waiting and fixed deployment workflows.
+
 The [implementation plan](docs/implementation-plan.md) records the completed
 delivery stages. Every API is usable by people and arbitrary automation clients.
 The design supports concurrent manual and external changes to repositories and
@@ -21,11 +24,15 @@ hosts.
 - A shared operation registry generates request decoding, capability names,
   operation kind, idempotency requirement, parameter/response JSON Schemas and
   CLI subcommands. Utoipa derives OpenAPI from the same request types.
+- Compact, credential-scoped discovery offers summary/tools/full views,
+  revision-bound pages and `resources.list`. Job/change lists are scoped before
+  pagination. Safe machine errors retain explicit retry advice.
 - SQLx/SQLite stores durable jobs, idempotency keys, revisioned transitions and
   events with WAL, synchronous writes, migrations and consistent backups.
 - `exec.run` submits a bounded asynchronous job to a server-defined execution
   profile. `jobs.list/status/logs/cancel` survive client disconnects and daemon
-  restarts. The Hub retries a lost acknowledgement with the same stable job ID.
+  restarts. `jobs.wait` observes revisions with separate waiter capacity;
+  `jobs.events/result` provide bounded replay and evidence reads. The Hub retries a lost acknowledgement with the same stable job ID.
 - The Linux executor launches each command as a transient systemd service, uses
   cgroup-wide cancellation and timeouts, stores bounded binary output, and
   reconciles persistent result records after restart. Diagnostic profiles run as
@@ -46,6 +53,9 @@ hosts.
   Activation and recovery use exact closure/profile ownership checks; a later
   human push or rebuild makes the old operation stale or superseded instead of
   being overwritten.
+- `deploy.run` durably drives an existing frozen change to built or verified.
+  Workflow ownership and child identities commit atomically; restart reuses
+  children, and cancellation stops future stages.
 - Deployment and service mutations share a durable per-host lock for maxops
   jobs. Builds remain independent, and the lock never claims to exclude a human
   or another fleet tool.
@@ -77,7 +87,7 @@ hosts.
   stdio. It forwards the same bearer identity and HTTP requests as the CLI;
   there is no second authorization or job implementation.
 - A Python standard-library HTTP example demonstrates catalog discovery,
-  generic operation calls and durable job polling without Max or any bot SDK.
+  generic operation calls and bounded revision waiting without Max or any bot SDK.
 - Native NixOS modules with unprivileged services and systemd credentials.
 - Devenv, nextest, Criterion, HTTP integration tests and a NixOS VM test.
 

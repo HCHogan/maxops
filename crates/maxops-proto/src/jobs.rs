@@ -263,6 +263,8 @@ impl ExecRunParams {
 #[serde(deny_unknown_fields)]
 pub struct JobsListParams {
     #[serde(default)]
+    pub cursor: Option<JobId>,
+    #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
     pub states: Vec<JobState>,
@@ -309,6 +311,8 @@ pub struct JobCancelParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 pub struct JobsListResponse {
     pub jobs: Vec<JobRecord>,
+    #[serde(default)]
+    pub next_cursor: Option<JobId>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
@@ -366,6 +370,7 @@ pub struct RuntimeStateResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(tag = "action", content = "params", rename_all = "snake_case")]
 pub enum ExecutorRequest {
+    ExecutionProfiles,
     Submit {
         job_id: JobId,
         job: NewJob,
@@ -390,6 +395,7 @@ pub enum ExecutorRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub enum ExecutorResponse {
+    ExecutionProfiles(Vec<crate::ExecutionProfileInfo>),
     Job(JobRecord),
     Logs(JobLogsResponse),
     Workspace(WorkspaceTargetResponse),

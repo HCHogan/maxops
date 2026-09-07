@@ -187,6 +187,7 @@ async fn wait_for_job(
     job_id: JobId,
     follow: bool,
 ) -> color_eyre::eyre::Result<JobRecord> {
+    let mut revision = None;
     let mut stdout_offset = 0;
     let mut stderr_offset = 0;
     loop {
@@ -210,10 +211,12 @@ async fn wait_for_job(
             stdout_offset = logs.next_stdout_offset;
             stderr_offset = logs.next_stderr_offset;
         }
-        let request = Request::JobsStatus(JobIdParams {
+        let request = Request::JobsWait(maxops_proto::JobWaitParams {
             job_id: job_id.clone(),
+            after_revision: revision,
+            timeout_seconds: 10,
         });
-        let job: JobRecord = match transport::read_json(
+        let waited: Value = match transport::read_json(
             token
                 .apply(client.post(format!("{url}/v1/execute")))
                 .json(&request),
@@ -227,7 +230,16 @@ async fn wait_for_job(
             }
             Err(error) => return Err(error),
         };
-        if job.handle.state.is_terminal() {
+        let handle: JobHandle = serde_json::from_value(waited["job"]["handle"].clone())?;
+        revision = Some(handle.revision);
+        if handle.state.is_terminal() {
+            let job: JobRecord =
+                transport::read_json(token.apply(client.post(format!("{url}/v1/execute"))).json(
+                    &Request::JobsStatus(JobIdParams {
+                        job_id: job_id.clone(),
+                    }),
+                ))
+                .await?;
             if follow {
                 let logs = fetch_logs(
                     client,
@@ -246,7 +258,6 @@ async fn wait_for_job(
             }
             return Ok(job);
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 

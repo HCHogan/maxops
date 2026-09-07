@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Response, StatusCode, header},
     routing::{get, post},
 };
@@ -38,6 +38,8 @@ use std::{
 use tokio::sync::Semaphore;
 use utoipa::OpenApi;
 
+mod client_api;
+mod deployment_workflow;
 mod metrics;
 
 #[derive(utoipa::OpenApi)]
@@ -235,6 +237,7 @@ struct App {
     event_sinks: Vec<EventSink>,
     remediation_policy: RemediationPolicyConfig,
     slots: Semaphore,
+    wait_slots: Semaphore,
     store: Option<Store>,
     repositories: BTreeMap<String, String>,
     deployments: BTreeMap<String, DeploymentConfig>,
@@ -586,6 +589,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
         event_sinks,
         remediation_policy: config.remediation_policy,
         slots: Semaphore::new(16),
+        wait_slots: Semaphore::new(64),
         store,
         repositories,
         deployments,
@@ -601,6 +605,7 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
     if let Some(store) = &app.store {
         for job in store.nonterminal_jobs().await? {
             match job.handle.operation.as_str() {
+                "deploy.run" => deployment_workflow::spawn(app.clone(), job),
                 "diagnostics.collect" => spawn_diagnostics(app.clone(), job),
                 "remediations.begin" => spawn_remediation_begin(app.clone(), job),
                 _ => spawn_dispatch(app.clone(), job.handle.job_id),
@@ -901,12 +906,15 @@ fn unit_manageable(host: &Host, unit: &str) -> Result<(), ApiError> {
     (status = 200, description = "Operations permitted for the authenticated principal", body = Value),
     (status = 401, description = "Missing or invalid bearer token")
 ), security(("bearer" = [])))]
-async fn catalog(State(app): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Value> {
+async fn catalog(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    query: Result<Query<client_api::CatalogQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Value> {
     let principal = authenticate(&app, &headers)?;
-    Ok(Json(
-        json!({"version": PROTOCOL_VERSION, "operations": operations().into_iter()
-        .filter(|op| principal.capabilities.contains(op.capability)).collect::<Vec<_>>()}),
-    ))
+    let Query(query) =
+        query.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid catalog parameters"))?;
+    Ok(Json(client_api::catalog_value(principal, query)?))
 }
 
 async fn observe(app: &App, host: &Host) -> color_eyre::eyre::Result<Snapshot> {
@@ -1039,6 +1047,7 @@ async fn fleet_pressure(app: &App, principal: &Principal) -> BTreeMap<String, Va
 async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value, ApiError> {
     let upstream_error = || ApiError(StatusCode::BAD_GATEWAY, "upstream observation unavailable");
     match request {
+        Request::ResourcesList(params) => client_api::resources(app, principal, params).await,
         Request::FleetOverview(_) => {
             let hosts = principal
                 .hosts
@@ -1269,6 +1278,10 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         | Request::UnitsStop(_)
         | Request::UnitsRestart(_)
         | Request::UnitsReload(_)
+        | Request::JobsWait(_)
+        | Request::JobsEvents(_)
+        | Request::JobsResult(_)
+        | Request::DeployRun(_)
         | Request::JobsList(_)
         | Request::JobsStatus(_)
         | Request::JobsLogs(_)
@@ -1331,10 +1344,17 @@ fn map_store_error(error: color_eyre::eyre::Report) -> ApiError {
         || message.contains("remediation is terminal")
     {
         ApiError(StatusCode::CONFLICT, "remediation policy conflict")
-    } else if message.contains("idempotency key") || message.contains("revision changed") {
+    } else if message.contains("idempotency key") {
         ApiError(
             StatusCode::CONFLICT,
-            "job request conflicts with current state",
+            "idempotency key conflicts with another request",
+        )
+    } else if message.contains("revision changed") {
+        ApiError(StatusCode::CONFLICT, "change revision changed")
+    } else if message.contains("workflow") {
+        ApiError(
+            StatusCode::CONFLICT,
+            "change is owned by a deployment workflow",
         )
     } else if message.contains("change not found") {
         ApiError(StatusCode::NOT_FOUND, "change not found")
@@ -1501,21 +1521,29 @@ async fn run_job_operation(
             if let Some(host) = &params.host {
                 host_for(app, principal, host)?;
             }
-            let changes = store
-                .list_changes(&principal.name, params.host.as_deref(), params.limit)
+            let mut changes = store
+                .list_visible_changes(
+                    &principal.name,
+                    &principal.hosts,
+                    &principal.deployments,
+                    &params,
+                )
                 .await
-                .map_err(map_store_error)?
-                .into_iter()
-                .filter(|change| {
-                    principal
-                        .deployments
-                        .contains(&change.plan.deployment_profile)
-                })
-                .collect();
+                .map_err(map_store_error)?;
+            let more = changes.len() > usize::from(params.limit);
+            changes.truncate(usize::from(params.limit));
+            let next_cursor = if more {
+                changes.last().map(|change| change.plan.change_id.clone())
+            } else {
+                None
+            };
             Ok((
                 StatusCode::OK,
-                serde_json::to_value(ChangeHistoryResponse { changes })
-                    .expect("serializable change history"),
+                serde_json::to_value(ChangeHistoryResponse {
+                    changes,
+                    next_cursor,
+                })
+                .expect("serializable change history"),
             ))
         }
         Request::WorkspaceStatus(params) => {
@@ -1769,6 +1797,21 @@ async fn run_job_operation(
                 serde_json::to_value(updated).expect("serializable remediation"),
             ))
         }
+        Request::JobsWait(params) => Ok((
+            StatusCode::OK,
+            client_api::wait(app, principal, params).await?,
+        )),
+        Request::JobsEvents(params) => Ok((
+            StatusCode::OK,
+            client_api::events(app, principal, params).await?,
+        )),
+        Request::JobsResult(params) => Ok((
+            StatusCode::OK,
+            client_api::result(app, principal, params).await?,
+        )),
+        Request::DeployRun(params) => {
+            deployment_workflow::submit(app, principal, headers, params).await
+        }
         Request::JobsList(params) => {
             if let Some(host) = &params.host {
                 host_for(app, principal, host)?;
@@ -1779,21 +1822,21 @@ async fn run_job_operation(
                     "job list limit must be 1..200",
                 ));
             }
-            let jobs = store
-                .list_jobs(
-                    Some(&principal.name),
-                    params.host.as_deref(),
-                    &params.states,
-                    params.limit,
-                )
+            let mut jobs = store
+                .list_visible_jobs(&principal.name, &principal.hosts, &params)
                 .await
-                .map_err(map_store_error)?
-                .into_iter()
-                .filter(|job| principal.hosts.contains(&job.handle.host))
-                .collect();
+                .map_err(map_store_error)?;
+            let more = jobs.len() > usize::from(params.limit);
+            jobs.truncate(usize::from(params.limit));
+            let next_cursor = if more {
+                jobs.last().map(|job| job.handle.job_id.clone())
+            } else {
+                None
+            };
             Ok((
                 StatusCode::OK,
-                serde_json::to_value(JobsListResponse { jobs }).expect("serializable jobs"),
+                serde_json::to_value(JobsListResponse { jobs, next_cursor })
+                    .expect("serializable jobs"),
             ))
         }
         Request::JobsStatus(params) => {
@@ -1802,7 +1845,9 @@ async fn run_job_operation(
                 .await
                 .map_err(map_store_error)?;
             host_for(app, principal, &job.handle.host)?;
-            if (!job.handle.state.is_terminal() || job.handle.state == JobState::OutcomeUnknown)
+            job = deployment_workflow::reconcile(app, principal, job).await?;
+            if !deployment_workflow::is_local(&job.handle.operation)
+                && (!job.handle.state.is_terminal() || job.handle.state == JobState::OutcomeUnknown)
                 && let Ok(ExecutorResponse::Job(target)) = agent_request(
                     app,
                     &job.handle.host,
@@ -1855,6 +1900,16 @@ async fn run_job_operation(
             host_for(app, principal, &job.handle.host)?;
             if job.handle.revision != params.expected_revision {
                 return Err(ApiError(StatusCode::CONFLICT, "job revision changed"));
+            }
+            if deployment_workflow::is_local(&job.handle.operation) {
+                let requested = store
+                    .request_cancel(&params.job_id, job.handle.revision, &params.reason)
+                    .await
+                    .map_err(map_store_error)?;
+                return Ok((
+                    StatusCode::OK,
+                    serde_json::to_value(requested).expect("job"),
+                ));
             }
             let target = agent_request(
                 app,
@@ -2093,6 +2148,17 @@ async fn submit_change_stage(
     params: DeployChangeParams,
     action: DeploymentAction,
 ) -> Result<(StatusCode, Value), ApiError> {
+    submit_change_stage_owned(app, principal, headers, params, action, None).await
+}
+
+async fn submit_change_stage_owned(
+    app: &Arc<App>,
+    principal: &Principal,
+    headers: &HeaderMap,
+    params: DeployChangeParams,
+    action: DeploymentAction,
+    workflow: Option<&JobId>,
+) -> Result<(StatusCode, Value), ApiError> {
     let key = idempotency_key(headers)?;
     if let Some(existing) = durable_store(app)?
         .get_idempotent_job(&principal.name, key)
@@ -2226,42 +2292,24 @@ async fn submit_change_stage(
                 .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid job deadline"))?,
         ),
     };
+    let id = workflow.map_or_else(
+        || JobId::parse(uuid::Uuid::now_v7().to_string()).expect("UUID"),
+        |parent| stable_child_job_id(parent, operation),
+    );
     let submitted = durable_store(app)?
-        .submit_job(key, &job)
+        .submit_linked_job(
+            key,
+            &id,
+            &job,
+            Some(maxops_store::ChangeJobLink {
+                change: &change,
+                next,
+                action: Some(action),
+                workflow,
+            }),
+        )
         .await
         .map_err(map_store_error)?;
-    if submitted.created {
-        match action {
-            DeploymentAction::Build => {
-                change.jobs.build = Some(submitted.job.handle.job_id.clone())
-            }
-            DeploymentAction::Activate => {
-                change.jobs.activate = Some(submitted.job.handle.job_id.clone())
-            }
-            DeploymentAction::Verify => {
-                change.jobs.verify = Some(submitted.job.handle.job_id.clone())
-            }
-            DeploymentAction::Rollback => {
-                change.jobs.rollback = Some(submitted.job.handle.job_id.clone())
-            }
-            DeploymentAction::Prepare => unreachable!(),
-        }
-        durable_store(app)?
-            .transition_change(
-                &change.plan.change_id,
-                &principal.name,
-                ChangeTransition {
-                    expected_revision: change.revision,
-                    next,
-                    plan: &change.plan,
-                    artifact: change.artifact.as_ref(),
-                    jobs: &change.jobs,
-                    recovery_state: change.recovery_state.as_deref(),
-                },
-            )
-            .await
-            .map_err(map_store_error)?;
-    }
     if submitted.created || submitted.job.handle.state == JobState::Queued {
         spawn_dispatch(app.clone(), submitted.job.handle.job_id.clone());
     }
@@ -3305,17 +3353,38 @@ fn submit_request(job: &JobRecord) -> ExecutorRequest {
 async fn execute(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(request): Json<Request>,
+    representation: Query<client_api::Representation>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     app.requests_total.fetch_add(1, Ordering::Relaxed);
     let principal = authenticate(&app, &headers)?;
+    let Json(raw) = payload
+        .map_err(|error| ApiError(error.status(), "request does not match operation schema"))?;
+    if let Some(name) = raw.get("op").and_then(Value::as_str)
+        && !operations().iter().any(|operation| operation.name == name)
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported operation",
+        ));
+    }
+    let request: Request = serde_json::from_value(raw).map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "request does not match operation schema",
+        )
+    })?;
     if !principal.capabilities.contains(request.capability()) {
         return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
     }
-    let _slot = app
-        .slots
-        .try_acquire()
-        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "hub busy"))?;
+    let _slot = (if matches!(request, Request::JobsWait(_)) {
+        &app.wait_slots
+    } else {
+        &app.slots
+    })
+    .try_acquire()
+    .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "hub busy"))?;
+    representation.0.validate()?;
     let operation = request.name();
     let (kind, idempotency) = operations()
         .into_iter()
@@ -3342,7 +3411,9 @@ async fn execute(
         run_job_operation(&app, principal, &headers, request).await
     };
     tracing::info!(actor = %principal.name, operation, success = result.is_ok(), "query completed");
-    result.map(|(status, value)| (status, Json(value)))
+    result.and_then(|(status, value)| {
+        client_api::present(representation, operation, value).map(|value| (status, Json(value)))
+    })
 }
 
 fn spawn_event_delivery(app: Arc<App>) {

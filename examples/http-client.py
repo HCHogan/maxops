@@ -6,7 +6,6 @@ import json
 import os
 import pathlib
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,13 +48,24 @@ class Maxops:
             with self.opener.open(request, timeout=15) as response:
                 raw = response.read(MAX_BODY + 1)
         except urllib.error.HTTPError as error:
-            raise RuntimeError(f"maxops returned HTTP {error.code}") from None
+            # Only forward the bounded machine contract, never an arbitrary
+            # proxy error page or a remote human-readable body.
+            try:
+                public = json.loads(error.read(4097))
+                code, retry = public.get("code", ""), public.get("retry", "")
+                if code not in {"unsupported_operation", "idempotency_conflict", "revision_conflict", "stale_baseline", "cursor_invalid", "workflow_conflict", "unauthenticated", "forbidden", "not_found", "state_conflict", "cursor_expired", "busy", "invalid_request", "unavailable"}:
+                    code = "unknown"
+                if retry not in {"refresh_catalog", "never", "refresh", "replan", "restart_listing", "observe", "backoff", "observe_before_retry"}:
+                    retry = "unspecified"
+            except (ValueError, AttributeError):
+                code, retry = "unknown", "unspecified"
+            raise RuntimeError(f"maxops HTTP {error.code} code={code} retry={retry}") from None
         if len(raw) > MAX_BODY:
             raise RuntimeError("maxops response exceeds 2 MiB")
         return json.loads(raw)
 
     def operations(self):
-        return self.request("GET", "/v1/operations")
+        return self.request("GET", "/v1/operations?view=summary")
 
     def execute(self, operation: str, params: dict, idempotency_key=None):
         return self.request(
@@ -66,12 +76,15 @@ class Maxops:
         )
 
     def wait(self, job_id: str):
+        revision = None
         while True:
-            job = self.execute("jobs.status", {"job_id": job_id})
-            state = job["handle"]["state"]
-            if state in TERMINAL:
+            response = self.execute("jobs.wait", {
+                "job_id": job_id, "after_revision": revision, "timeout_seconds": 10,
+            })
+            job = response["job"]
+            revision = job["handle"]["revision"]
+            if job["handle"]["state"] in TERMINAL:
                 return job
-            time.sleep(0.25)
 
 
 def json_object(value: str) -> dict:

@@ -296,3 +296,26 @@ The [implementation plan](implementation-plan.md) records the completed event,
 diagnostic and client stages. Reboot and data recovery have separate
 implementation and verification requirements. Rolling procedures and the
 read-only fallback are in [upgrade.md](upgrade.md).
+
+## Compact client contract and fixed deployment workflow
+
+The public contract is [api-client-contract.md](api-client-contract.md). The Hub
+projects the single proto registry into credential-scoped summary/tools/full
+catalogs with revision-bound pagination. Input-only discovery avoids sending
+response schemas to model clients. `resources.list` discovers permitted policy
+names; it does not confer authorization. Job/change list filters apply in SQL
+before page limits, and cursors preserve ordering and scope.
+
+`jobs.wait` uses separate bounded waiter admission and committed revision
+notifications, with a timed fallback for a reopened store. `jobs.events` replays
+existing durable events. `jobs.result` reads bounded JSON fragments; compact
+status and decoded logs avoid duplicating large results. Public machine errors
+cross CLI/MCP boundaries through an allowlist, without arbitrary upstream bodies.
+
+`deploy.run` is one fixed Hub-owned job over an existing frozen change. Migration
+004 adds workflow ownership; job/idempotency insertion and change/stage linkage
+share a transaction. Deterministic child IDs survive interruption and restart.
+Independent primitives cannot replace an active workflow's children. Cancellation
+coordinates the current child and never implies reversal. Unknown workflows can
+reconcile evidence through jobs.status, but observation never starts new stages.
+The executor retains source/runtime baseline checks and rollback policy.

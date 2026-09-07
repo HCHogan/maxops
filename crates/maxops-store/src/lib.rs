@@ -33,12 +33,21 @@ pub struct Store {
     pool: SqlitePool,
     writer: Arc<Mutex<()>>,
     path: PathBuf,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug)]
 pub struct SubmitResult {
     pub job: JobRecord,
     pub created: bool,
+}
+
+pub struct ChangeJobLink<'a> {
+    pub change: &'a ChangeRecord,
+    pub next: ChangeState,
+    /// None claims the change for a new workflow; Some links a primitive stage.
+    pub action: Option<maxops_proto::DeploymentAction>,
+    pub workflow: Option<&'a JobId>,
 }
 
 pub struct ChangeTransition<'a> {
@@ -126,6 +135,7 @@ impl Store {
             pool,
             writer: Arc::new(Mutex::new(())),
             path: path.to_owned(),
+            changed: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -140,6 +150,18 @@ impl Store {
         idempotency_key: &str,
         id: &JobId,
         new: &NewJob,
+    ) -> Result<SubmitResult> {
+        self.submit_linked_job(idempotency_key, id, new, None).await
+    }
+
+    /// Job identity, idempotency receipt, change revision and stage ownership
+    /// commit together. No orphaned stage can be dispatched after a failed CAS.
+    pub async fn submit_linked_job(
+        &self,
+        idempotency_key: &str,
+        id: &JobId,
+        new: &NewJob,
+        link: Option<ChangeJobLink<'_>>,
     ) -> Result<SubmitResult> {
         validate_new_job(idempotency_key, new)?;
         let spec = canonical_json(&new.spec);
@@ -162,6 +184,7 @@ impl Store {
             );
             let id: String = row.try_get("job_id")?;
             transaction.commit().await?;
+            self.changed.notify_waiters();
             return Ok(SubmitResult {
                 job: self.get_job_by_text(&id).await?,
                 created: false,
@@ -189,6 +212,59 @@ impl Store {
         .bind(deadline)
         .execute(&mut *transaction)
         .await?;
+        if let Some(link) = link {
+            let change = link.change;
+            let row = sqlx::query("SELECT c.revision, c.workflow_job_id, j.state AS workflow_state, j.cancel_requested FROM changes c LEFT JOIN jobs j ON j.id = c.workflow_job_id WHERE c.id = ? AND c.creator = ?")
+                .bind(change.plan.change_id.as_str()).bind(&new.principal)
+                .fetch_optional(&mut *transaction).await?.ok_or_else(|| eyre!("change not found"))?;
+            ensure!(
+                to_u64(row.try_get("revision")?, "change revision")? == change.revision,
+                "change revision changed"
+            );
+            let owner: Option<String> = row.try_get("workflow_job_id")?;
+            let owner_state: Option<String> = row.try_get("workflow_state")?;
+            if let Some(workflow) = link.workflow {
+                ensure!(
+                    owner.as_deref() == Some(workflow.as_str()),
+                    "workflow ownership changed"
+                );
+                ensure!(
+                    owner_state.as_deref() == Some("running")
+                        && row.try_get::<i64, _>("cancel_requested")? == 0,
+                    "workflow is not running"
+                );
+            } else if let Some(state) = owner_state {
+                let state = JobState::from_str(&state).map_err(|message| eyre!(message))?;
+                ensure!(
+                    state.is_terminal() && state != JobState::OutcomeUnknown,
+                    "change is owned by a deployment workflow"
+                );
+            }
+            ensure!(
+                change.state == link.next || change.state.can_transition_to(link.next),
+                "invalid change state transition"
+            );
+            let mut jobs = change.jobs.clone();
+            if let Some(action) = link.action {
+                use maxops_proto::DeploymentAction::*;
+                *match action {
+                    Build => &mut jobs.build,
+                    Activate => &mut jobs.activate,
+                    Verify => &mut jobs.verify,
+                    Rollback => &mut jobs.rollback,
+                    Prepare => &mut jobs.prepare,
+                } = Some(id.clone());
+            }
+            let owner = if link.action.is_none() {
+                Some(id.as_str())
+            } else {
+                owner.as_deref()
+            };
+            sqlx::query("UPDATE changes SET revision = revision + 1, state = ?, jobs_json = ?, workflow_job_id = ?, updated_at = ? WHERE id = ? AND creator = ? AND revision = ?")
+                .bind(link.next.as_str()).bind(serde_json::to_string(&jobs)?).bind(owner).bind(&at)
+                .bind(change.plan.change_id.as_str()).bind(&new.principal).bind(to_i64(change.revision, "change revision")?)
+                .execute(&mut *transaction).await?;
+        }
         sqlx::query(
             "INSERT INTO idempotency (principal, key, spec_hash, job_id, created_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -209,6 +285,7 @@ impl Store {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.changed.notify_waiters();
         Ok(SubmitResult {
             job: self.get_job(id).await?,
             created: true,
@@ -234,6 +311,7 @@ impl Store {
                 "job ID was already used with a different specification"
             );
             transaction.commit().await?;
+            self.changed.notify_waiters();
             return Ok(SubmitResult {
                 job: self.get_job(id).await?,
                 created: false,
@@ -268,6 +346,7 @@ impl Store {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.changed.notify_waiters();
         Ok(SubmitResult {
             job: self.get_job(id).await?,
             created: true,
@@ -348,6 +427,128 @@ impl Store {
                 .filter(|job| !terminal.contains(&job.handle.state))
                 .collect()
         })
+    }
+
+    pub async fn list_visible_jobs(
+        &self,
+        principal: &str,
+        hosts: &BTreeSet<String>,
+        params: &maxops_proto::JobsListParams,
+    ) -> Result<Vec<JobRecord>> {
+        ensure!(
+            (1..=200).contains(&params.limit),
+            "job list limit must be 1..200"
+        );
+        let cursor = match &params.cursor {
+            Some(id) => {
+                let job = self.get_owned_job(principal, id).await?;
+                ensure!(hosts.contains(&job.handle.host), "job not found");
+                Some((job.created_at.to_string(), id.as_str()))
+            }
+            None => None,
+        };
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM jobs WHERE principal = ");
+        query.push_bind(principal);
+        if hosts.is_empty() {
+            return Ok(vec![]);
+        }
+        query.push(" AND host IN (");
+        let mut names = query.separated(",");
+        for host in hosts {
+            names.push_bind(host);
+        }
+        names.push_unseparated(")");
+        if let Some(host) = &params.host {
+            query.push(" AND host = ").push_bind(host);
+        }
+        if !params.states.is_empty() {
+            query.push(" AND state IN (");
+            let mut states = query.separated(",");
+            for state in &params.states {
+                states.push_bind(state.as_str());
+            }
+            states.push_unseparated(")");
+        }
+        if let Some((at, id)) = cursor {
+            query
+                .push(" AND (created_at, id) < (")
+                .push_bind(at)
+                .push(",")
+                .push_bind(id)
+                .push(")");
+        }
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(i64::from(params.limit) + 1);
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_job)
+            .collect()
+    }
+
+    pub async fn list_visible_changes(
+        &self,
+        principal: &str,
+        hosts: &BTreeSet<String>,
+        deployments: &BTreeSet<String>,
+        params: &maxops_proto::ChangeHistoryParams,
+    ) -> Result<Vec<ChangeRecord>> {
+        ensure!(
+            (1..=200).contains(&params.limit),
+            "change list limit must be 1..200"
+        );
+        let cursor = match &params.cursor {
+            Some(id) => {
+                let change = self.get_owned_change(principal, id).await?;
+                ensure!(hosts.contains(&change.plan.target_host), "change not found");
+                Some((change.plan.created_at.to_string(), id.as_str()))
+            }
+            None => None,
+        };
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT * FROM changes WHERE creator = ");
+        query.push_bind(principal);
+        if hosts.is_empty() {
+            return Ok(vec![]);
+        }
+        query.push(" AND host IN (");
+        let mut names = query.separated(",");
+        for host in hosts {
+            names.push_bind(host);
+        }
+        names.push_unseparated(")");
+        if deployments.is_empty() {
+            return Ok(vec![]);
+        }
+        query.push(" AND json_extract(intent_json, '$.deployment_profile') IN (");
+        let mut profiles = query.separated(",");
+        for deployment in deployments {
+            profiles.push_bind(deployment);
+        }
+        profiles.push_unseparated(")");
+        if let Some(host) = &params.host {
+            query.push(" AND host = ").push_bind(host);
+        }
+        if let Some((at, id)) = cursor {
+            query
+                .push(" AND (created_at, id) < (")
+                .push_bind(at)
+                .push(",")
+                .push_bind(id)
+                .push(")");
+        }
+        query
+            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(i64::from(params.limit) + 1);
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_change)
+            .collect()
     }
 
     /// Acquire one target-local resource for a job. A lock owned by the same
@@ -829,6 +1030,7 @@ impl Store {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.changed.notify_waiters();
         self.get_job(id).await
     }
 
@@ -882,16 +1084,32 @@ impl Store {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.changed.notify_waiters();
         self.get_job(id).await
     }
 
+    pub fn job_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+
     pub async fn job_events(&self, id: &JobId, after_sequence: u64) -> Result<Vec<JobEvent>> {
+        self.job_events_page(id, after_sequence, 200).await
+    }
+
+    pub async fn job_events_page(
+        &self,
+        id: &JobId,
+        after_sequence: u64,
+        limit: u16,
+    ) -> Result<Vec<JobEvent>> {
+        ensure!((1..=200).contains(&limit), "event limit must be 1..200");
         let rows = sqlx::query(
             "SELECT sequence, kind, state, occurred_at, payload_json
-             FROM job_events WHERE job_id = ? AND sequence > ? ORDER BY sequence",
+             FROM job_events WHERE job_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
         )
         .bind(id.as_str())
         .bind(to_i64(after_sequence, "event sequence")?)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

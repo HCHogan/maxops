@@ -587,6 +587,17 @@ fn executor_error_code(message: &str) -> &'static str {
 
 async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorResponse> {
     match request {
+        ExecutorRequest::ExecutionProfiles => Ok(ExecutorResponse::ExecutionProfiles(
+            app.config
+                .profiles
+                .iter()
+                .map(|(name, profile)| maxops_proto::ExecutionProfileInfo {
+                    name: name.clone(),
+                    max_timeout_seconds: profile.timeout_seconds,
+                    output_limit_bytes: profile.output_limit_bytes,
+                })
+                .collect(),
+        )),
         ExecutorRequest::Submit { job_id, job } => submit_job(app, job_id, job).await,
         ExecutorRequest::Status(params) => {
             let job = app.store.get_job(&params.job_id).await?;
