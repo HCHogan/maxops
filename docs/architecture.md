@@ -74,7 +74,8 @@ been loaded is explicitly unknown. `units.list` pages this snapshot with state/p
 `units.status` separately reads Service D-Bus properties for PID, memory,
 restart count and last main-process exit code/status. Unsupported memory
 accounting remains null, not zero. Non-service units return common loaded state without requesting Service-specific
-properties. This is not a list of every installed unit. Old agent snapshots default
+properties. Agent responses negotiate gzip; the shared client bounds the decoded body,
+so transport compression does not bypass the response-size limit. This is not a list of every installed unit. Old agent snapshots default
 to allowlist coverage; Hub policy can narrow but cannot claim broader observation
 than the Agent reported.
 

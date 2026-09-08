@@ -225,6 +225,10 @@ for broad observation; defaults remain explicit allowlists. Unloaded units are
 separate exact `.service` list. `units.list` is paged and carries `unit_scope`;
 all-loaded coverage is not a list of every installed unit file.
 
+Agent responses negotiate gzip with the shared HTTP client so broad systemd
+snapshots remain practical over slower fleet links. The response limit applies
+to decoded bytes; clients without gzip support continue receiving plain JSON.
+
 Use `events.recent` for bounded, newest-first incident history with host/unit and
 time filters. `events.list` remains an oldest-first durable replay API. Summary
 views omit event payloads; `events.get` reads their evidence in bounded JSON

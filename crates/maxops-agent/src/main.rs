@@ -153,6 +153,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
             post(manage).layer(DefaultBodyLimit::max(maxops_proto::transport::MAX_BODY)),
         )
         .layer(DefaultBodyLimit::max(128 * 1024))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "agent listening");
@@ -520,6 +521,66 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn negotiated_gzip_keeps_large_observations_small_and_decodes_with_shared_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let value = serde_json::json!({"units": vec![serde_json::json!({
+            "unit":"example.service", "active_state":"active", "load_state":"loaded"
+        }); 500]});
+        let served = value.clone();
+        let router = Router::new()
+            .route("/", get(move || async move { Json(served.clone()) }))
+            .layer(tower_http::compression::CompressionLayer::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut connection = tokio::net::TcpStream::connect(address).await.unwrap();
+        connection.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut wire = Vec::new();
+        connection.read_to_end(&mut wire).await.unwrap();
+        assert!(
+            wire.windows(b"content-encoding: gzip".len())
+                .any(|part| part == b"content-encoding: gzip")
+        );
+        assert!(wire.len() < value.to_string().len() / 5);
+        let decoded: serde_json::Value = transport::read_json(
+            transport::client()
+                .unwrap()
+                .get(format!("http://{address}/")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded, value);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compressed_responses_still_enforce_the_decoded_body_limit() {
+        let router = Router::new()
+            .route(
+                "/",
+                get(|| async { Json(serde_json::json!({"text":"x".repeat(transport::MAX_BODY)})) }),
+            )
+            .layer(tower_http::compression::CompressionLayer::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = transport::read_json::<serde_json::Value>(
+            transport::client()
+                .unwrap()
+                .get(format!("http://{address}/")),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("upstream response too large")
+        );
+        server.abort();
+    }
+
     #[test]
     fn broad_observation_is_explicit_and_keeps_exact_management_scope() {
         let mut config: Config = serde_json::from_value(serde_json::json!({"host":"test", "listen":"127.0.0.1:9720", "token_file":"/runtime/token", "readable_units":["demo.service"]})).unwrap();
