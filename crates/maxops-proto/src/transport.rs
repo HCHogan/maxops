@@ -50,6 +50,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (code, retry) = match self.1 {
             "unsupported operation" => ("unsupported_operation", "refresh_catalog"),
+            "capability not permitted" => ("capability_not_permitted", "never"),
+            "host not permitted" | "job targets another host" => ("host_not_permitted", "never"),
+            "unit not permitted" | "service not permitted" => ("unit_not_readable", "never"),
+            "unit is not manageable" | "service is not manageable" => {
+                ("unit_not_manageable", "never")
+            }
+            "logs not permitted" => ("logs_not_permitted", "never"),
+            "repository not permitted" => ("repository_not_permitted", "never"),
+            "deployment not permitted" => ("deployment_not_permitted", "never"),
+            "execution profiles require a host" => ("execution_profile_host_required", "never"),
+            "invalid observation unit name" => ("invalid_unit_name", "never"),
             "idempotency key conflicts with another request" => ("idempotency_conflict", "never"),
             "job revision changed" | "change revision changed" => ("revision_conflict", "refresh"),
             "deployment baseline changed" | "deployment plan expired" => {

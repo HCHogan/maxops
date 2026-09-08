@@ -1405,6 +1405,56 @@ impl Store {
         })
     }
 
+    pub async fn recent_events(
+        &self,
+        allowed_hosts: &BTreeSet<String>,
+        params: &maxops_proto::RecentEventsParams,
+    ) -> Result<Vec<EventRecord>> {
+        params.validate().map_err(|message| eyre!(message))?;
+        ensure!(!allowed_hosts.is_empty(), "event host scope is empty");
+        if let Some(host) = &params.host {
+            ensure!(allowed_hosts.contains(host), "host not permitted");
+        }
+        let hosts: Vec<_> = allowed_hosts
+            .iter()
+            .filter(|host| params.host.as_ref().is_none_or(|wanted| *host == wanted))
+            .collect();
+        let since = maxops_proto::now().checked_sub(std::time::Duration::from_secs(u64::from(
+            params.since_seconds,
+        )))?;
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT sequence, id, source, fingerprint, episode_id, kind, host, occurred_at, received_at, related_job_id, related_change_id, payload_json FROM fleet_events WHERE host IN (",
+        );
+        {
+            let mut separated = query.separated(", ");
+            for host in hosts {
+                separated.push_bind(host);
+            }
+        }
+        query
+            .push(") AND julianday(occurred_at) >= julianday(")
+            .push_bind(since.to_string())
+            .push(")");
+        if let Some(sequence) = params.before_sequence {
+            query
+                .push(" AND sequence < ")
+                .push_bind(to_i64(sequence, "event sequence")?);
+        }
+        if let Some(unit) = &params.unit {
+            query.push(" AND COALESCE(json_extract(payload_json, '$.labels.unit'), json_extract(payload_json, '$.labels.name'), json_extract(payload_json, '$.unit')) = ").push_bind(unit);
+        }
+        query
+            .push(" ORDER BY sequence DESC LIMIT ")
+            .push_bind(i64::from(params.limit));
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_event)
+            .collect()
+    }
+
     pub async fn prune_events_through(&self, sequence: u64) -> Result<u64> {
         let _writer = self.writer.lock().await;
         let result = sqlx::query("DELETE FROM fleet_events WHERE sequence <= ?")
@@ -2502,6 +2552,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("event cursor expired"));
+    }
+
+    #[tokio::test]
+    async fn recent_event_pages_filter_time_host_and_unit_before_limiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("recent.db"))
+            .await
+            .unwrap();
+        for (fingerprint, host, unit, age) in [
+            ("old", "host-a", "health.service", 7200),
+            ("first", "host-a", "health.service", 5),
+            ("private", "host-b", "health.service", 0),
+            ("other", "host-a", "other.service", 0),
+            ("last", "host-a", "health.service", 0),
+        ] {
+            store
+                .ingest_alert(AlertEventInput {
+                    source: "test".into(),
+                    fingerprint: fingerprint.into(),
+                    host: host.into(),
+                    firing: true,
+                    occurred_at: maxops_proto::now()
+                        .checked_sub(Duration::from_secs(age))
+                        .unwrap(),
+                    payload: json!({"labels":{"name":unit}}),
+                })
+                .await
+                .unwrap();
+        }
+        let hosts = BTreeSet::from(["host-a".to_owned()]);
+        let mut params: maxops_proto::RecentEventsParams =
+            serde_json::from_value(json!({"unit":"health.service", "limit":1})).unwrap();
+        let page = store.recent_events(&hosts, &params).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].fingerprint, "last");
+        params.before_sequence = Some(page[0].sequence);
+        let older = store.recent_events(&hosts, &params).await.unwrap();
+        assert_eq!(older[0].fingerprint, "first");
+        params.before_sequence = Some(older[0].sequence);
+        assert!(
+            store
+                .recent_events(&hosts, &params)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        params.host = Some("host-b".into());
+        assert!(store.recent_events(&hosts, &params).await.is_err());
     }
 
     #[tokio::test]

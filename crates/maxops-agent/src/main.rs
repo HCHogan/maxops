@@ -9,7 +9,7 @@ use maxops_proto::{
     ExecutorRequest, ExecutorResponse, Facts, LogEntry, LogParams, Snapshot, UnitActionParams,
     UnitDetails, UnitObservation, UnitParams, UnitStatus, now,
     transport::{self, ApiError, ApiResult, Token},
-    valid_host, valid_unit,
+    valid_host, valid_observation_unit, valid_unit,
 };
 use serde::Deserialize;
 use std::{
@@ -39,6 +39,8 @@ struct Config {
     executor_socket: Option<PathBuf>,
     #[serde(default)]
     readable_units: BTreeSet<String>,
+    #[serde(default)]
+    read_all_units: bool,
     #[serde(default)]
     manageable_units: BTreeSet<String>,
     #[serde(default)]
@@ -105,14 +107,16 @@ async fn main() -> color_eyre::eyre::Result<()> {
     transport::validate_listen(config.listen)?;
     color_eyre::eyre::ensure!(valid_host(&config.host), "invalid host name");
     color_eyre::eyre::ensure!(
-        config.readable_units.iter().all(|u| valid_unit(u)),
-        "readable_units must contain exact service names"
+        config
+            .readable_units
+            .iter()
+            .all(|u| valid_observation_unit(u)),
+        "readable_units must contain exact systemd unit names"
     );
     color_eyre::eyre::ensure!(
-        config
-            .manageable_units
-            .iter()
-            .all(|unit| { valid_unit(unit) && config.readable_units.contains(unit) }),
+        config.manageable_units.iter().all(|unit| {
+            valid_unit(unit) && (config.read_all_units || config.readable_units.contains(unit))
+        }),
         "manageable_units must be valid readable service names"
     );
     let token = Token::read(&config.token_file)?;
@@ -234,31 +238,46 @@ fn authorize(app: &App, headers: &HeaderMap) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn unit_readable(config: &Config, unit: &str) -> bool {
+    valid_observation_unit(unit) && (config.read_all_units || config.readable_units.contains(unit))
+}
+
+fn listed_status(listed: &[ListedUnit], name: &str) -> UnitStatus {
+    match listed.iter().find(|unit| unit.0 == name) {
+        Some(unit) => UnitStatus {
+            unit: unit.0.clone(),
+            description: unit.1.clone(),
+            load_state: unit.2.clone(),
+            active_state: unit.3.clone(),
+            sub_state: unit.4.clone(),
+            details: None,
+        },
+        None => UnitStatus {
+            unit: name.into(),
+            description: String::new(),
+            load_state: "not-loaded".into(),
+            active_state: "unknown".into(),
+            sub_state: "unknown".into(),
+            details: None,
+        },
+    }
+}
+
 async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
     let manager = ManagerProxy::new(&app.bus).await?;
     let listed = manager.list_units().await?;
-    let units = app
-        .config
-        .readable_units
+    let mut names = app.config.readable_units.clone();
+    if app.config.read_all_units {
+        names.extend(
+            listed
+                .iter()
+                .filter(|u| valid_observation_unit(&u.0))
+                .map(|u| u.0.clone()),
+        );
+    }
+    let units = names
         .iter()
-        .map(|name| match listed.iter().find(|u| &u.0 == name) {
-            Some(u) => UnitStatus {
-                unit: u.0.clone(),
-                description: u.1.clone(),
-                load_state: u.2.clone(),
-                active_state: u.3.clone(),
-                sub_state: u.4.clone(),
-                details: None,
-            },
-            None => UnitStatus {
-                unit: name.clone(),
-                description: String::new(),
-                load_state: "not-loaded".into(),
-                active_state: "unknown".into(),
-                sub_state: "unknown".into(),
-                details: None,
-            },
-        })
+        .map(|name| listed_status(&listed, name))
         .collect();
     let uptime = std::fs::read_to_string("/proc/uptime")?;
     let uptime_seconds = uptime
@@ -298,6 +317,7 @@ async fn collect(app: &App) -> color_eyre::eyre::Result<Snapshot> {
             profile_matches_running,
         },
         units,
+        read_all_units: app.config.read_all_units,
     })
 }
 
@@ -316,11 +336,8 @@ async fn unit_status(
     Json(params): Json<UnitParams>,
 ) -> ApiResult<UnitObservation> {
     authorize(&app, &headers)?;
-    if params.host != app.config.host
-        || !valid_unit(&params.unit)
-        || !app.config.readable_units.contains(&params.unit)
-    {
-        return Err(ApiError(StatusCode::FORBIDDEN, "service not permitted"));
+    if params.host != app.config.host || !unit_readable(&app.config, &params.unit) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "unit not permitted"));
     }
     let _slot = app
         .slots
@@ -342,15 +359,11 @@ async fn unit_status(
 async fn collect_unit(app: &App, name: &str) -> color_eyre::eyre::Result<UnitStatus> {
     let listed = ManagerProxy::new(&app.bus).await?.list_units().await?;
     let Some(unit) = listed.iter().find(|unit| unit.0 == name) else {
-        return Ok(UnitStatus {
-            unit: name.into(),
-            description: String::new(),
-            load_state: "not-loaded".into(),
-            active_state: "unknown".into(),
-            sub_state: "unknown".into(),
-            details: None,
-        });
+        return Ok(listed_status(&listed, name));
     };
+    if !name.ends_with(".service") {
+        return Ok(listed_status(&listed, name));
+    }
     let proxy = zbus::fdo::PropertiesProxy::builder(&app.bus)
         .destination("org.freedesktop.systemd1")?
         .path(unit.6.clone())?
@@ -485,7 +498,7 @@ async fn logs(
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     if params.host != app.config.host
         || !app.config.allow_logs
-        || !app.config.readable_units.contains(&params.unit)
+        || !unit_readable(&app.config, &params.unit)
     {
         return Err(ApiError(StatusCode::FORBIDDEN, "logs not permitted"));
     }
@@ -507,6 +520,18 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn broad_observation_is_explicit_and_keeps_exact_management_scope() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({"host":"test", "listen":"127.0.0.1:9720", "token_file":"/runtime/token", "readable_units":["demo.service"]})).unwrap();
+        assert!(!unit_readable(&config, "health.service"));
+        config.read_all_units = true;
+        assert!(unit_readable(&config, "health.service"));
+        assert!(unit_readable(&config, "multi-user.target"));
+        assert!(!unit_readable(&config, "*.service"));
+        assert!(config.manageable_units.is_empty());
+        assert_eq!(listed_status(&[], "unloaded.timer").active_state, "unknown");
+    }
+
     #[test]
     fn journal_deadline_leaves_time_for_http_response() {
         assert!(JOURNAL_TIMEOUT + Duration::from_secs(2) <= transport::REQUEST_TIMEOUT);

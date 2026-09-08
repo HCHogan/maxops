@@ -561,6 +561,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                 "alpha".into(),
                 Host {
                     config: HostConfig {
+                        read_all_units: false,
                         name: "alpha".into(),
                         site: Some("test".into()),
                         agent_url: agent_url.into(),
@@ -579,6 +580,7 @@ fn app(agent_url: &str, capabilities: &[&str]) -> App {
                 "private".into(),
                 Host {
                     config: HostConfig {
+                        read_all_units: false,
                         name: "private".into(),
                         site: None,
                         agent_url: agent_url.into(),
@@ -918,6 +920,7 @@ async fn management_app(agent_url: &str, state_file: &std::path::Path) -> App {
             "alpha".into(),
             Host {
                 config: HostConfig {
+                    read_all_units: false,
                     name: "alpha".into(),
                     site: Some("test".into()),
                     agent_url: agent_url.into(),
@@ -1749,6 +1752,7 @@ async fn failed_units_filter_inventory_and_agent_output() {
     assert_eq!(result["hosts"].as_array().unwrap().len(), 1);
     assert_eq!(result["hosts"][0]["units"].as_array().unwrap().len(), 1);
     assert_eq!(result["hosts"][0]["units"][0]["unit"], "demo.service");
+    assert_eq!(result["hosts"][0]["unit_scope"]["coverage"], "allowlist");
     assert_eq!(
         call(
             router,
@@ -1761,6 +1765,129 @@ async fn failed_units_filter_inventory_and_agent_output() {
         StatusCode::FORBIDDEN
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn all_unit_observation_is_paged_and_does_not_grant_mutations() {
+    let (url, server) = stub(Router::new().route(
+        "/v1/snapshot",
+        get(|| async {
+            let mut value = snapshot("alpha");
+            value["read_all_units"] = json!(true);
+            Json(value)
+        }),
+    ))
+    .await;
+    let mut state = app(&url, &["units:read", "self:read"]);
+    let host = state.hosts.get_mut("alpha").unwrap();
+    host.config.read_all_units = true;
+    assert!(unit_allowed(host, "multi-user.target").is_ok());
+    assert!(unit_allowed(host, "worker@one.timer").is_ok());
+    assert!(unit_allowed(host, "../escape.service").is_err());
+    assert!(unit_manageable(host, "secret.service").is_err());
+    let router = router(Arc::new(state));
+    let (status, first) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"units.list","params":{"host":"alpha","limit":1}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["unit_scope"]["coverage"], "all_loaded");
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["units"].as_array().unwrap().len(), 1);
+    let (_, next) = call(router.clone(), "/v1/execute", Some(USER_TOKEN), json!({"op":"units.list","params":{"host":"alpha","limit":1,"cursor":first["next_cursor"]}})).await;
+    assert_eq!(next["units"][0]["unit"], "secret.service");
+    let (_, resources) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{"kind":"units","host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(resources["total"], 2);
+    assert_eq!(resources["resources"][1]["manageable"], false);
+    let (_, filtered) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"units.list","params":{"host":"alpha","prefix":"secret","state":"failed"}}),
+    )
+    .await;
+    assert_eq!(filtered["total"], 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn event_details_are_bounded_and_host_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    state.clients[0].capabilities.insert("events:read".into());
+    let mut ids = Vec::new();
+    for host in ["alpha", "private"] {
+        let event = state
+            .store
+            .as_ref()
+            .unwrap()
+            .ingest_alert(AlertEventInput {
+                source: "test".into(),
+                fingerprint: host.into(),
+                host: host.into(),
+                firing: true,
+                occurred_at: now(),
+                payload: json!({"evidence":"abcdefghijk"}),
+            })
+            .await
+            .unwrap();
+        ids.push(event.event_id);
+    }
+    let router = router(Arc::new(state));
+    let (status, fragment) = call(router.clone(), "/v1/execute?view=summary", Some(USER_TOKEN), json!({"op":"events.get","params":{"event_id":ids[0],"pointer":"/payload/evidence","limit":5}})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fragment["text"].as_str().unwrap().len(), 5);
+    assert_eq!(fragment["complete"], false);
+    assert_eq!(fragment["next_offset"], 5);
+    let (status, error) = call(
+        router,
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"events.get","params":{"event_id":ids[1]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["code"], "host_not_permitted");
+    assert!(!error.to_string().contains("abcdefghijk"));
+}
+
+#[tokio::test]
+async fn discovery_explains_host_requirement_and_summaries_bound_event_payloads() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    state.clients[0].capabilities.insert("self:read".into());
+    let (status, error) = call(
+        router(Arc::new(state)),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{"kind":"execution_profiles"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "execution_profile_host_required");
+    let operation = operations()
+        .into_iter()
+        .find(|operation| operation.name == "resources.list")
+        .unwrap();
+    assert_eq!(
+        operation.params_schema.to_value()["then"]["required"],
+        json!(["host"])
+    );
+    let query = serde_json::from_value(json!({"view":"summary"})).unwrap();
+    let compact = client_api::present(Query(query), "events.recent", json!({"events":[{"sequence":42,"payload":{"annotations":{"summary":"failure"},"labels":{"name":"health.service"},"large":"x".repeat(100_000)}}]})).unwrap();
+    assert!(compact.to_string().len() < 1000);
+    assert_eq!(compact["events"][0]["unit"], "health.service");
+    assert_eq!(compact["events"][0]["summary"], "failure");
+    assert!(compact["events"][0].get("payload").is_none());
 }
 
 #[tokio::test]

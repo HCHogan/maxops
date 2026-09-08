@@ -31,6 +31,23 @@ pub struct HostParams {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct UnitsListParams {
+    pub host: String,
+    /// Exact active state, for example failed or active. Omit to list all states.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Literal unit-name prefix, not a shell pattern.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default = "default_lines")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FailedParams {
     #[serde(default)]
     pub host: Option<String>,
@@ -96,8 +113,8 @@ impl LogParams {
         if !(1..=200).contains(&self.lines) || !(1..=86400).contains(&self.since_seconds) {
             return Err("logs require 1..200 lines and 1..86400 since_seconds");
         }
-        if !valid_unit(&self.unit) {
-            return Err("invalid service unit name");
+        if !valid_observation_unit(&self.unit) {
+            return Err("invalid observation unit name");
         }
         Ok(())
     }
@@ -173,11 +190,13 @@ operations! {
     HostFacts(HostParams) -> serde_json::Value, "host.facts", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Kernel, uptime and the running system closure";
     HostMetrics(HostParams) -> serde_json::Value, "host.metrics", "metrics:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
     DeployStatus(FailedParams) -> serde_json::Value, "deploy.status", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Running closure versus persistent system profile; unavailable hosts remain explicit";
-    UnitsList(HostParams) -> serde_json::Value, "units.list", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "All explicitly readable services, including unloaded services";
-    UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one explicitly readable service";
+    UnitsList(UnitsListParams) -> serde_json::Value, "units.list", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Page authorized loaded units and configured unloaded units; filter by state or literal prefix. Coverage is explicit; an empty list is not whole-host health";
+    UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one authorized systemd unit, including services, timers, targets and scopes";
     UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
     AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
-    EventsList(EventsListParams) -> EventsListResponse, "events.list", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Replay durable fleet events after a scoped cursor";
+    EventsGet(EventGetParams) -> serde_json::Value, "events.get", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Read bounded event evidence by event_id, JSON pointer and byte offset; use /payload for details omitted from summaries";
+    EventsRecent(RecentEventsParams) -> serde_json::Value, "events.recent", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Recent incident events, newest first, default last hour and 20 entries; filter by host/unit and use next_before_sequence for older pages";
+    EventsList(EventsListParams) -> EventsListResponse, "events.list", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Replay durable fleet events oldest first after a scoped cursor; use events.recent for incident diagnosis";
     SelfStatus(Empty) -> serde_json::Value, "self.status", "self:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Hub readiness, component state and bounded queue counters";
     ExecRun(ExecRunParams) -> JobHandle, "exec.run", "exec:run", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Run a bounded command using a configured target profile";
     UnitsStart(UnitActionParams) -> JobHandle, "units.start", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Start one explicitly manageable systemd service";
@@ -209,7 +228,7 @@ operations! {
     ResourcesList(ResourcesParams) -> serde_json::Value, "resources.list", "self:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Discover authorized hosts, units, repositories, deployments or target execution profiles in bounded pages";
     JobsWait(JobWaitParams) -> serde_json::Value, "jobs.wait", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Wait up to 10 seconds for a job revision or terminal outcome; no submission is replayed";
     JobsEvents(JobEventsParams) -> serde_json::Value, "jobs.events", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Replay durable events for an owned job after a sequence cursor";
-    JobsResult(JobResultParams) -> serde_json::Value, "jobs.result", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a bounded result fragment using a JSON pointer and UTF-8 byte offsets";
+    JobsResult(JobResultParams) -> serde_json::Value, "jobs.result", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read stored result JSON using a JSON pointer (empty selects root); command stdout/stderr are in jobs.logs, not /stdout";
     DeployRun(DeployRunParams) -> JobHandle, "deploy.run", "deploy:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Durably run a prepared change through build or verified activation; preserves revision and external-writer guards";
 }
 
@@ -220,6 +239,46 @@ pub fn valid_unit(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-.:@".contains(&b))
+}
+
+/// Exact systemd unit names for observation only. Mutations still use valid_unit.
+pub fn valid_observation_unit(name: &str) -> bool {
+    let Some((stem, kind)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if name.len() > 255
+        || stem.is_empty()
+        || !matches!(
+            kind,
+            "service"
+                | "timer"
+                | "socket"
+                | "target"
+                | "path"
+                | "mount"
+                | "automount"
+                | "swap"
+                | "slice"
+                | "scope"
+                | "device"
+        )
+    {
+        return false;
+    }
+    let mut bytes = stem.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            if bytes.next() != Some(b'x')
+                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !(byte.is_ascii_alphanumeric() || b"_-.:@".contains(&byte)) {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn valid_host(name: &str) -> bool {
@@ -237,6 +296,30 @@ pub fn now() -> jiff::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_unit_names_do_not_expand_mutation_names_or_allow_patterns() {
+        for name in [
+            "health.service",
+            "backup.timer",
+            "multi-user.target",
+            "docker-a.scope",
+            r"dev-disk\x2dlabel.device",
+        ] {
+            assert!(valid_observation_unit(name), "{name}");
+        }
+        for name in [
+            "*.service",
+            "../demo.service",
+            "a/b.service",
+            "demo.service;id",
+            r"bad\name.service",
+            ".service",
+        ] {
+            assert!(!valid_observation_unit(name), "{name}");
+        }
+        assert!(!valid_unit("multi-user.target"));
+    }
+
     #[test]
     fn requests_fail_closed() {
         for value in [
@@ -280,7 +363,7 @@ mod tests {
     #[test]
     fn registry_exposes_execution_metadata_without_changing_observation_names() {
         let operations = operations();
-        assert_eq!(operations.len(), 43);
+        assert_eq!(operations.len(), 45);
         assert!(operations.iter().take(9).all(|operation| {
             matches!(operation.kind, OperationKind::Observation)
                 && operation.read_only

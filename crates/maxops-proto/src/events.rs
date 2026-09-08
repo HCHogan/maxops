@@ -176,6 +176,47 @@ pub fn default_event_limit() -> u16 {
     100
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecentEventsParams {
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Exact systemd unit; matches unit/name labels or a diagnostic unit.
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default = "crate::default_since")]
+    #[schemars(range(min = 1, max = 604800))]
+    pub since_seconds: u32,
+    #[serde(default)]
+    pub before_sequence: Option<u64>,
+    #[serde(default = "default_recent_limit")]
+    #[schemars(range(min = 1, max = 50))]
+    pub limit: u16,
+}
+
+pub fn default_recent_limit() -> u16 {
+    20
+}
+
+impl RecentEventsParams {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=50).contains(&self.limit) || !(1..=604800).contains(&self.since_seconds) {
+            return Err("recent events require 1..50 entries and 1..604800 since_seconds");
+        }
+        if self.host.as_ref().is_some_and(|host| !valid_host(host)) {
+            return Err("invalid host");
+        }
+        if self
+            .unit
+            .as_ref()
+            .is_some_and(|unit| !crate::valid_observation_unit(unit))
+        {
+            return Err("invalid observation unit name");
+        }
+        Ok(())
+    }
+}
+
 impl EventsListParams {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !(1..=200).contains(&self.limit) {

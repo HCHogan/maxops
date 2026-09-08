@@ -109,3 +109,23 @@ Inventory, grants and deployment profiles remain in the consuming Nix repository
   transitions; external changes or competing callers cannot be overwritten.
 - Rust format/clippy/nextest, affected module evaluations and HTTP integration
   tests pass. Production deployment is separate from local validation.
+
+## Broad observation and incident queries
+
+Agent and Hub `readAllUnits` is opt-in, independent of `manageableUnits`.
+`units.list` returns bounded pages with `unit_scope`, `state` and literal `prefix`
+filters. `all_loaded` coverage excludes unobserved installed unit files; an empty
+allowlist result is not whole-host health. `resources.list(kind=units)` discovers
+loaded names under broad policy and preserves explicit readable/manageable flags.
+`kind=execution_profiles` requires a nonempty `host`; the tools schema encodes it.
+
+`events.recent` defaults to the last hour, newest first, with 20 entries (maximum
+50), optional exact host/unit filters and `before_sequence` pagination.
+`events.list` retains oldest-first replay. `view=summary` removes event payloads
+and includes a bounded summary, unit and event ID. `events.get` exposes scoped
+JSON fragments with the same pointer/offset bounds as `jobs.result`.
+
+Fixed error codes distinguish `host_not_permitted`, `capability_not_permitted`,
+`unit_not_readable`, `unit_not_manageable`, `logs_not_permitted` and
+`execution_profile_host_required`. These are non-retryable without correcting
+the input or policy; no arbitrary upstream error text needs to be reflected.

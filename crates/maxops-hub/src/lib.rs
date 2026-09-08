@@ -18,7 +18,7 @@ use maxops_proto::{
     RuntimeStateResponse, Snapshot, SourceBaseline, UnitActionParams, WorkspaceStatusParams,
     WorkspaceTargetRequest, WorkspaceTargetResponse, now, operations,
     transport::{self, ApiError, ApiResult, Token},
-    valid_host, valid_unit,
+    valid_host, valid_observation_unit, valid_unit,
 };
 use maxops_store::{
     AlertEventInput, ChangeTransition, NewFleetEvent, RemediationCompletion, Store,
@@ -105,6 +105,8 @@ struct HostConfig {
     execution_token_file: Option<PathBuf>,
     #[serde(default)]
     readable_units: BTreeSet<String>,
+    #[serde(default)]
+    read_all_units: bool,
     #[serde(default)]
     manageable_units: BTreeSet<String>,
     #[serde(default)]
@@ -263,13 +265,14 @@ pub async fn build(config: Config) -> color_eyre::eyre::Result<(SocketAddr, Rout
     for host in config.hosts {
         color_eyre::eyre::ensure!(valid_host(&host.name), "invalid inventory host name");
         color_eyre::eyre::ensure!(
-            host.readable_units.iter().all(|u| valid_unit(u)),
+            host.readable_units
+                .iter()
+                .all(|u| valid_observation_unit(u)),
             "invalid readable service name"
         );
         color_eyre::eyre::ensure!(
-            host.manageable_units
-                .iter()
-                .all(|unit| valid_unit(unit) && host.readable_units.contains(unit)),
+            host.manageable_units.iter().all(|unit| valid_unit(unit)
+                && (host.read_all_units || host.readable_units.contains(unit))),
             "manageable services must be valid readable service names"
         );
         color_eyre::eyre::ensure!(
@@ -889,7 +892,13 @@ async fn runtime_state(
 }
 
 fn unit_allowed(host: &Host, unit: &str) -> Result<(), ApiError> {
-    if !host.config.readable_units.contains(unit) {
+    if !valid_observation_unit(unit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid observation unit name",
+        ));
+    }
+    if !host.config.read_all_units && !host.config.readable_units.contains(unit) {
         return Err(ApiError(StatusCode::FORBIDDEN, "unit not permitted"));
     }
     Ok(())
@@ -917,6 +926,11 @@ async fn catalog(
     Ok(Json(client_api::catalog_value(principal, query)?))
 }
 
+fn unit_scope(snapshot: &Snapshot) -> Value {
+    json!({"coverage": if snapshot.read_all_units {"all_loaded"} else {"allowlist"},
+        "observed_count": snapshot.units.len(), "includes_all_installed": false})
+}
+
 async fn observe(app: &App, host: &Host) -> color_eyre::eyre::Result<Snapshot> {
     let request = host.token.apply(app.client.get(format!(
         "{}/v1/snapshot",
@@ -929,9 +943,11 @@ async fn observe(app: &App, host: &Host) -> color_eyre::eyre::Result<Snapshot> {
             && now().as_second() - snapshot.observed_at.as_second() <= 90,
         "agent observation is stale or clock is skewed"
     );
-    snapshot
-        .units
-        .retain(|unit| host.config.readable_units.contains(&unit.unit));
+    snapshot.units.retain(|unit| {
+        valid_observation_unit(&unit.unit)
+            && (host.config.read_all_units || host.config.readable_units.contains(&unit.unit))
+    });
+    snapshot.read_all_units &= host.config.read_all_units;
     app.agent_heartbeats
         .lock()
         .expect("agent heartbeat lock poisoned")
@@ -1060,7 +1076,7 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             let rows: Vec<_> = observations.into_iter().map(|(host, result)| {
                 let observation = match result {
                     Ok(snapshot) => json!({"state": "reachable", "observed_at": snapshot.observed_at,
-                        "failed_units": snapshot.units.iter().filter(|u| u.active_state == "failed").count()}),
+                        "unit_scope": unit_scope(&snapshot), "failed_units": snapshot.units.iter().filter(|u| u.active_state == "failed").count()}),
                     Err(_) => json!({"state": "unavailable", "observed_at": null, "failed_units": null}),
                 };
                 let exporter = samples.get(&host.config.name).cloned().unwrap_or(json!({"state": "unknown", "sample_at_unix_seconds": null}));
@@ -1089,7 +1105,7 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             };
             let rows: Vec<_> = snapshots(app, hosts).await.into_iter().map(|(host, result)| match result {
                 Ok(snapshot) => json!({"host": host.config.name, "observed_at": snapshot.observed_at,
-                    "state": "available", "units": snapshot.units.into_iter().filter(|u| u.active_state == "failed").collect::<Vec<_>>()}),
+                    "state": "available", "unit_scope": unit_scope(&snapshot), "units": snapshot.units.into_iter().filter(|u| u.active_state == "failed").collect::<Vec<_>>()}),
                 Err(_) => json!({"host": host.config.name, "observed_at": null, "state": "unavailable", "units": null}),
             }).collect();
             Ok(json!({"observed_at": now(), "hosts": rows}))
@@ -1127,9 +1143,29 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         Request::UnitsList(params) => {
             let host = host_for(app, principal, &params.host)?;
             let snapshot = observe(app, host).await.map_err(|_| upstream_error())?;
-            Ok(
-                json!({"host": snapshot.host, "observed_at": snapshot.observed_at, "units": snapshot.units}),
-            )
+            let scope = unit_scope(&snapshot);
+            let mut units = snapshot.units;
+            units.retain(|unit| {
+                params
+                    .state
+                    .as_ref()
+                    .is_none_or(|state| state == &unit.active_state)
+                    && params
+                        .prefix
+                        .as_ref()
+                        .is_none_or(|prefix| unit.unit.starts_with(prefix))
+            });
+            units.sort_by(|a, b| a.unit.cmp(&b.unit));
+            let values = units
+                .into_iter()
+                .map(|unit| serde_json::to_value(unit).expect("unit JSON"))
+                .collect();
+            let mut result =
+                client_api::page(values, params.limit, params.cursor.as_deref(), "units")?;
+            result["host"] = json!(snapshot.host);
+            result["observed_at"] = json!(snapshot.observed_at);
+            result["unit_scope"] = scope;
+            Ok(result)
         }
         Request::UnitsStatus(params) => {
             let host = host_for(app, principal, &params.host)?;
@@ -1192,6 +1228,36 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
                 json!({"observed_at": now(), "alerts": alerts.into_iter().filter(|alert| {
                 alert["labels"]["instance"].as_str().is_some_and(|name| principal.hosts.contains(name))
             }).collect::<Vec<_>>()}),
+            )
+        }
+        Request::EventsGet(params) => {
+            let event = durable_store(app)?
+                .get_event(&params.event_id)
+                .await
+                .map_err(map_store_error)?;
+            host_for(app, principal, &event.host)?;
+            let value = serde_json::to_value(event).expect("stored event JSON");
+            let mut fragment =
+                client_api::json_fragment(&value, &params.pointer, params.offset, params.limit)?;
+            fragment["event_id"] = json!(params.event_id);
+            Ok(fragment)
+        }
+        Request::EventsRecent(params) => {
+            params
+                .validate()
+                .map_err(|message| ApiError(StatusCode::BAD_REQUEST, message))?;
+            if let Some(host) = &params.host {
+                host_for(app, principal, host)?;
+            }
+            let events = durable_store(app)?
+                .recent_events(&principal.hosts, &params)
+                .await
+                .map_err(map_store_error)?;
+            let next = (events.len() == usize::from(params.limit))
+                .then(|| events.last().map(|event| event.sequence))
+                .flatten();
+            Ok(
+                json!({"events": events, "order": "newest_first", "since_seconds": params.since_seconds, "next_before_sequence": next}),
             )
         }
         Request::EventsList(params) => {

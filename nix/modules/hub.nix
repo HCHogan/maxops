@@ -16,6 +16,7 @@ let
     execution_token_file =
       if host.executionTokenFile == null then null else "${credentialDir}/execution-${toString i}";
     readable_units = host.readableUnits;
+    read_all_units = host.readAllUnits;
     manageable_units = host.manageableUnits;
     diagnostic_profile = host.diagnosticProfile;
     diagnostic_probes = host.diagnosticProbes;
@@ -144,6 +145,11 @@ in
               type = lib.types.nullOr lib.types.str;
               default = null;
               description = "Optional dedicated credential for the agent management endpoint.";
+            };
+            readAllUnits = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Observe every loaded systemd unit and read any exact unit's status/logs; grants no service mutations.";
             };
             readableUnits = lib.mkOption {
               type = lib.types.listOf lib.types.str;
@@ -377,7 +383,8 @@ in
       }
       {
         assertion = lib.all (
-          host: lib.all (unit: builtins.elem unit host.readableUnits) host.manageableUnits
+          host:
+          host.readAllUnits || lib.all (unit: builtins.elem unit host.readableUnits) host.manageableUnits
         ) cfg.hosts;
         message = "maxops-hub manageableUnits must be a subset of readableUnits.";
       }

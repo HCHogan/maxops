@@ -54,6 +54,10 @@ pub struct Snapshot {
     pub observed_at: jiff::Timestamp,
     pub facts: Facts,
     pub units: Vec<UnitStatus>,
+    /// False for older agents and explicit allowlists. True covers loaded units,
+    /// not every installed unit file.
+    #[serde(default)]
+    pub read_all_units: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]

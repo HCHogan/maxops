@@ -12,12 +12,10 @@ let
     listen = "${cfg.listenAddress}:${toString cfg.port}";
     token_file = "/run/credentials/maxops-agent.service/token";
     execution_token_file =
-      if cfg.execution.enable then
-        "/run/credentials/maxops-agent.service/execution-token"
-      else
-        null;
+      if cfg.execution.enable then "/run/credentials/maxops-agent.service/execution-token" else null;
     executor_socket = if cfg.execution.enable then cfg.execution.socketPath else null;
     readable_units = cfg.readableUnits;
+    read_all_units = cfg.readAllUnits;
     manageable_units = cfg.manageableUnits;
     allow_logs = cfg.allowLogs;
     journalctl = "${pkgs.systemd}/bin/journalctl";
@@ -49,6 +47,11 @@ in
     tokenFile = lib.mkOption {
       type = lib.types.str;
       description = "Absolute runtime path to the agent token. Never put token contents in the Nix store.";
+    };
+    readAllUnits = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Observe every loaded systemd unit and read any exact unit's status/logs; grants no service mutations.";
     };
     readableUnits = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -105,7 +108,8 @@ in
         message = "maxops-agent.execution.tokenFile must be a runtime path outside the Nix store.";
       }
       {
-        assertion = lib.all (unit: builtins.elem unit cfg.readableUnits) cfg.manageableUnits;
+        assertion =
+          cfg.readAllUnits || lib.all (unit: builtins.elem unit cfg.readableUnits) cfg.manageableUnits;
         message = "maxops-agent manageableUnits must be a subset of readableUnits.";
       }
     ];
@@ -116,18 +120,19 @@ in
       after = [
         "network-online.target"
         "tailscaled.service"
-      ] ++ lib.optional cfg.execution.enable "maxops-executor.service";
+      ]
+      ++ lib.optional cfg.execution.enable "maxops-executor.service";
       wants = [ "network-online.target" ] ++ lib.optional cfg.execution.enable "maxops-executor.service";
       environment.RUST_LOG = "info";
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/maxops-agent --config ${configFile}";
         DynamicUser = true;
-        LoadCredential =
-          [ "token:${cfg.tokenFile}" ]
-          ++ lib.optional cfg.execution.enable "execution-token:${cfg.execution.tokenFile}";
+        LoadCredential = [
+          "token:${cfg.tokenFile}"
+        ]
+        ++ lib.optional cfg.execution.enable "execution-token:${cfg.execution.tokenFile}";
         SupplementaryGroups =
-          lib.optional cfg.allowLogs "systemd-journal"
-          ++ lib.optional cfg.execution.enable "maxops-executor";
+          lib.optional cfg.allowLogs "systemd-journal" ++ lib.optional cfg.execution.enable "maxops-executor";
         Restart = "on-failure";
         RestartSec = "10s";
         TimeoutStopSec = "15s";

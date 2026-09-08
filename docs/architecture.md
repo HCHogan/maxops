@@ -34,8 +34,10 @@ credentials, unknown hosts and unknown capabilities. Alert ingress requires a
 separate token. Tokens are not accepted in query strings or request parameters.
 They are compared in constant time for equal-length inputs and are never logged.
 
-Service names are canonical `.service` names with a deliberately restricted
-ASCII syntax. Both the hub and agent validate service scope. New capabilities
+Observation uses exact systemd unit names with a restricted ASCII syntax and
+canonical hexadecimal escapes. Hub and Agent independently enforce an explicit
+list or opt-in `read_all_units` policy. Typed mutations still require exact
+`.service` names in independent manageable lists. New capabilities
 are opt-in; there is no `*` grant. Logs need `logs:read` and agent `allowLogs`.
 The service uses a dynamic unprivileged user with no capabilities or privilege
 escalation. Journal membership remains a broader process-level read privilege
@@ -68,10 +70,13 @@ query evaluation timestamp. Samples older than 90 seconds or more than 30
 seconds ahead are stale. The same tolerance applies to agent observations.
 
 Unit status uses systemd's loaded-unit list. An allowlisted unit that has not
-been loaded is explicitly unknown. `units.list` uses this bounded snapshot.
+been loaded is explicitly unknown. `units.list` pages this snapshot with state/prefix filters and explicit coverage.
 `units.status` separately reads Service D-Bus properties for PID, memory,
 restart count and last main-process exit code/status. Unsupported memory
-accounting remains null, not zero. This is not a list of every installed unit.
+accounting remains null, not zero. Non-service units return common loaded state without requesting Service-specific
+properties. This is not a list of every installed unit. Old agent snapshots default
+to allowlist coverage; Hub policy can narrow but cannot claim broader observation
+than the Agent reported.
 
 `host.metrics` uses fixed host-scoped expressions, including separate raw
 source timestamp queries for the counters underlying five-minute rates.

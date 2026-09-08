@@ -217,9 +217,18 @@ both text and structured JSON. The adapter follows the
 [stdio transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
 and [tools protocol](https://modelcontextprotocol.io/specification/2025-06-18/server/tools).
 
-Service names must be explicit canonical `.service` names. Patterns, paths and
-shell expressions are rejected. Status covers the intersection of hub and agent
-allowlists; unloaded units are `unknown`/`not-loaded`, not automatically healthy.
+Observation accepts exact canonical systemd unit names, including `.service`,
+`.timer`, `.target`, `.socket` and `.scope`. Patterns, paths and shell expressions
+are rejected. Set native `readAllUnits = true` on both Agent and Hub host entries
+for broad observation; defaults remain explicit allowlists. Unloaded units are
+`unknown`/`not-loaded`, not automatically healthy. `manageableUnits` stays a
+separate exact `.service` list. `units.list` is paged and carries `unit_scope`;
+all-loaded coverage is not a list of every installed unit file.
+
+Use `events.recent` for bounded, newest-first incident history with host/unit and
+time filters. `events.list` remains an oldest-first durable replay API. Summary
+views omit event payloads; `events.get` reads their evidence in bounded JSON
+fragments. Discovery requires `host` for `kind=execution_profiles`.
 
 HTTP endpoints:
 

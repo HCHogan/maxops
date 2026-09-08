@@ -66,7 +66,7 @@ pub(super) fn catalog_value(principal: &Principal, query: CatalogQuery) -> Resul
 
 // Cursor binds the complete authorized, filtered representation. It cannot be
 // moved between principals with different scope, filters, or catalog versions.
-fn page(
+pub(super) fn page(
     values: Vec<Value>,
     limit: u16,
     cursor: Option<&str>,
@@ -127,19 +127,32 @@ pub(super) async fn resources(
     match params.kind {
         DiscoveryResourceKind::Hosts => {
             for host in hosts {
-                entries.push(json!({"host": host.config.name, "site": host.config.site}));
+                entries.push(json!({"host": host.config.name, "site": host.config.site, "read_all_units": host.config.read_all_units}));
             }
         }
         DiscoveryResourceKind::Units => {
             for host in hosts {
                 let readable = principal.capabilities.contains("units:read");
                 let manageable = principal.capabilities.contains("units:manage");
-                for unit in host
+                let mut names = host
                     .config
                     .readable_units
                     .union(&host.config.manageable_units)
-                {
-                    let read = readable && host.config.readable_units.contains(unit);
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if readable && host.config.read_all_units {
+                    let snapshot = observe(app, host).await.map_err(|_| {
+                        ApiError(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unit discovery unavailable",
+                        )
+                    })?;
+                    names.extend(snapshot.units.into_iter().map(|unit| unit.unit));
+                }
+                for unit in &names {
+                    let read = readable
+                        && (host.config.read_all_units
+                            || host.config.readable_units.contains(unit));
                     let manage = manageable && host.config.manageable_units.contains(unit);
                     if read || manage {
                         entries.push(json!({"host": host.config.name, "unit": unit, "readable": read, "manageable": manage}));
@@ -294,15 +307,29 @@ pub(super) async fn result(
     let Some(value) = &job.result else {
         return Ok(json!({"available": false, "handle": job.handle}));
     };
+    let mut fragment = json_fragment(value, &params.pointer, params.offset, params.limit)?;
+    fragment["job_id"] = json!(params.job_id);
+    Ok(fragment)
+}
+
+pub(super) fn json_fragment(
+    value: &Value,
+    pointer: &str,
+    offset: u64,
+    limit: u32,
+) -> Result<Value, ApiError> {
+    if !(1..=32768).contains(&limit) || pointer.len() > 1024 {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid result bounds"));
+    }
     let selected = value
-        .pointer(&params.pointer)
+        .pointer(pointer)
         .ok_or(ApiError(StatusCode::NOT_FOUND, "result pointer not found"))?;
     let text = serde_json::to_string(selected).expect("stored JSON");
-    let start = usize::try_from(params.offset)
+    let start = usize::try_from(offset)
         .ok()
         .filter(|offset| *offset <= text.len() && text.is_char_boundary(*offset))
         .ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid result offset"))?;
-    let mut end = (start + params.limit as usize).min(text.len());
+    let mut end = (start + limit as usize).min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -312,11 +339,9 @@ pub(super) async fn result(
             "result limit is smaller than a UTF-8 character",
         ));
     }
-    Ok(
-        json!({"available": true, "job_id": params.job_id, "pointer": params.pointer,
+    Ok(json!({"available": true, "pointer": pointer,
         "encoding": "json_utf8", "text": &text[start..end], "next_offset": end,
-        "total_bytes": text.len(), "complete": end == text.len()}),
-    )
+        "total_bytes": text.len(), "complete": end == text.len()}))
 }
 
 #[derive(Default, Deserialize)]
@@ -363,6 +388,31 @@ pub(super) fn present(
                         if let Ok(record) = serde_json::from_value::<JobRecord>(job.clone()) {
                             *job = job_summary(&record);
                         }
+                    }
+                }
+            }
+            "events.list" | "events.recent" => {
+                if let Some(events) = value.get_mut("events").and_then(Value::as_array_mut) {
+                    for event in events {
+                        let payload = event
+                            .as_object_mut()
+                            .and_then(|fields| fields.remove("payload"))
+                            .unwrap_or(Value::Null);
+                        event["summary"] = json!(
+                            payload["annotations"]["summary"]
+                                .as_str()
+                                .or_else(|| payload["summary"].as_str())
+                                .unwrap_or("")
+                                .chars()
+                                .take(500)
+                                .collect::<String>()
+                        );
+                        event["unit"] = payload["labels"]["unit"]
+                            .as_str()
+                            .or_else(|| payload["labels"]["name"].as_str())
+                            .or_else(|| payload["unit"].as_str())
+                            .map_or(Value::Null, |unit| json!(unit));
+                        event["payload_available"] = json!(!payload.is_null());
                     }
                 }
             }

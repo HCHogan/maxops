@@ -1,6 +1,6 @@
 //! Bounded, transport-independent contracts for clients. Full records remain
 //! available for audit; discovery and waiting never require response schemas.
-use crate::{ChangeId, JobId};
+use crate::{ChangeId, EventId, JobId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -17,9 +17,11 @@ pub enum DiscoveryResourceKind {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = execution_profiles_require_host)]
 pub struct ResourcesParams {
     #[serde(default)]
     pub kind: DiscoveryResourceKind,
+    /// Required when kind is execution_profiles; optional for other kinds.
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -27,6 +29,25 @@ pub struct ResourcesParams {
     #[serde(default = "crate::default_job_limit")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: u16,
+}
+
+fn execution_profiles_require_host(schema: &mut schemars::Schema) {
+    schema.insert("if".into(), serde_json::json!({"properties":{"kind":{"const":"execution_profiles"}},"required":["kind"]}));
+    schema.insert("then".into(), serde_json::json!({"required":["host"],"properties":{"host":{"type":"string","minLength":1}}}));
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EventGetParams {
+    pub event_id: EventId,
+    /// RFC 6901 pointer; empty selects the event, /payload selects its evidence.
+    #[serde(default)]
+    pub pointer: String,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "default_result_limit")]
+    #[schemars(range(min = 1, max = 32768))]
+    pub limit: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
