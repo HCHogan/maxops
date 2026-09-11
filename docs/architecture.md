@@ -121,7 +121,12 @@ Probe commands run through the existing hardened executor profile under stable
 child job IDs, so restart recovery queries the same target jobs. Evidence is
 marked as fact, hypothesis or missing; rule results carry stable IDs and cite
 their evidence. The bundle and a `diagnostic_collected` event retain the parent
-episode when collection starts from an event.
+episode when collection starts from an event. Each probe must succeed with
+complete, untruncated logs to count as collected evidence. The bundle reports
+`collection_status` and `missing_evidence`; compact job summaries preserve this
+assessment independently of the inline result size. Completing collection does
+not assert that the target is healthy. Profiles expose only declared execution
+metadata (including PATH), never credentials or arbitrary environment values.
 
 `remediations.begin` atomically claims one attempt for an episode and host.
 SQLite permits one active remediation per episode and per host, then applies the

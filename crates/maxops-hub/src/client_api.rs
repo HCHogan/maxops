@@ -190,6 +190,22 @@ pub(super) async fn resources(
                 }
             }
         }
+        DiscoveryResourceKind::DiagnosticProbes => {
+            if !principal.capabilities.contains("diagnostics:collect") {
+                return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
+            }
+            for host in app.hosts.values().filter(|host| {
+                principal.hosts.contains(&host.config.name)
+                    && params
+                        .host
+                        .as_ref()
+                        .is_none_or(|selected| selected == &host.config.name)
+            }) {
+                for (name, argv) in &host.config.diagnostic_probes {
+                    entries.push(json!({"host":host.config.name,"probe":name,"argv":argv,"profile":host.config.diagnostic_profile}));
+                }
+            }
+        }
         DiscoveryResourceKind::ExecutionProfiles => {
             if !principal.capabilities.contains("exec:run") {
                 return Err(ApiError(StatusCode::FORBIDDEN, "capability not permitted"));
@@ -222,6 +238,8 @@ pub(super) fn job_summary(job: &JobRecord) -> Value {
     json!({"handle": job.handle, "created_at": job.created_at, "updated_at": job.updated_at,
         "deadline": job.deadline, "cancel_requested": job.cancel_requested,
         "result_available": job.result.is_some(),
+        "evidence_status": job.result.as_ref().and_then(|value| value.pointer("/diagnostic/collection_status")),
+        "missing_evidence": job.result.as_ref().and_then(|value| value.pointer("/diagnostic/missing_evidence")),
         "result": job.result.as_ref().filter(|value| serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 8192))})
 }
 

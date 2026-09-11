@@ -585,17 +585,30 @@ fn executor_error_code(message: &str) -> &'static str {
     }
 }
 
+fn profile_info(name: &str, profile: &Profile) -> maxops_proto::ExecutionProfileInfo {
+    maxops_proto::ExecutionProfileInfo {
+        name: name.to_owned(),
+        max_timeout_seconds: profile.timeout_seconds,
+        output_limit_bytes: profile.output_limit_bytes,
+        user: profile.user.clone(),
+        privileged: profile.privileged,
+        interpreter: profile.interpreter.to_string_lossy().into_owned(),
+        working_roots: profile
+            .working_roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+        path: profile.environment.get("PATH").cloned(),
+    }
+}
+
 async fn handle(app: Arc<App>, request: ExecutorRequest) -> Result<ExecutorResponse> {
     match request {
         ExecutorRequest::ExecutionProfiles => Ok(ExecutorResponse::ExecutionProfiles(
             app.config
                 .profiles
                 .iter()
-                .map(|(name, profile)| maxops_proto::ExecutionProfileInfo {
-                    name: name.clone(),
-                    max_timeout_seconds: profile.timeout_seconds,
-                    output_limit_bytes: profile.output_limit_bytes,
-                })
+                .map(|(name, profile)| profile_info(name, profile))
                 .collect(),
         )),
         ExecutorRequest::Submit { job_id, job } => submit_job(app, job_id, job).await,
@@ -2249,6 +2262,23 @@ fn deployment_spec_path(config: &Config, id: &JobId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_discovery_exposes_execution_context_without_extra_environment() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "user":"maxops-runner", "interpreter":"/bin/sh", "working_roots":["/work"],
+            "environment":{"PATH":"/tools/bin","PRIVATE_VALUE":"do-not-disclose"}
+        }))
+        .unwrap();
+        let value = serde_json::to_value(profile_info("diagnostic", &profile)).unwrap();
+        assert_eq!(value["path"], "/tools/bin");
+        assert_eq!(value["user"], "maxops-runner");
+        assert_eq!(value["privileged"], false);
+        assert_eq!(value["working_roots"], serde_json::json!(["/work"]));
+        assert_eq!(value["interpreter"], "/bin/sh");
+        assert!(!value.to_string().contains("do-not-disclose"));
+        assert!(value.get("environment").is_none());
+    }
 
     #[test]
     fn config_rejects_relative_privileged_paths() {

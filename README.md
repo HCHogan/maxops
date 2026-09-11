@@ -232,7 +232,20 @@ to decoded bytes; clients without gzip support continue receiving plain JSON.
 Use `events.recent` for bounded, newest-first incident history with host/unit and
 time filters. `events.list` remains an oldest-first durable replay API. Summary
 views omit event payloads; `events.get` reads their evidence in bounded JSON
-fragments. Discovery requires `host` for `kind=execution_profiles`.
+fragments. Discovery requires `host` for `kind=execution_profiles`; profiles
+include user, privilege, interpreter, working roots and declared PATH, without
+credential values or arbitrary environment variables. Commands run in a non-login
+shell and do not inherit an interactive user's PATH. Use `kind=diagnostic_probes`
+to list authorized named probes and their argv/profile before collecting evidence.
+
+`diagnostics.collect` reports `collection_status` (`complete`, `partial`, `failed`)
+and `missing_evidence`. A failed probe, unavailable logs or truncated probe output
+is missing evidence even if the collection job itself completed. `jobs.status`
+and `jobs.wait` retain `evidence_status` and `missing_evidence` even when the bundle
+is too large to inline; read it through `jobs.result` with `/diagnostic` and page
+as needed. `complete` describes evidence collection, not host health. Similarly,
+`exec.run` success describes process exit, not achievement of a caller's goal.
+Remote `job_id` parameters are UUIDs; a consumer's task number is not a job ID.
 
 HTTP endpoints:
 

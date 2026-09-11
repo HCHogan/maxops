@@ -9,7 +9,25 @@ use std::{
 
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
+#[schemars(inline, transform = job_id_schema)]
 pub struct JobId(String);
+
+fn job_id_schema(schema: &mut schemars::Schema) {
+    schema.insert("minLength".into(), serde_json::json!(36));
+    schema.insert("maxLength".into(), serde_json::json!(36));
+    schema.insert(
+        "pattern".into(),
+        serde_json::json!(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        ),
+    );
+    schema.insert(
+        "description".into(),
+        serde_json::json!(
+            "Remote maxops job UUID returned by job submission; never a consumer task number."
+        ),
+    );
+}
 
 impl JobId {
     pub fn parse(value: impl Into<String>) -> Result<Self, &'static str> {

@@ -93,6 +93,15 @@ pkgs.testers.runNixOSTest {
         ];
         credentialSources.fixture = "/run/job-credential";
         profiles.diagnostic = {
+          environment.PATH = pkgs.lib.makeBinPath [
+            pkgs.coreutils
+            pkgs.systemd
+            pkgs.iproute2
+            pkgs.procps
+            pkgs.gnugrep
+            pkgs.jq
+            pkgs.tailscale
+          ];
           timeoutSeconds = 600;
           outputLimitBytes = 64;
           tasksMax = 32;
@@ -354,6 +363,8 @@ pkgs.testers.runNixOSTest {
       };
     };
   testScript = ''
+    import json
+
     start_all()
     machine.wait_for_unit("maxops-agent.service")
     machine.wait_for_unit("maxops-executor.service")
@@ -400,6 +411,11 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds(manager + f"jobs.status --job-id {second_claim} | jq -e '.handle.state == \"failed\" and .result.error == \"remediation_budget_exhausted\"'", timeout=20)
 
     machine.succeed("echo '{\"host\":\"fixture\",\"profile\":\"diagnostic\",\"command\":{\"argv\":[\"${pkgs.bash}/bin/bash\",\"-c\",\"printf first; sleep 12; printf second\"]},\"timeout_seconds\":30}' > /tmp/long-job.json")
+    probe = {"host":"fixture", "profile":"diagnostic", "command":{"script":"set -euo pipefail; command -v systemctl journalctl ip free grep jq tailscale >/dev/null; systemctl --version >/dev/null; ip -j address show | jq -e 'length > 0' >/dev/null; printf diagnostic-ready"}}
+    machine.succeed("cat > /tmp/diagnostic-env.json <<'EOF'\n" + json.dumps(probe) + "\nEOF")
+    probe_job = machine.succeed(manager + "exec.run --params-file /tmp/diagnostic-env.json --idempotency-key diagnostic-environment | jq -r .job_id").strip()
+    machine.wait_until_succeeds(manager + f"jobs.status --job-id {probe_job} | jq -e '.handle.state == \"succeeded\" and .result.exit_code == 0 and .result.stdout_bytes == 16 and .result.stderr_bytes == 0'", timeout=30)
+
     machine.fail(ctl + "exec.run --params-file /tmp/long-job.json --idempotency-key observer-cannot-run")
     job = machine.succeed(manager + "exec.run --params-file /tmp/long-job.json --idempotency-key restart-survival | jq -r .job_id").strip()
     same_job = machine.succeed(manager + "exec.run --params-file /tmp/long-job.json --idempotency-key restart-survival | jq -r .job_id").strip()

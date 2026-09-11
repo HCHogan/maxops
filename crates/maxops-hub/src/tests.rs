@@ -674,6 +674,8 @@ async fn successful_executor(
     match request {
         ExecutorRequest::ExecutionProfiles => Ok(Json(ExecutorResponse::ExecutionProfiles(vec![]))),
         ExecutorRequest::Submit { job_id, job } => {
+            let command_missing = job.spec.pointer("/command/argv/0").and_then(Value::as_str)
+                == Some("/missing/diagnostic-command");
             let accepted = store.accept_job(&job_id, &job).await.unwrap();
             let job = if accepted.created {
                 let dispatching = store
@@ -694,9 +696,13 @@ async fn successful_executor(
                     .transition_job(
                         &job_id,
                         running.handle.revision,
-                        JobState::Succeeded,
+                        if command_missing {
+                            JobState::Failed
+                        } else {
+                            JobState::Succeeded
+                        },
                         &json!({}),
-                        Some(&json!({"exit_code":0})),
+                        Some(&json!({"exit_code":if command_missing {127} else {0}})),
                     )
                     .await
                     .unwrap()
@@ -2281,7 +2287,10 @@ async fn diagnostics_and_remediation_form_a_scoped_budgeted_flow() {
         .get_mut("alpha")
         .unwrap()
         .config
-        .diagnostic_probes = BTreeMap::from([("identity".into(), vec!["/bin/true".into()])]);
+        .diagnostic_probes = BTreeMap::from([
+        ("identity".into(), vec!["/bin/true".into()]),
+        ("missing".into(), vec!["/missing/diagnostic-command".into()]),
+    ]);
     state.remediation_policy = RemediationPolicyConfig {
         max_attempts_per_episode: 1,
         cooldown_seconds: 0,
@@ -2305,7 +2314,7 @@ async fn diagnostics_and_remediation_form_a_scoped_budgeted_flow() {
         Some(USER_TOKEN),
         Some("diagnostic-flow"),
         json!({"op":"diagnostics.collect","params":{
-            "host":"alpha","event_id":alert.event_id,"unit":"demo.service","probes":["identity"]
+            "host":"alpha","event_id":alert.event_id,"unit":"demo.service","probes":["identity","missing"]
         }}),
     )
     .await;
@@ -2319,6 +2328,28 @@ async fn diagnostics_and_remediation_form_a_scoped_budgeted_flow() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(diagnostic.handle.state, JobState::Succeeded);
+    let summary = client_api::job_summary(&diagnostic);
+    assert_eq!(summary["evidence_status"], "partial");
+    assert_eq!(summary["missing_evidence"], json!(["probe:missing"]));
+    let evidence = &diagnostic.result.as_ref().unwrap()["diagnostic"]["evidence"];
+    let failed = evidence
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["evidence_id"] == "probe:missing")
+        .unwrap();
+    assert_eq!(failed["assessment"], "missing");
+    assert_eq!(failed["value"]["result"]["exit_code"], 127);
+    let (status, probes) = call(
+        router.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"resources.list","params":{"kind":"diagnostic_probes","host":"alpha"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(probes["total"], 2);
+
     assert_eq!(
         diagnostic.result.as_ref().unwrap()["diagnostic"]["host"],
         "alpha"

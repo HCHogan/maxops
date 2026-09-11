@@ -316,6 +316,9 @@ pub struct DiagnosticRuleResult {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticBundle {
+    /// Collection completeness, independent of the process/job transport state.
+    pub collection_status: String,
+    pub missing_evidence: Vec<String>,
     pub artifact_id: String,
     pub host: String,
     pub unit: Option<String>,

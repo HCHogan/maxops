@@ -13,6 +13,7 @@ pub enum DiscoveryResourceKind {
     Repositories,
     Deployments,
     ExecutionProfiles,
+    DiagnosticProbes,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
@@ -114,4 +115,10 @@ pub struct ExecutionProfileInfo {
     pub name: String,
     pub max_timeout_seconds: u32,
     pub output_limit_bytes: u64,
+    pub user: String,
+    pub privileged: bool,
+    pub interpreter: String,
+    pub working_roots: Vec<String>,
+    /// Declared executable search path; login-shell environments are not inherited.
+    pub path: Option<String>,
 }

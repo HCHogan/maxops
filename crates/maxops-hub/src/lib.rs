@@ -2992,7 +2992,15 @@ async fn diagnostic_probe(
     DiagnosticEvidence {
         evidence_id: format!("probe:{probe}"),
         source: "configured_probe".into(),
-        assessment: EvidenceAssessment::Fact,
+        assessment: if job.handle.state == JobState::Succeeded
+            && logs
+                .as_ref()
+                .is_some_and(|output| output.complete && !output.truncated)
+        {
+            EvidenceAssessment::Fact
+        } else {
+            EvidenceAssessment::Missing
+        },
         value: json!({
             "job_id": child_id,
             "state": job.handle.state,
@@ -3115,7 +3123,21 @@ async fn run_diagnostics(app: Arc<App>, job: JobRecord) -> color_eyre::eyre::Res
             conclusion: "selected unit state is unavailable".into(),
         });
     }
+    let missing_evidence: Vec<String> = evidence
+        .iter()
+        .filter(|item| matches!(item.assessment, EvidenceAssessment::Missing))
+        .map(|item| item.evidence_id.clone())
+        .collect();
+    let collection_status = if missing_evidence.is_empty() {
+        "complete"
+    } else if missing_evidence.len() == evidence.len() {
+        "failed"
+    } else {
+        "partial"
+    };
     let bundle = DiagnosticBundle {
+        collection_status: collection_status.into(),
+        missing_evidence,
         artifact_id: stable_child_job_id(&job.handle.job_id, "diagnostic-artifact").to_string(),
         host: params.host.clone(),
         unit: params.unit.clone(),

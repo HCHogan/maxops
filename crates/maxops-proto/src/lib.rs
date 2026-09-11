@@ -321,6 +321,26 @@ mod tests {
     }
 
     #[test]
+    fn job_schema_exposes_the_remote_uuid_contract() {
+        let schema = serde_json::to_value(schema_for!(JobId)).unwrap();
+        assert_eq!(schema["type"], "string");
+        let wait = serde_json::to_value(schema_for!(JobWaitParams)).unwrap();
+        assert_eq!(wait["properties"]["job_id"]["minLength"], 36);
+        assert_eq!(schema["minLength"], 36);
+        assert_eq!(schema["maxLength"], 36);
+        assert!(schema["pattern"].as_str().unwrap().contains("{12}"));
+        assert!(
+            serde_json::from_value::<JobWaitParams>(serde_json::json!({"job_id":"133"})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<JobWaitParams>(
+                serde_json::json!({"job_id":"01a08fdf-744d-7401-a700-616632d53bee"})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn requests_fail_closed() {
         for value in [
             r#"{"op":"units.restart","params":{"host":"a","unit":"a.service","force":true}}"#,
