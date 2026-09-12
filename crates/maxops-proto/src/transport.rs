@@ -56,6 +56,9 @@ impl IntoResponse for ApiError {
             "unit is not manageable" | "service is not manageable" => {
                 ("unit_not_manageable", "never")
             }
+            "unit kind is not manageable; mutations require .service" => {
+                ("unit_kind_not_manageable", "never")
+            }
             "logs not permitted" => ("logs_not_permitted", "never"),
             "repository not permitted" => ("repository_not_permitted", "never"),
             "deployment not permitted" => ("deployment_not_permitted", "never"),
@@ -137,6 +140,7 @@ impl UpstreamHttpError {
                         | "cursor_expired"
                         | "busy"
                         | "invalid_request"
+                        | "unit_kind_not_manageable"
                         | "unavailable"
                 )
                 && matches!(
@@ -310,6 +314,16 @@ pub async fn health() -> Json<Health> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mutation_kind_error_crosses_transport_without_upstream_text() {
+        let error = UpstreamHttpError::new(StatusCode::BAD_REQUEST).with_public_body(
+            br#"{"code":"unit_kind_not_manageable","retry":"never","error":"private upstream text"}"#,
+        );
+        assert_eq!(error.code(), Some("unit_kind_not_manageable"));
+        assert_eq!(error.retry(), Some("never"));
+        assert!(!error.to_string().contains("private upstream text"));
+    }
+
     #[test]
     fn bearer_auth_rejects_missing_wrong_and_duplicate_headers() {
         let token = Token::parse("a".repeat(32)).unwrap();

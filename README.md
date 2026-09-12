@@ -246,6 +246,13 @@ is too large to inline; read it through `jobs.result` with `/diagnostic` and pag
 as needed. `complete` describes evidence collection, not host health. Similarly,
 `exec.run` success describes process exit, not achievement of a caller's goal.
 Remote `job_id` parameters are UUIDs; a consumer's task number is not a job ID.
+`jobs.status/wait/logs/result` also accept the original submission's `idempotency_key`
+instead of `job_id`, scoped to the same authenticated principal.
+
+For model-facing observations, use `POST /v1/execute?view=summary`: alerts are
+paged and grouped, the fleet overview contains per-host pressure summaries, and
+host metrics aggregate fresh series into statistics. Full observations remain
+available. See the [response and identity contract](docs/api-client-contract.md#model-facing-observations-and-submission-identity).
 
 HTTP endpoints:
 

@@ -238,3 +238,34 @@ source archive then passed the Linux package tests and complete KVM VM script
 on b650. The VM independently exercised external Git commits, a manual
 service restart and an external profile activation, proving stale plans stop and
 superseded deployments do not roll back another writer's running generation.
+
+## Model-facing contract (issue #1, 2026-09-12)
+
+Validated locally with devenv on macOS. No production activation was performed.
+Nix modules and both nixpkgs pins are unchanged.
+
+- `just check`: format, strict workspace/all-target clippy, 94 nextest tests and
+  workspace doctests pass. The registry tests compile real JSON Schema validators,
+  require descriptions on every nested input property, and check service syntax
+  against `valid_unit`, including boundary lengths and invalid unit kinds.
+- `cargo build --workspace --locked` and `scripts/smoke.py`: actual Hub, CLI,
+  HTTP example and MCP pass their shared-catalog/identity smoke test.
+- `nix flake check --all-systems --no-build` and `scripts/check-pins.py`: evaluation
+  and pin alignment pass. This is not a new NixOS VM run.
+- A read-only capture of 20 live alerts was replayed into the local Hub binary:
+  full response 20,622 bytes, summary 2,537 bytes, two groups. Every full alert
+  object remains unchanged. The committed anonymized capture's summary is 2,589
+  bytes and its test checks byte-identical full serialization, lossless shared
+  summaries, peer pagination, Unicode bounds and cursor invalidation.
+- A nine-host HTTP fixture with per-core, filesystem and network series produces
+  a 4,004-byte fleet summary. Aggregation tests preserve unavailable, stale,
+  ambiguous and partial evidence and match filesystem dimensions before ratios.
+- HTTP tests submit a job, read it using only its original key, reopen storage,
+  and compare all four key-based reads to UUID reads. Unknown keys, other
+  principals and revoked hosts stay isolated. Canonical non-service mutations
+  return `unit_kind_not_manageable` without creating a durable receipt; tools
+  schemas also include principal-scoped service enums for enum-only consumers.
+
+Consumer task deadlines, model-visible admission responses and skill splitting
+remain the separately tracked work in HCHogan/max#20. These local results prove
+this repository's contract, not production rollout or model behavior after rollout.

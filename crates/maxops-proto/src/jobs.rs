@@ -192,8 +192,18 @@ pub struct JobRecord {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSpec {
-    Argv(Vec<String>),
-    Script(String),
+    Argv(
+        #[schemars(
+            description = "Literal executable followed by arguments; no shell parsing or expansion."
+        )]
+        Vec<String>,
+    ),
+    Script(
+        #[schemars(
+            description = "Script run by the configured profile interpreter in a non-login shell with its declared PATH."
+        )]
+        String,
+    ),
 }
 
 impl CommandSpec {
@@ -216,15 +226,22 @@ impl CommandSpec {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecRunParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
+    /// Target profile name from resources.list(kind=execution_profiles, host=...). Inspect its user, privilege, interpreter, working_roots, PATH and limits before choosing.
     pub profile: String,
+    /// Exactly one of argv (literal executable and arguments, no shell expansion) or script (uses the profile interpreter in a non-login shell). The profile supplies declared PATH; preserve failure exit status rather than masking it with || true.
     pub command: CommandSpec,
+    /// Optional absolute working directory under the profile working_roots from resources.list(kind=execution_profiles, host=...).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Explicit non-secret environment overrides; omit to use the configured profile environment and PATH. Never put credentials here.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Configured credential names allowed by the profile; only operator-supplied references, never secret values or source paths. The executor uses systemd LoadCredential.
     #[serde(default)]
     pub credential_refs: Vec<String>,
+    /// Requested runtime in seconds (1..86400); must not exceed max_timeout_seconds from resources.list(kind=execution_profiles, host=...). Omission uses the profile runtime limit and a 300-second Hub deadline; set explicitly to align them.
     #[serde(default)]
     pub timeout_seconds: Option<u32>,
 }
@@ -280,12 +297,16 @@ impl ExecRunParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobsListParams {
+    /// Continuation cursor returned by this operation; omit for the first page and preserve filters when continuing.
     #[serde(default)]
     pub cursor: Option<JobId>,
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     #[serde(default)]
     pub host: Option<String>,
+    /// Optional job-state filter; an empty array includes all states.
     #[serde(default)]
     pub states: Vec<JobState>,
+    /// Maximum entries per page; use the returned cursor to continue.
     #[serde(default = "default_job_limit")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: u16,
@@ -298,17 +319,22 @@ pub fn default_job_limit() -> u16 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobIdParams {
+    /// Remote maxops job UUID from submission or jobs.list; never a consumer task number.
     pub job_id: JobId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobLogsParams {
+    /// Remote maxops job UUID from submission or jobs.list; never a consumer task number.
     pub job_id: JobId,
+    /// Byte offset from next_stdout_offset; zero starts at the beginning of stdout.
     #[serde(default)]
     pub stdout_offset: u64,
+    /// Byte offset from next_stderr_offset; zero starts at the beginning of stderr.
     #[serde(default)]
     pub stderr_offset: u64,
+    /// Maximum bytes per output stream (1..65536, default 65536); follow returned byte offsets.
     #[serde(default = "default_log_limit")]
     #[schemars(range(min = 1, max = 65536))]
     pub limit: u32,
@@ -321,8 +347,11 @@ pub fn default_log_limit() -> u32 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobCancelParams {
+    /// Remote maxops job UUID from submission or jobs.list; never a consumer task number.
     pub job_id: JobId,
+    /// Current job revision from jobs.status or jobs.wait; rejects cancellation based on stale state.
     pub expected_revision: u64,
+    /// Nonempty cancellation explanation, at most 1024 bytes; cancellation never reverses an accepted action.
     pub reason: String,
 }
 

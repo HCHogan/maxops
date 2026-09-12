@@ -26,12 +26,14 @@ pub struct Empty {}
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnitsListParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
     /// Exact active state, for example failed or active. Omit to list all states.
     #[serde(default)]
@@ -39,8 +41,10 @@ pub struct UnitsListParams {
     /// Literal unit-name prefix, not a shell pattern.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Continuation cursor returned by this operation; omit for the first page and preserve filters when continuing.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Maximum entries per page; use the returned cursor to continue.
     #[serde(default = "default_lines")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: u16,
@@ -49,6 +53,7 @@ pub struct UnitsListParams {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FailedParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     #[serde(default)]
     pub host: Option<String>,
 }
@@ -56,15 +61,29 @@ pub struct FailedParams {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnitParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
+    /// Exact readable unit from resources.list(kind=units); observation accepts canonical systemd unit kinds, including services, timers and targets.
     pub unit: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnitActionParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
+    /// Service-only mutation: exact .service name in manageable_units, discovered via resources.list(kind=units) with manageable=true.
+    #[schemars(
+        length(min = 9, max = 255),
+        regex(pattern = r"^[A-Za-z0-9_.:@-]+\.service$")
+    )]
+    #[schema(
+        min_length = 9,
+        max_length = 255,
+        pattern = r"^[A-Za-z0-9_.:@-]+\.service$"
+    )]
     pub unit: String,
+    /// Read units.status first and supply unit.details.invocation_id (32 hex digits); a concurrent restart then fails with stale_baseline. Omission disables this guard.
     #[serde(default)]
     pub expected_invocation_id: Option<String>,
 }
@@ -75,6 +94,9 @@ impl UnitActionParams {
             return Err("invalid host");
         }
         if !valid_unit(&self.unit) {
+            if valid_observation_unit(&self.unit) && !self.unit.ends_with(".service") {
+                return Err("unit kind is not manageable; mutations require .service");
+            }
             return Err("invalid service unit name");
         }
         if self.expected_invocation_id.as_ref().is_some_and(|value| {
@@ -89,12 +111,16 @@ impl UnitActionParams {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
+    /// Exact readable unit from resources.list(kind=units); observation accepts canonical systemd unit kinds, including services, timers and targets.
     pub unit: String,
+    /// Maximum recent journal entries to collect (1..200, default 50).
     #[serde(default = "default_lines")]
     #[schemars(range(min = 1, max = 200))]
     #[schema(minimum = 1, maximum = 200, default = 50)]
     pub lines: u16,
+    /// Journal lookback in seconds (1..86400, default 3600).
     #[serde(default = "default_since")]
     #[schemars(range(min = 1, max = 86400))]
     #[schema(minimum = 1, maximum = 86400, default = 3600)]
@@ -188,12 +214,12 @@ operations! {
     FleetOverview(Empty) -> serde_json::Value, "fleet.overview", "fleet:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Observed agent and exporter state for permitted hosts";
     UnitsFailed(FailedParams) -> serde_json::Value, "units.failed", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Failed readable services; unreachable hosts remain explicit";
     HostFacts(HostParams) -> serde_json::Value, "host.facts", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Kernel, uptime and the running system closure";
-    HostMetrics(HostParams) -> serde_json::Value, "host.metrics", "metrics:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
+    HostMetrics(HostMetricsParams) -> serde_json::Value, "host.metrics", "metrics:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Host-scoped CPU, memory, load, filesystem and network observations from Prometheus";
     DeployStatus(FailedParams) -> serde_json::Value, "deploy.status", "host:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Running closure versus persistent system profile; unavailable hosts remain explicit";
     UnitsList(UnitsListParams) -> serde_json::Value, "units.list", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Page authorized loaded units and configured unloaded units; filter by state or literal prefix. Coverage is explicit; an empty list is not whole-host health";
     UnitsStatus(UnitParams) -> serde_json::Value, "units.status", "units:read", OperationKind::Observation, true, IdempotencyRequirement::None, "State of one authorized systemd unit, including services, timers, targets and scopes";
     UnitsLogs(LogParams) -> serde_json::Value, "units.logs", "logs:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Bounded recent journal entries for one readable service";
-    AlertsActive(Empty) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
+    AlertsActive(AlertsParams) -> serde_json::Value, "alerts.active", "alerts:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Active alerts with an instance label matching permitted hosts";
     EventsGet(EventGetParams) -> serde_json::Value, "events.get", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Read bounded event evidence by event_id, JSON pointer and byte offset; use /payload for details omitted from summaries";
     EventsRecent(RecentEventsParams) -> serde_json::Value, "events.recent", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Recent incident events, newest first, default last hour and 20 entries; filter by host/unit and use next_before_sequence for older pages";
     EventsList(EventsListParams) -> EventsListResponse, "events.list", "events:read", OperationKind::Observation, true, IdempotencyRequirement::None, "Replay durable fleet events oldest first after a scoped cursor; use events.recent for incident diagnosis";
@@ -204,8 +230,8 @@ operations! {
     UnitsRestart(UnitActionParams) -> JobHandle, "units.restart", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Restart one explicitly manageable systemd service";
     UnitsReload(UnitActionParams) -> JobHandle, "units.reload", "units:manage", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Reload one explicitly manageable systemd service without upgrading to restart";
     JobsList(JobsListParams) -> JobsListResponse, "jobs.list", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "List durable jobs owned by the authenticated principal";
-    JobsStatus(JobIdParams) -> JobRecord, "jobs.status", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one durable job and its current target-confirmed state";
-    JobsLogs(JobLogsParams) -> JobLogsResponse, "jobs.logs", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read bounded command output using byte offsets";
+    JobsStatus(JobLookupParams) -> JobRecord, "jobs.status", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read one durable job and its current target-confirmed state";
+    JobsLogs(JobOutputParams) -> JobLogsResponse, "jobs.logs", "jobs:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read bounded command output using byte offsets";
     JobsCancel(JobCancelParams) -> JobRecord, "jobs.cancel", "jobs:cancel", OperationKind::JobControl, false, IdempotencyRequirement::None, "Request cancellation of a non-terminal job";
     WorkspaceCreate(WorkspaceCreateParams) -> JobHandle, "workspace.create", "workspace:write", OperationKind::JobSubmission, false, IdempotencyRequirement::Required, "Create an isolated workspace at the currently observed configured remote ref";
     WorkspaceStatus(WorkspaceStatusParams) -> WorkspaceRecord, "workspace.status", "workspace:read", OperationKind::JobControl, true, IdempotencyRequirement::None, "Read a workspace's durable revision and Git identities";
@@ -294,7 +320,10 @@ pub fn now() -> jiff::Timestamp {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests;
+
+#[cfg(test)]
+mod legacy_tests {
     use super::*;
     #[test]
     fn observation_unit_names_do_not_expand_mutation_names_or_allow_patterns() {

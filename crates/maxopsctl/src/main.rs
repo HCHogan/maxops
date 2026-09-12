@@ -1,8 +1,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use maxops_proto::{
-    IdempotencyRequirement, JobHandle, JobId, JobIdParams, JobLogsParams, JobLogsResponse,
-    JobRecord, JobState, OperationKind, PROTOCOL_VERSION, Request, operations,
+    IdempotencyRequirement, JobHandle, JobId, JobLogsParams, JobLogsResponse, JobRecord, JobState,
+    OperationKind, PROTOCOL_VERSION, Request, operations,
     transport::{self, Token},
 };
 use serde_json::{Value, json};
@@ -141,6 +141,12 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Request::UnitsLogs(params) => {
             params.validate().map_err(color_eyre::eyre::Report::msg)?;
         }
+        Request::UnitsStart(params)
+        | Request::UnitsStop(params)
+        | Request::UnitsRestart(params)
+        | Request::UnitsReload(params) => {
+            params.validate().map_err(color_eyre::eyre::Report::msg)?;
+        }
         Request::ExecRun(params) => {
             params.validate().map_err(color_eyre::eyre::Report::msg)?;
         }
@@ -212,7 +218,8 @@ async fn wait_for_job(
             stderr_offset = logs.next_stderr_offset;
         }
         let request = Request::JobsWait(maxops_proto::JobWaitParams {
-            job_id: job_id.clone(),
+            job_id: Some(job_id.clone()),
+            idempotency_key: None,
             after_revision: revision,
             timeout_seconds: 10,
         });
@@ -233,13 +240,12 @@ async fn wait_for_job(
         let handle: JobHandle = serde_json::from_value(waited["job"]["handle"].clone())?;
         revision = Some(handle.revision);
         if handle.state.is_terminal() {
-            let job: JobRecord =
-                transport::read_json(token.apply(client.post(format!("{url}/v1/execute"))).json(
-                    &Request::JobsStatus(JobIdParams {
-                        job_id: job_id.clone(),
-                    }),
-                ))
-                .await?;
+            let job: JobRecord = transport::read_json(
+                token
+                    .apply(client.post(format!("{url}/v1/execute")))
+                    .json(&Request::JobsStatus(job_id.clone().into())),
+            )
+            .await?;
             if follow {
                 let logs = fetch_logs(
                     client,
@@ -274,7 +280,7 @@ async fn fetch_logs(
     transport::read_json(
         token
             .apply(client.post(format!("{url}/v1/execute")))
-            .json(&Request::JobsLogs(params)),
+            .json(&Request::JobsLogs(params.into())),
     )
     .await
 }

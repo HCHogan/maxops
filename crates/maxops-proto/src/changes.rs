@@ -291,33 +291,44 @@ pub struct ChangeRecord {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeployPrepareParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: crate::WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Exact target_host paired with the profile in resources.list(kind=deployments).
     pub target_host: String,
+    /// Granted deployment profile from resources.list(kind=deployments), matching repository and target_host.
     pub profile: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeployChangeParams {
+    /// Change UUID returned by deploy.prepare or changes.history.
     pub change_id: ChangeId,
+    /// Current change revision from changes.status; re-read before each stage to reject concurrent changes.
     pub expected_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeStatusParams {
+    /// Change UUID returned by deploy.prepare or changes.history.
     pub change_id: ChangeId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeHistoryParams {
+    /// Continuation cursor returned by this operation; omit for the first page and preserve filters when continuing.
     #[serde(default)]
     pub cursor: Option<ChangeId>,
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     #[serde(default)]
     pub host: Option<String>,
+    /// Maximum entries per page; use the returned cursor to continue.
     #[serde(default = "default_change_limit")]
     #[schemars(range(min = 1, max = 200))]
     #[schema(minimum = 1, maximum = 200, default = 50)]

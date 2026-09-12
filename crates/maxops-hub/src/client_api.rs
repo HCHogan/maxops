@@ -17,7 +17,11 @@ pub(super) struct CatalogQuery {
     cursor: Option<String>,
 }
 
-pub(super) fn catalog_value(principal: &Principal, query: CatalogQuery) -> Result<Value, ApiError> {
+pub(super) fn catalog_value(
+    app: &App,
+    principal: &Principal,
+    query: CatalogQuery,
+) -> Result<Value, ApiError> {
     let view = query.view.as_deref().unwrap_or("full");
     if !matches!(view, "summary" | "tools" | "full") {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid catalog view"));
@@ -43,10 +47,31 @@ pub(super) fn catalog_value(principal: &Principal, query: CatalogQuery) -> Resul
         {
             continue;
         }
+        let service_mutation = operation.capability == "units:manage";
         let mut value = serde_json::to_value(operation).expect("serializable operation");
         let fields = value.as_object_mut().expect("operation object");
         if view != "full" {
             fields.remove("response_schema");
+        }
+        if view == "tools" {
+            let schema = fields.get_mut("params_schema").expect("input schema");
+            compact_schema(schema);
+            if service_mutation {
+                // This refines the registry constraint using current policy, not
+                // another operation dispatch table. Enum-aware clients reject
+                // non-services before their own durable admission even if they
+                // do not implement JSON Schema pattern validation.
+                let units: BTreeSet<_> = app
+                    .hosts
+                    .values()
+                    .filter(|host| principal.hosts.contains(&host.config.name))
+                    .flat_map(|host| host.config.manageable_units.iter())
+                    .collect();
+                if units.is_empty() {
+                    continue;
+                }
+                schema["properties"]["unit"]["enum"] = json!(units);
+            }
         }
         if view == "summary" {
             fields.remove("params_schema");
@@ -62,6 +87,74 @@ pub(super) fn catalog_value(principal: &Principal, query: CatalogQuery) -> Resul
     result["version"] = json!(PROTOCOL_VERSION);
     result["view"] = json!(view);
     Ok(result)
+}
+
+// Walk schema positions only: a property literally named title must survive.
+fn compact_schema(schema: &mut Value) {
+    let Some(fields) = schema.as_object_mut() else {
+        return;
+    };
+    fields.remove("$schema");
+    fields.remove("title");
+    for (key, value) in fields {
+        match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for schema in schemas.values_mut() {
+                        compact_schema(schema);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for schema in schemas {
+                        compact_schema(schema);
+                    }
+                }
+            }
+            "items"
+            | "additionalProperties"
+            | "contains"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "unevaluatedProperties" => compact_schema(value),
+            _ => {}
+        }
+    }
+}
+
+pub(super) async fn lookup_job(
+    app: &App,
+    principal: &Principal,
+    job_id: Option<&JobId>,
+    key: Option<&str>,
+) -> Result<JobRecord, ApiError> {
+    let store = durable_store(app)?;
+    let job = match (job_id, key) {
+        (Some(id), None) => store
+            .get_owned_job(&principal.name, id)
+            .await
+            .map_err(map_store_error)?,
+        (None, Some(key))
+            if !key.is_empty() && key.len() <= 128 && key.bytes().all(|b| b.is_ascii_graphic()) =>
+        {
+            store
+                .get_idempotent_job(&principal.name, key)
+                .await
+                .map_err(map_store_error)?
+                .ok_or(ApiError(StatusCode::NOT_FOUND, "job not found"))?
+        }
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "supply exactly one job UUID or submission idempotency_key",
+            ));
+        }
+    };
+    host_for(app, principal, &job.handle.host)?;
+    Ok(job)
 }
 
 // Cursor binds the complete authorized, filtered representation. It cannot be
@@ -257,6 +350,15 @@ pub(super) async fn wait(
     let store = durable_store(app)?;
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(u64::from(params.timeout_seconds));
+    let job_id = lookup_job(
+        app,
+        principal,
+        params.job_id.as_ref(),
+        params.idempotency_key.as_deref(),
+    )
+    .await?
+    .handle
+    .job_id;
     let mut revision = params.after_revision;
     loop {
         // Subscribe before reading to avoid a lost notification between the
@@ -265,7 +367,7 @@ pub(super) async fn wait(
         tokio::pin!(notified);
         notified.as_mut().enable();
         let job = store
-            .get_owned_job(&principal.name, &params.job_id)
+            .get_owned_job(&principal.name, &job_id)
             .await
             .map_err(map_store_error)?;
         host_for(app, principal, &job.handle.host)?;
@@ -317,16 +419,19 @@ pub(super) async fn result(
     if !(1..=32768).contains(&params.limit) || params.pointer.len() > 1024 {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid result bounds"));
     }
-    let job = durable_store(app)?
-        .get_owned_job(&principal.name, &params.job_id)
-        .await
-        .map_err(map_store_error)?;
+    let job = lookup_job(
+        app,
+        principal,
+        params.job_id.as_ref(),
+        params.idempotency_key.as_deref(),
+    )
+    .await?;
     host_for(app, principal, &job.handle.host)?;
     let Some(value) = &job.result else {
         return Ok(json!({"available": false, "handle": job.handle}));
     };
     let mut fragment = json_fragment(value, &params.pointer, params.offset, params.limit)?;
-    fragment["job_id"] = json!(params.job_id);
+    fragment["job_id"] = json!(job.handle.job_id);
     Ok(fragment)
 }
 
@@ -370,6 +475,9 @@ pub(super) struct Representation {
 }
 
 impl Representation {
+    pub(super) fn is_summary(&self) -> bool {
+        self.view.as_deref() == Some("summary")
+    }
     pub(super) fn validate(&self) -> Result<(), ApiError> {
         let query = self;
         if query
@@ -389,12 +497,18 @@ impl Representation {
 
 pub(super) fn present(
     Query(query): Query<Representation>,
-    operation: &str,
+    request: &Request,
     mut value: Value,
 ) -> Result<Value, ApiError> {
     query.validate()?;
+    let operation = request.name();
+    if let Request::AlertsActive(params) = request {
+        value = observation_views::alerts(value, params, query.is_summary())?;
+    }
     if query.view.as_deref() == Some("summary") {
         match operation {
+            "fleet.overview" => observation_views::fleet(&mut value),
+            "host.metrics" => observation_views::aggregate(&mut value["observation"]),
             "jobs.status" | "jobs.cancel" => {
                 if let Ok(job) = serde_json::from_value::<JobRecord>(value.clone()) {
                     value = job_summary(&job);
@@ -486,5 +600,33 @@ fn compact_change(value: &mut Value) {
             }
         }
         fields.remove("artifact");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_compaction_preserves_properties_refs_and_validation_constraints() {
+        let mut schema = json!({"$schema":"draft", "title":"Outer", "type":"object", "required":["title"],
+            "properties":{"title":{"title":"Inner", "type":"string","description":"Input titled title.","pattern":"^x$"},
+                "$schema":{"type":"string","enum":["literal"]},"ref":{"$ref":"#/$defs/Named"}},
+            "$defs":{"Named":{"title":"Name","type":"string","minLength":1}},
+            "oneOf":[{"title":"Branch","required":["ref"]}]});
+        compact_schema(&mut schema);
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert_eq!(
+            schema["properties"]["title"],
+            json!({"type":"string","description":"Input titled title.","pattern":"^x$"})
+        );
+        assert_eq!(schema["properties"]["$schema"]["enum"], json!(["literal"]));
+        assert_eq!(schema["properties"]["ref"]["$ref"], "#/$defs/Named");
+        assert_eq!(
+            schema["$defs"]["Named"],
+            json!({"type":"string","minLength":1})
+        );
+        assert_eq!(schema["oneOf"], json!([{"required":["ref"]}]));
     }
 }

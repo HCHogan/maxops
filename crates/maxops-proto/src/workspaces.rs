@@ -103,7 +103,9 @@ pub struct WorkspaceRecord {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCreateParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Expected full remote commit hash observed for the configured ref; a later external push rejects this operation instead of being overwritten.
     #[serde(default)]
     pub expected_remote_head: Option<String>,
 }
@@ -111,25 +113,35 @@ pub struct WorkspaceCreateParams {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceStatusParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRevisionParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceReadParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Relative regular-file path within the workspace; no absolute paths, traversal, .git or symlinks.
     pub path: String,
+    /// Maximum UTF-8 file bytes to read; oversized files are rejected rather than truncated.
     #[serde(default = "default_workspace_read_bytes")]
     #[schemars(range(min = 1, max = 262144))]
     #[schema(minimum = 1, maximum = 262144, default = 262144)]
@@ -143,6 +155,7 @@ pub const fn default_workspace_read_bytes() -> u32 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceEdit {
+    /// Relative regular-file path within the workspace; no absolute paths, traversal, .git or symlinks.
     pub path: String,
     /// UTF-8 replacement contents. `null` deletes an existing regular file.
     pub content: Option<String>,
@@ -151,37 +164,54 @@ pub struct WorkspaceEdit {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceApplyParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Bounded replacements or deletions of regular UTF-8 files; creates one new immutable revision.
     pub edits: Vec<WorkspaceEdit>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCommitParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Commit message for the exact workspace revision; author identity comes from repository policy.
     pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceCheckParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Operator-configured check name for the repository from resources.list(kind=repositories); discovery lists repository names, so obtain configured check names from its operator policy. No arbitrary command.
     pub check: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePublishParams {
+    /// Permitted repository name from resources.list(kind=repositories).
     pub repository: String,
+    /// Workspace UUID from workspace.create or workspace.status; use the same repository.
     pub workspace_id: WorkspaceId,
+    /// Current workspace revision from workspace.status; compare-and-swap guard against intervening edits. Re-read after every change.
     pub expected_revision: u64,
+    /// Configured publishable Git ref, such as refs/heads/main; obtain it from repository operator policy (resources.list(kind=repositories) discovers names only). No force push.
     pub reference: String,
+    /// Expected full remote commit hash observed for the configured ref; a later external push rejects this operation instead of being overwritten.
     pub expected_remote_head: String,
 }
 

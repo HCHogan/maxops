@@ -161,12 +161,16 @@ pub struct EventRecord {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventsListParams {
+    /// Replay events after this durable sequence; omit to start at the earliest retained event.
     #[serde(default)]
     pub cursor: Option<u64>,
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     #[serde(default)]
     pub host: Option<String>,
+    /// Event-kind filter; an empty array includes all kinds.
     #[serde(default)]
     pub kinds: Vec<EventKind>,
+    /// Maximum entries per page; use the returned cursor to continue.
     #[serde(default = "default_event_limit")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: u16,
@@ -179,16 +183,20 @@ pub fn default_event_limit() -> u16 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecentEventsParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     #[serde(default)]
     pub host: Option<String>,
     /// Exact systemd unit; matches unit/name labels or a diagnostic unit.
     #[serde(default)]
     pub unit: Option<String>,
+    /// Recent-event lookback in seconds, default one hour; does not change oldest-first events.list replay.
     #[serde(default = "crate::default_since")]
     #[schemars(range(min = 1, max = 604800))]
     pub since_seconds: u32,
+    /// Exclusive upper sequence from next_before_sequence; omit for newest events.
     #[serde(default)]
     pub before_sequence: Option<u64>,
+    /// Maximum entries per page; use the returned cursor to continue.
     #[serde(default = "default_recent_limit")]
     #[schemars(range(min = 1, max = 50))]
     pub limit: u16,
@@ -240,17 +248,23 @@ pub struct EventsListResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticCollectParams {
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
+    /// Event UUID from events.recent or events.list; links this operation to that evidence and episode.
     #[serde(default)]
     pub event_id: Option<EventId>,
+    /// Optional readable .service from resources.list(kind=units), used for unit status and bounded journal evidence; non-service units are unsupported here.
     #[serde(default)]
     pub unit: Option<String>,
+    /// Maximum recent journal entries to collect (1..200, default 50).
     #[serde(default = "default_lines")]
     #[schemars(range(min = 1, max = 200))]
     pub lines: u16,
+    /// Journal lookback in seconds (1..86400, default 3600).
     #[serde(default = "default_since")]
     #[schemars(range(min = 1, max = 86400))]
     pub since_seconds: u32,
+    /// Up to 16 fixed probe names from resources.list(kind=diagnostic_probes, host=...). Inspect argv/profile there; prefer configured probes for repeated diagnostics. Empty collects no probes.
     #[serde(default)]
     pub probes: Vec<String>,
 }
@@ -331,7 +345,9 @@ pub struct DiagnosticBundle {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemediationBeginParams {
+    /// Event UUID from events.recent or events.list; links this operation to that evidence and episode.
     pub event_id: EventId,
+    /// Exact permitted host from resources.list(kind=hosts); never invent a host name.
     pub host: String,
 }
 
@@ -373,13 +389,19 @@ impl RemediationState {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemediationFinishParams {
+    /// Remediation UUID returned in the result of remediations.begin.
     pub remediation_id: RemediationId,
+    /// Current remediation revision from the remediations.begin result or previous finish response; compare-and-swap guard.
     pub expected_revision: u64,
+    /// Terminal remediation outcome; active is rejected.
     pub outcome: RemediationState,
+    /// Optional remote job UUID providing evidence for this outcome.
     #[serde(default)]
     pub related_job_id: Option<JobId>,
+    /// Optional change UUID providing deployment evidence for this outcome.
     #[serde(default)]
     pub related_change_id: Option<ChangeId>,
+    /// Evidence-based outcome explanation, 1..1024 bytes; distinguish missing evidence from verified recovery.
     pub summary: String,
 }
 

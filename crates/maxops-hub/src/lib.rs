@@ -41,6 +41,7 @@ use utoipa::OpenApi;
 mod client_api;
 mod deployment_workflow;
 mod metrics;
+mod observation_views;
 
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(execute, catalog), components(schemas(Request)), modifiers(&BearerSecurity))]
@@ -923,7 +924,7 @@ async fn catalog(
     let principal = authenticate(&app, &headers)?;
     let Query(query) =
         query.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid catalog parameters"))?;
-    Ok(Json(client_api::catalog_value(principal, query)?))
+    Ok(Json(client_api::catalog_value(&app, principal, query)?))
 }
 
 fn unit_scope(snapshot: &Snapshot) -> Value {
@@ -1060,7 +1061,12 @@ async fn fleet_pressure(app: &App, principal: &Principal) -> BTreeMap<String, Va
     results
 }
 
-async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value, ApiError> {
+async fn run(
+    app: &App,
+    principal: &Principal,
+    request: Request,
+    summary: bool,
+) -> Result<Value, ApiError> {
     let upstream_error = || ApiError(StatusCode::BAD_GATEWAY, "upstream observation unavailable");
     match request {
         Request::ResourcesList(params) => client_api::resources(app, principal, params).await,
@@ -1089,8 +1095,9 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
                     _ => "unknown",
                 };
                 let metrics = pressure.get(&host.config.name).cloned().unwrap_or(Value::Null);
+                let pressure = if summary { observation_views::pressure(&metrics) } else { json!({"state": metrics["state"], "load1": metrics["metrics"]["load1"], "filesystem_available_bytes": metrics["metrics"]["filesystem_available_bytes"], "filesystem_size_bytes": metrics["metrics"]["filesystem_size_bytes"]}) };
                 json!({"host": host.config.name, "site": host.config.site, "agent": observation, "exporter": exporter, "assessment": assessment,
-                    "pressure": {"state": metrics["state"], "load1": metrics["metrics"]["load1"], "filesystem_available_bytes": metrics["metrics"]["filesystem_available_bytes"], "filesystem_size_bytes": metrics["metrics"]["filesystem_size_bytes"]}})
+                    "pressure": pressure})
             }).collect();
             Ok(json!({"observed_at": now(), "prometheus": prometheus, "hosts": rows}))
         }
@@ -1119,7 +1126,10 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
         }
         Request::HostMetrics(params) => {
             let host = host_for(app, principal, &params.host)?;
-            let metrics = metrics::host_metrics(app, &host.config.name).await;
+            let mut metrics = metrics::host_metrics(app, &host.config.name).await;
+            if params.aggregation == maxops_proto::MetricAggregation::Stats {
+                observation_views::aggregate(&mut metrics);
+            }
             Ok(json!({"host": host.config.name, "observed_at": now(), "observation": metrics}))
         }
         Request::DeployStatus(params) => {
@@ -1208,7 +1218,10 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             .await
             .map_err(|_| upstream_error())
         }
-        Request::AlertsActive(_) => {
+        Request::AlertsActive(params) => {
+            if let Some(host) = &params.host {
+                host_for(app, principal, host)?;
+            }
             let url = app.alertmanager_url.as_ref().ok_or(ApiError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Alertmanager not configured",
@@ -1226,7 +1239,7 @@ async fn run(app: &App, principal: &Principal, request: Request) -> Result<Value
             .map_err(|_| upstream_error())?;
             Ok(
                 json!({"observed_at": now(), "alerts": alerts.into_iter().filter(|alert| {
-                alert["labels"]["instance"].as_str().is_some_and(|name| principal.hosts.contains(name))
+                alert["labels"]["instance"].as_str().is_some_and(|name| principal.hosts.contains(name) && params.host.as_ref().is_none_or(|host| host == name))
             }).collect::<Vec<_>>()}),
             )
         }
@@ -1906,10 +1919,13 @@ async fn run_job_operation(
             ))
         }
         Request::JobsStatus(params) => {
-            let mut job = store
-                .get_owned_job(&principal.name, &params.job_id)
-                .await
-                .map_err(map_store_error)?;
+            let mut job = client_api::lookup_job(
+                app,
+                principal,
+                params.job_id.as_ref(),
+                params.idempotency_key.as_deref(),
+            )
+            .await?;
             host_for(app, principal, &job.handle.host)?;
             job = deployment_workflow::reconcile(app, principal, job).await?;
             if !deployment_workflow::is_local(&job.handle.operation)
@@ -1918,7 +1934,7 @@ async fn run_job_operation(
                     app,
                     &job.handle.host,
                     &ExecutorRequest::Status(JobIdParams {
-                        job_id: params.job_id.clone(),
+                        job_id: job.handle.job_id.clone(),
                     }),
                 )
                 .await
@@ -1933,14 +1949,26 @@ async fn run_job_operation(
             ))
         }
         Request::JobsLogs(params) => {
-            let job = store
-                .get_owned_job(&principal.name, &params.job_id)
-                .await
-                .map_err(map_store_error)?;
+            let job = client_api::lookup_job(
+                app,
+                principal,
+                params.job_id.as_ref(),
+                params.idempotency_key.as_deref(),
+            )
+            .await?;
             host_for(app, principal, &job.handle.host)?;
-            let response = agent_request(app, &job.handle.host, &ExecutorRequest::Logs(params))
-                .await
-                .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"))?;
+            let response = agent_request(
+                app,
+                &job.handle.host,
+                &ExecutorRequest::Logs(JobLogsParams {
+                    job_id: job.handle.job_id,
+                    stdout_offset: params.stdout_offset,
+                    stderr_offset: params.stderr_offset,
+                    limit: params.limit,
+                }),
+            )
+            .await
+            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "executor unavailable"))?;
             let ExecutorResponse::Logs(logs) = response else {
                 return Err(ApiError(
                     StatusCode::BAD_GATEWAY,
@@ -3492,15 +3520,20 @@ async fn execute(
         ));
     }
     let result = if kind == OperationKind::Observation {
-        run(&app, principal, request)
-            .await
-            .map(|value| (StatusCode::OK, value))
+        run(
+            &app,
+            principal,
+            request.clone(),
+            representation.0.is_summary(),
+        )
+        .await
+        .map(|value| (StatusCode::OK, value))
     } else {
-        run_job_operation(&app, principal, &headers, request).await
+        run_job_operation(&app, principal, &headers, request.clone()).await
     };
     tracing::info!(actor = %principal.name, operation, success = result.is_ok(), "query completed");
     result.and_then(|(status, value)| {
-        client_api::present(representation, operation, value).map(|value| (status, Json(value)))
+        client_api::present(representation, &request, value).map(|value| (status, Json(value)))
     })
 }
 

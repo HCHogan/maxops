@@ -26,8 +26,12 @@ async fn compact_catalog_pages_are_complete_scoped_and_revision_bound() {
     )
     .await;
     assert_eq!(full["total"], tools["total"]);
+    assert!(full["operations"][0]["params_schema"]["$schema"].is_string());
+    assert!(full["operations"][0]["params_schema"]["title"].is_string());
     for operation in tools["operations"].as_array().unwrap() {
         assert!(operation["params_schema"].is_object());
+        assert!(operation["params_schema"].get("$schema").is_none());
+        assert!(operation["params_schema"].get("title").is_none());
         assert!(operation.get("response_schema").is_none());
         assert_ne!(operation["name"], "exec.run");
     }
@@ -1889,7 +1893,7 @@ async fn discovery_explains_host_requirement_and_summaries_bound_event_payloads(
         json!(["host"])
     );
     let query = serde_json::from_value(json!({"view":"summary"})).unwrap();
-    let compact = client_api::present(Query(query), "events.recent", json!({"events":[{"sequence":42,"payload":{"annotations":{"summary":"failure"},"labels":{"name":"health.service"},"large":"x".repeat(100_000)}}]})).unwrap();
+    let compact = client_api::present(Query(query), &serde_json::from_value(json!({"op":"events.recent","params":{}})).unwrap(), json!({"events":[{"sequence":42,"payload":{"annotations":{"summary":"failure"},"labels":{"name":"health.service"},"large":"x".repeat(100_000)}}]})).unwrap();
     assert!(compact.to_string().len() < 1000);
     assert_eq!(compact["events"][0]["unit"], "health.service");
     assert_eq!(compact["events"][0]["summary"], "failure");
@@ -2456,4 +2460,413 @@ async fn exporter_matches_timestamp_labels_without_metric_name() {
         scraped_at as f64
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn submission_receipt_reads_survive_reopen_and_preserve_identity_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = Store::open(&directory.path().join("target.db"))
+        .await
+        .unwrap();
+    let (url, task) = stub(
+        Router::new()
+            .route("/v1/manage", post(successful_executor))
+            .with_state(target),
+    )
+    .await;
+    let path = directory.path().join("hub.db");
+    let state = Arc::new(management_app(&url, &path).await);
+    let route = router(state.clone());
+    let submission = json!({"op":"exec.run","params":{"host":"alpha","profile":"diagnostic","command":{"argv":["/bin/true"]}}});
+    let (status, handle) = call_with_idempotency(
+        route.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("receipt-123"),
+        submission,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, observed) = call(
+        route.clone(),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        json!({"op":"jobs.status","params":{"idempotency_key":"receipt-123"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(observed["handle"]["job_id"], handle["job_id"]);
+    let id: JobId = serde_json::from_value(handle["job_id"].clone()).unwrap();
+    terminal_job(&state, &id).await;
+    drop(route);
+    drop(state);
+    let mut reopened = management_app(&url, &path).await;
+    let store = reopened.store.as_ref().unwrap().clone();
+    store
+        .submit_job("private-key", &fixture_job("other", "alpha"))
+        .await
+        .unwrap();
+    store
+        .submit_job("revoked-host", &fixture_job("manager", "private"))
+        .await
+        .unwrap();
+    reopened.clients.push(Principal {
+        name: "other".into(),
+        token: Token::parse(ALERT_TOKEN.into()).unwrap(),
+        hosts: BTreeSet::from(["alpha".into()]),
+        capabilities: BTreeSet::from(["jobs:read".into()]),
+        access: Access::Manage,
+        repositories: BTreeSet::new(),
+        deployments: BTreeSet::new(),
+    });
+    let route = router(Arc::new(reopened));
+    for operation in ["jobs.status", "jobs.wait", "jobs.logs", "jobs.result"] {
+        let extra = if operation == "jobs.wait" {
+            json!({"timeout_seconds":0})
+        } else {
+            json!({})
+        };
+        let mut keyed = extra.clone();
+        keyed["idempotency_key"] = json!("receipt-123");
+        let (status, by_key) = call(
+            route.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            json!({"op":operation,"params":keyed}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{operation}: {by_key}");
+        let mut by_id = extra.clone();
+        by_id["job_id"] = handle["job_id"].clone();
+        let (_, by_id) = call(
+            route.clone(),
+            "/v1/execute",
+            Some(USER_TOKEN),
+            json!({"op":operation,"params":by_id}),
+        )
+        .await;
+        assert_eq!(by_key, by_id, "{operation}");
+        for (token, key, expected) in [
+            (USER_TOKEN, "private-key", StatusCode::NOT_FOUND),
+            (ALERT_TOKEN, "receipt-123", StatusCode::NOT_FOUND),
+            (USER_TOKEN, "missing", StatusCode::NOT_FOUND),
+            (USER_TOKEN, "revoked-host", StatusCode::FORBIDDEN),
+        ] {
+            let mut params = extra.clone();
+            params["idempotency_key"] = json!(key);
+            let (status, error) = call(
+                route.clone(),
+                "/v1/execute",
+                Some(token),
+                json!({"op":operation,"params":params}),
+            )
+            .await;
+            assert_eq!(status, expected, "{operation}: {error}");
+        }
+        for mut params in [
+            json!({}),
+            json!({"idempotency_key":""}),
+            json!({"job_id":id,"idempotency_key":"receipt-123"}),
+        ] {
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, _) = call(
+                route.clone(),
+                "/v1/execute",
+                Some(USER_TOKEN),
+                json!({"op":operation,"params":params}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn wrong_mutation_kind_has_specific_error_and_creates_no_durable_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let state =
+        Arc::new(management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await);
+    let (status, error) = call_with_idempotency(
+        router(state.clone()),
+        "/v1/execute",
+        Some(USER_TOKEN),
+        Some("reject-target"),
+        json!({"op":"units.stop","params":{"host":"alpha","unit":"multi-user.target"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "unit_kind_not_manageable");
+    assert_eq!(error["retry"], "never");
+    assert!(
+        state
+            .store
+            .as_ref()
+            .unwrap()
+            .get_idempotent_job("manager", "reject-target")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn nine_host_overview_and_metric_views_are_bounded_over_http() {
+    let (url, task) = stub(Router::new()
+        .route("/{host}/v1/snapshot", get(|axum::extract::Path(host): axum::extract::Path<String>| async move {Json(snapshot(&host))}))
+        .route("/api/v1/query", get(|axum::extract::Query(params): axum::extract::Query<BTreeMap<String, String>>| async move {
+            let query = &params["query"];
+            let host = query.split("instance=\"").nth(1).and_then(|s| s.split('"').next());
+            let mut rows = Vec::new();
+            if let Some(host) = host {
+                for (name, count, value) in [("load1",1,2.0),("load5",1,1.5),("load15",1,1.0),("memory_available_bytes",1,25.0),("memory_total_bytes",1,100.0),("filesystem_available_bytes",9,20.0),("filesystem_size_bytes",9,100.0),("cpu_idle_seconds_per_second",9,0.5),("network_receive_bytes_per_second",19,50.0),("network_transmit_bytes_per_second",19,100.0)] {
+                    for index in 0..count {
+                        let mut labels = json!({"job":"node","instance":host,"maxops_metric":name});
+                        if name.starts_with("filesystem") {labels["mountpoint"]=json!(format!("/data/{index}")); labels["device"]=json!(format!("/dev/device{index}"));}
+                        if name.starts_with("cpu") {labels["cpu"]=json!(index.to_string());}
+                        if name.starts_with("network") {labels["device"]=json!(format!("eth{index}"));}
+                        rows.push(json!({"metric":labels,"value":[0,if query.contains("timestamp(") {now().as_second().to_string()} else {value.to_string()}]}));
+                    }
+                }
+            }
+            Json(json!({"status":"success","data":{"resultType":"vector","result":rows}}))
+        }))).await;
+    let mut state = app("http://127.0.0.1:1", &["fleet:read", "metrics:read"]);
+    state.hosts.clear();
+    state.clients[0].hosts.clear();
+    for index in 0..9 {
+        let name = format!("node-{index:02}");
+        let mut config = app("http://127.0.0.1:1", &[])
+            .hosts
+            .remove("alpha")
+            .unwrap()
+            .config;
+        config.name = name.clone();
+        config.agent_url = format!("{url}/{name}");
+        state.hosts.insert(
+            name.clone(),
+            Host {
+                config,
+                token: Token::parse(AGENT_TOKEN.into()).unwrap(),
+                execution_token: None,
+            },
+        );
+        state.clients[0].hosts.insert(name);
+    }
+    state.prometheus_url = Some(url);
+    let route = router(Arc::new(state));
+    let (status, summary) = call(
+        route.clone(),
+        "/v1/execute?view=summary",
+        Some(USER_TOKEN),
+        json!({"op":"fleet.overview","params":{}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bytes = serde_json::to_vec(&summary).unwrap().len();
+    eprintln!("nine-host overview summary: {bytes} bytes");
+    assert!(bytes < 6000, "nine-host overview summary: {bytes} bytes");
+    assert_eq!(summary["hosts"].as_array().unwrap().len(), 9);
+    for host in summary["hosts"].as_array().unwrap() {
+        assert_eq!(host["agent_state"], "reachable");
+        assert_eq!(host["pressure"]["load1"], 2.0);
+        assert_eq!(host["pressure"]["memory_used_fraction"], 0.75);
+        assert_eq!(host["pressure"]["filesystem_state"], "available");
+    }
+    assert!(!summary.to_string().contains("samples"));
+    let (_, full) = call(
+        route.clone(),
+        "/v1/execute?view=full",
+        Some(USER_TOKEN),
+        json!({"op":"fleet.overview","params":{}}),
+    )
+    .await;
+    assert!(full["hosts"][0]["pressure"]["filesystem_available_bytes"]["samples"].is_array());
+    for (path, params, aggregated) in [
+        ("/v1/execute?view=full", json!({"host":"node-00"}), false),
+        ("/v1/execute?view=summary", json!({"host":"node-00"}), true),
+        (
+            "/v1/execute?view=full",
+            json!({"host":"node-00","aggregation":"stats"}),
+            true,
+        ),
+    ] {
+        let (status, result) = call(
+            route.clone(),
+            path,
+            Some(USER_TOKEN),
+            json!({"op":"host.metrics","params":params}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cpu = &result["observation"]["metrics"]["cpu_idle_seconds_per_second"];
+        if aggregated {
+            assert_eq!(cpu["series_count"], 9);
+            assert!((cpu["mean"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+            assert!(cpu.get("samples").is_none());
+        } else {
+            assert_eq!(cpu["samples"].as_array().unwrap().len(), 9);
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn alert_views_filter_before_paging_and_keep_full_objects() {
+    let capture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/active-alerts-20.json")).unwrap();
+    let source = capture.clone();
+    let (url, task) = stub(Router::new().route(
+        "/api/v2/alerts",
+        get(move || {
+            let data = source.clone();
+            async move { Json(data) }
+        }),
+    ))
+    .await;
+    let mut state = app("http://127.0.0.1:1", &["alerts:read"]);
+    state.alertmanager_url = Some(url);
+    state.clients[0].hosts = capture
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["labels"]["instance"].as_str().unwrap().to_owned())
+        .collect();
+    for name in state.clients[0].hosts.clone() {
+        let mut config = app("http://127.0.0.1:1", &[])
+            .hosts
+            .remove("alpha")
+            .unwrap()
+            .config;
+        config.name = name.clone();
+        state.hosts.insert(
+            name,
+            Host {
+                config,
+                token: Token::parse(AGENT_TOKEN.into()).unwrap(),
+                execution_token: None,
+            },
+        );
+    }
+    let route = router(Arc::new(state));
+    let (_, full) = call(
+        route.clone(),
+        "/v1/execute?view=full",
+        Some(USER_TOKEN),
+        json!({"op":"alerts.active","params":{}}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_vec(&full["alerts"]).unwrap(),
+        serde_json::to_vec(&capture).unwrap()
+    );
+    let (status, summary) = call(
+        route.clone(),
+        "/v1/execute?view=summary",
+        Some(USER_TOKEN),
+        json!({"op":"alerts.active","params":{}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(serde_json::to_vec(&summary).unwrap().len() <= 4000);
+    let selected = capture[0]["labels"]["instance"].as_str().unwrap();
+    let expected = capture
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["labels"]["instance"] == selected)
+        .count();
+    for view in ["summary", "full"] {
+        let (status, filtered) = call(
+            route.clone(),
+            &format!("/v1/execute?view={view}"),
+            Some(USER_TOKEN),
+            json!({"op":"alerts.active","params":{"host":selected,"limit":1}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(filtered["total"], expected);
+        assert_eq!(filtered["alerts"].as_array().unwrap().len(), 1);
+        let (status, _) = call(
+            route.clone(),
+            &format!("/v1/execute?view={view}"),
+            Some(USER_TOKEN),
+            json!({"op":"alerts.active","params":{"host":"private"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn tools_mutation_unit_enums_enforce_current_scope_before_consumer_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = management_app("http://127.0.0.1:1", &directory.path().join("hub.db")).await;
+    let mut private = app("http://127.0.0.1:1", &[])
+        .hosts
+        .remove("private")
+        .unwrap();
+    private
+        .config
+        .manageable_units
+        .insert("private.service".into());
+    state.hosts.insert("private".into(), private);
+    let state = Arc::new(state);
+    let route = router(state.clone());
+    let (_, tools) = get_json(route.clone(), "/v1/operations?view=tools", Some(USER_TOKEN)).await;
+    let (_, full) = get_json(route, "/v1/operations?view=full", Some(USER_TOKEN)).await;
+    for operation in tools["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|op| op["capability"] == "units:manage")
+    {
+        let unit = &operation["params_schema"]["properties"]["unit"];
+        assert_eq!(unit["enum"], json!(["demo.service"]));
+        // Max.Tool.Catalog.validatePresent rejects strings outside enum before
+        // invoking its task admission handler; it does not yet check pattern.
+        assert!(
+            !unit["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("multi-user.target"))
+        );
+        assert!(unit["pattern"].is_string());
+        let original = full["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["name"] == operation["name"])
+            .unwrap();
+        assert!(
+            original["params_schema"]["properties"]["unit"]
+                .get("enum")
+                .is_none()
+        );
+    }
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    state
+        .hosts
+        .get_mut("alpha")
+        .unwrap()
+        .config
+        .manageable_units
+        .clear();
+    let (_, empty) = get_json(
+        router(Arc::new(state)),
+        "/v1/operations?view=tools",
+        Some(USER_TOKEN),
+    )
+    .await;
+    assert!(
+        empty["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|op| op["capability"] != "units:manage")
+    );
 }

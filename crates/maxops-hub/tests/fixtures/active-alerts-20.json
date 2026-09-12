@@ -1,0 +1,661 @@
+[
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-01 → node-02 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:47.848Z",
+    "fingerprint": "0000000000000001",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-12T05:08:15.737Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:47.889+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-01",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-02",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-03 → node-02 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000002",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T17:40:40.008Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-03",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-02",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-04 → node-02 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000003",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T10:34:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-04",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-02",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-05 → node-06 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000004",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T10:58:15.737Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-05",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-06",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-02 → node-01 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:47.848Z",
+    "fingerprint": "0000000000000005",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-12T05:08:15.737Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:47.889+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-02",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-01",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-01 → node-04 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "0000000000000006",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-12T05:07:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-01",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-04",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-04 → node-01 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "0000000000000007",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T20:09:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-04",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-01",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-01 → node-06 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "0000000000000008",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-12T05:07:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-01",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-06",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-04 上 example-01.service 挂了"
+    },
+    "endsAt": "2026-09-12T08:28:27.799Z",
+    "fingerprint": "0000000000000009",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T13:03:55.958Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:27.831+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "SystemdUnitFailed",
+      "arch": "fixture",
+      "instance": "node-04",
+      "job": "fixture",
+      "name": "example-01.service",
+      "roles": "fixture",
+      "severity": "warning",
+      "state": "fixture",
+      "type": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-04 → node-05 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "000000000000000a",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T17:40:40.008Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-04",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-05",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-03 → node-05 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "000000000000000b",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-09T06:20:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-03",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-05",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-06 → node-02 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "000000000000000c",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T13:00:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-06",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-02",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-06 → node-05 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "000000000000000d",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T13:00:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-06",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-05",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-05 → node-03 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "000000000000000e",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T10:58:15.737Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-05",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-03",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-02 → node-04 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "000000000000000f",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T17:40:40.008Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-02",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-04",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-05 → node-04 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000010",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T10:58:15.737Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-05",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-04",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-02 → node-03 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000011",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T17:40:40.008Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-02",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-03",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-02 → node-06 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000012",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-10T17:40:40.008Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-02",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-06",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-01 → node-03 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:28:15.737Z",
+    "fingerprint": "0000000000000013",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-12T05:07:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:24:15.744+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-01",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-03",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  },
+  {
+    "annotations": {
+      "description": "Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. Diagnostic details omitted from this anonymized capture. ",
+      "summary": "node-06 → node-01 降级成 DERP 中继了"
+    },
+    "endsAt": "2026-09-12T08:29:15.737Z",
+    "fingerprint": "0000000000000014",
+    "receivers": [
+      {
+        "name": "example"
+      }
+    ],
+    "startsAt": "2026-09-11T20:10:47.848Z",
+    "status": {
+      "state": "active",
+      "silencedBy": [],
+      "inhibitedBy": []
+    },
+    "updatedAt": "2026-09-12T16:25:15.745+08:00",
+    "generatorURL": "https://prometheus.example.invalid/graph?g0.expr=fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20fixture%20",
+    "labels": {
+      "alertname": "TailscalePathDegraded",
+      "arch": "fixture",
+      "instance": "node-06",
+      "job": "fixture",
+      "kind": "fixture",
+      "os": "fixture",
+      "peer": "node-01",
+      "roles": "fixture",
+      "severity": "warning",
+      "user": "fixture"
+    }
+  }
+]
