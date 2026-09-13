@@ -99,8 +99,8 @@ from the running closure; filesystem ctime is never called deployment time.
 
 The development environment is `devenv.nix` + `devenv.yaml` + `devenv.lock`.
 The separate `flake.nix` exposes packages and NixOS modules to consumers.
-Both locks initially pin nixpkgs to
-`34268251cf5547d39063f2c5ea9a196246f7f3a6`, copied from nix-config's root
+Both locks pin nixpkgs to
+`21a67dc470149f337cecafbe965d8d252a390518`, copied from nix-config's root
 nixpkgs input. The development URL is pinned to the same revision. Update both
 deliberately; `scripts/check-pins.py` detects divergence.
 
